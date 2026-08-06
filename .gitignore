@@ -1,0 +1,24 @@
+# build artifacts
+*.o
+*.d
+kurono
+kurono-asan
+kurono-tsan
+kurono-ring-test
+build/
+
+# graphify knowledge graph output
+graphify-out/
+
+# process/scratch dirs, not source
+plans/
+commits/
+status/
+TODO.md
+BUGS.md
+IDEAS.md
+
+# local editor/tool state
+.claude/settings.local.json
+compile_commands.json
+.cache/
