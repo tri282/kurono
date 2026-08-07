@@ -7,6 +7,11 @@ kurono-tsan
 kurono-ring-test
 build/
 
+# compiled tool binaries (extensionless), keep tool sources tracked
+tools/*
+!tools/*.c
+!tools/*.h
+
 # graphify knowledge graph output
 graphify-out/
 
@@ -22,3 +27,9 @@ IDEAS.md
 .claude/settings.local.json
 compile_commands.json
 .cache/
+
+# tools
+.claudeignore
+.graphifyignore
+CLAUDE.md
+DESIGN.md
