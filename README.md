@@ -148,7 +148,16 @@ v1 is configured entirely through environment variables. There is no config file
 | `KURONO_IGNORE_DIRS` | unset | Comma-separated directory names never descended into |
 | `KURONO_PLAYLIST_DIR` | first music root + `/playlists` | Where playlists are read from and written to |
 | `KURONO_NO_SCAN` | unset | If set, skip the startup scan entirely |
+| `KURONO_TRACE` | unset | If set to `1`, write an audio-path trace log to `$XDG_STATE_HOME/kurono/trace.log` |
 | `KURONO_CONFIG` | `$XDG_CONFIG_HOME/kurono/config.toml` | Reserved. Unused in v1. |
+
+**Diagnosing an audio dropout.** Every run prints one line on exit — underruns, dropped trace records, and how close the decode buffer came to empty:
+
+```txt
+kurono: 0 underruns, 0 trace records dropped, pcm_ring low-water 1.87 s
+```
+
+If that line shows underruns, `KURONO_TRACE=1` writes the full per-event log to `$XDG_STATE_HOME/kurono/trace.log` (falling back to `~/.local/state`). The audio thread cannot format text, so it records fixed-size records that the UI thread renders — which is why tracing costs nothing when you are not reading it.
 
 **Point it at your library:**
 
