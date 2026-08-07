@@ -144,8 +144,9 @@ v1 is configured entirely through environment variables. There is no config file
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `KURONO_MUSIC_DIR` | `$XDG_MUSIC_DIR`, then `~/Music` | Root of the music tree, traversed recursively |
-| `KURONO_PLAYLIST_DIR` | `$KURONO_MUSIC_DIR/playlists` | Where playlists are read from and written to |
+| `KURONO_MUSIC_DIR` | `$XDG_MUSIC_DIR`, then `~/Music` | Roots of the music tree, traversed recursively. `:`-separated for more than one |
+| `KURONO_IGNORE_DIRS` | unset | Comma-separated directory names never descended into |
+| `KURONO_PLAYLIST_DIR` | first music root + `/playlists` | Where playlists are read from and written to |
 | `KURONO_NO_SCAN` | unset | If set, skip the startup scan entirely |
 | `KURONO_CONFIG` | `$XDG_CONFIG_HOME/kurono/config.toml` | Reserved. Unused in v1. |
 
@@ -154,6 +155,24 @@ v1 is configured entirely through environment variables. There is no config file
 ```bash
 export KURONO_MUSIC_DIR="$HOME/Music"
 ```
+
+**More than one location** — separate them with `:`, as in `PATH`:
+
+```bash
+export KURONO_MUSIC_DIR="$HOME/Music:/mnt/archive/flac"
+```
+
+Roots are scanned in order, and that is the order they appear in the Directory view. A root that does not exist is reported rather than silently skipped, so an unmounted disk is visible instead of looking like an empty library. A directory name containing `:` cannot be used — the same limitation `PATH` has.
+
+Symlinking a second location into your music directory does **not** work: the scanner skips symlinked directories entirely, deliberately, to avoid escaping the tree. Use multiple roots instead.
+
+**Skip directories by name:**
+
+```bash
+export KURONO_IGNORE_DIRS=".stversions,.Trash-1000"
+```
+
+Matched against the directory's own name anywhere in the tree, exactly and case-sensitively — not against the full path.
 
 The index is written to `$XDG_CACHE_HOME/kurono/library.db`, falling back to `~/.cache/kurono/library.db`. It is never written inside the music tree — the music directory is treated as read-only, with the playlist directory as the sole exception.
 
