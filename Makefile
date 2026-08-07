@@ -20,13 +20,13 @@ PKG_LIBS   := $(shell pkg-config --libs   $(PKGS) 2>/dev/null)
 LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 
 # Explicit, not a wildcard: an orphaned file must be visible, not silently
-# picked up. Only src/main.c exists as of phase 2 -- config.c, event.c,
-# audio/sink.c, audio/decoder.c, audio/engine.c, queue.c, ui/*, library/*
-# land in their own phases and get added here then. src/audio/ring.c
-# (phase 1) is not yet linked into the kurono binary -- nothing wires it
-# in before audio/engine.c (phase 7) -- so it is not in SRCS; it is built
-# separately by the ring-stress target below.
-SRCS = src/main.c
+# picked up. src/config.c lands in phase 3 and is linked immediately --
+# event.c, audio/sink.c, audio/decoder.c, audio/engine.c, queue.c, ui/*,
+# library/* land in their own phases and get added here then.
+# src/audio/ring.c (phase 1) is not yet linked into the kurono binary --
+# nothing wires it in before audio/engine.c (phase 7) -- so it is not in
+# SRCS; it is built separately by the ring-stress target below.
+SRCS = src/main.c src/config.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. src/audio/ring.c is the phase-1 ring and
