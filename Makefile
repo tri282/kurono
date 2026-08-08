@@ -30,8 +30,12 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # used it.
 # src/audio/trace.c (phase 5b) is wired in immediately, same as ring.c
 # and sink.c before it -- audio/sink.c's callbacks are its only callers.
+# src/audio/decoder.c (phase 6) is the AudioSource over ffmpeg -- wired
+# in immediately for the same reason: --decode (main.c) is its only
+# caller in this phase, and an unlinked ffmpeg-facing file would go
+# unanalysed by `make analyze` until someone remembered to move it.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
-       src/audio/trace.c
+       src/audio/trace.c src/audio/decoder.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its

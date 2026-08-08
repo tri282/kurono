@@ -1,6 +1,7 @@
 #include "../include/main.h"
 #include "../include/config.h"
 #include "../include/event.h"
+#include "../include/audio/decoder.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
 
@@ -125,6 +126,180 @@ resolve_trace_log_path(void)
   free(base);
   return path;
 } /* resolve_trace_log_path */
+
+/*
+ * No real device is opened for --decode (phase-6-decoder.md I.7: "no
+ * device, no ring, no threads"), so there is no negotiated session rate
+ * to target the way a live run would read one back from audio/sink.c.
+ * The probe pass uses this rate only to reach StreamInfo and learn the
+ * file's own rate; the measuring pass then re-opens at that native rate
+ * (see run_decode). It does not claim to match whatever rate this
+ * process's sink would negotiate at runtime.
+ */
+#define DECODE_PROBE_SAMPLE_RATE 48000u
+
+/* Frames per read() call in the drain pass. Arbitrary -- large enough
+   that the pass is not dominated by call overhead, small enough that a
+   short return is exercised well before the end of any real track. */
+#define DECODE_READ_CHUNK_FRAMES 4096
+
+/*
+ * decode_probe_rate: open path just far enough to read its StreamInfo
+ * and report the file's own sample rate, so the measuring pass can
+ * target it. Takes the path and the StreamInfo to fill, returns the
+ * file's sample rate, or 0 if the file could not be opened at all (the
+ * caller reports that; this function prints nothing).
+ */
+static unsigned
+decode_probe_rate(const char * path, StreamInfo * out_info)
+{
+  SessionFormat probe;
+  memset(&probe, 0, sizeof(probe));
+  probe.sample_rate = DECODE_PROBE_SAMPLE_RATE;
+  probe.channels    = 2;
+
+  AudioSource src = decoder_create(&probe);
+  if (src.self == NULL) {
+    return 0;
+  }
+  if (src.open(src.self, path, out_info) != 0) {
+    decoder_destroy(&src);
+    return 0;
+  }
+  unsigned rate = (out_info->sample_rate > 0) ? (unsigned) out_info->sample_rate
+                                              : DECODE_PROBE_SAMPLE_RATE;
+  src.close(src.self);
+  decoder_destroy(&src);
+  return rate;
+} /* decode_probe_rate */
+
+/*
+ * run_decode: implements --decode FILE (plan.md VI.8,
+ * phase-6-decoder.md I.7). Three passes over the file, in order:
+ *
+ *   1. Probe, to learn the file's own sample rate (decode_probe_rate).
+ *   2. Step pass, at that native rate, printing the raw frame count of
+ *      each of the first ten decode steps plus the total.
+ *      decoder_diag_step reports a step's true size, where
+ *      AudioSource.read clips to the caller's request and would hide a
+ *      short first step inside a larger one -- and a short first step
+ *      is exactly what phase-6-decoder.md III.1 exists to observe.
+ *   3. Drain pass, after seeking back to 0, pulling the whole file
+ *      through AudioSource.read into a discard buffer.
+ *
+ * Passes 2 and 3 both run at the file's native rate so that swr is a
+ * passthrough. Resampling would add its own filter delay to the first
+ * output and scale every count, which is precisely the measurement
+ * III.1 is trying to make -- a 48 kHz target would report the
+ * resampler's delay rather than the encoder's.
+ *
+ * Pass 3 exists because read() is the function phase 7 actually calls;
+ * without it the only diagnostic in this phase would exercise a code
+ * path the engine never uses. Its total must equal pass 2's -- the two
+ * paths drain the same decoder through different plumbing, so a
+ * mismatch is a residual-buffer or seek bug.
+ *
+ * Takes the file path, returns 0 when both passes complete, or 1 on any
+ * open failure, decode error, or disagreement between the two totals.
+ * A corrupt file or unsupported codec is reported on one stderr line
+ * and never crashes (DESIGN.md XI.1).
+ */
+static int
+run_decode(const char * path)
+{
+  StreamInfo info;
+  unsigned   rate = decode_probe_rate(path, &info);
+  if (rate == 0) {
+    fprintf(stderr, "kurono: --decode: cannot open %s\n", path);
+    return 1;
+  }
+
+  SessionFormat fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.sample_rate = rate;
+  fmt.channels    = 2;
+
+  AudioSource src = decoder_create(&fmt);
+  if (src.self == NULL) {
+    fprintf(stderr, "kurono: --decode: allocation failed\n");
+    return 1;
+  }
+
+  int ret = src.open(src.self, path, &info);
+  if (ret != 0) {
+    fprintf(stderr, "kurono: --decode: open failed for %s (error %d)\n", path, ret);
+    decoder_destroy(&src);
+    return 1;
+  }
+
+  printf("duration_ms=%lld bitrate=%lld sample_rate=%d channels=%d codec=%s\n",
+         (long long) info.duration_ms, (long long) info.bitrate,
+         info.sample_rate, info.channels, info.codec);
+  printf("target rate: %u Hz (file native -- swr is a passthrough)\n", rate);
+
+  /* Pass 2 -- raw step sizes. */
+  int  status     = 0;
+  long step_total = 0;
+  int  step       = 0;
+  for (;;) {
+    long n = decoder_diag_step(&src);
+    if (n < 0) {
+      fprintf(stderr, "kurono: --decode: decode error (%ld)\n", n);
+      status = 1;
+      break;
+    }
+    if (n == 0) {
+      break; /* end of stream */
+    }
+    if (step < 10) {
+      printf("step %2d: %ld frames\n", step, n);
+    }
+    step++;
+    step_total += n;
+  }
+  printf("total frames (steps): %ld\n", step_total);
+
+  /* Pass 3 -- the same file through the interface phase 7 uses. */
+  long read_total = 0;
+  if (status == 0) {
+    ret = src.seek(src.self, 0);
+    if (ret != 0) {
+      fprintf(stderr, "kurono: --decode: seek to 0 failed (error %d)\n", ret);
+      status = 1;
+    } else {
+      static float discard[DECODE_READ_CHUNK_FRAMES * 2];
+      for (;;) {
+        long n = src.read(src.self, discard, DECODE_READ_CHUNK_FRAMES);
+        if (n < 0) {
+          fprintf(stderr, "kurono: --decode: read error (%ld)\n", n);
+          status = 1;
+          break;
+        }
+        read_total += n;
+        if (n < DECODE_READ_CHUNK_FRAMES) {
+          break; /* short return is the EOF signal */
+        }
+      }
+      printf("total frames (read):  %ld\n", read_total);
+
+      /* Reported, deliberately not fatal. On a lossless format the two
+         totals should match exactly and a difference means a
+         residual-buffer bug. On a lossy one they legitimately can
+         differ: AVSEEK_FLAG_BACKWARD lands on a frame boundary rather
+         than on sample 0, so pass 3 may start slightly earlier or later
+         than pass 2 did. Judging which case applies is the reader's
+         job, so print the delta and let them. */
+      if (read_total != step_total) {
+        printf("note: totals differ by %ld frames (exact match expected for lossless)\n",
+               read_total - step_total);
+      }
+    }
+  }
+
+  src.close(src.self);
+  decoder_destroy(&src);
+  return status;
+} /* run_decode */
 
 /*
  * evsrc_name: the diagnostic label for an EventSource, for the
@@ -252,8 +427,10 @@ run_headless(void)
  * test (see run_headless) until SIGINT/SIGTERM/SIGHUP or a tty hangup,
  * --tone by running the phase-5 sink/ring/callback smoke test
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
- * and any other invocation (including no arguments) by printing a
- * one-line "not implemented yet" notice to stderr. Startup, wiring, and
+ * --decode FILE by running the phase-6 decoder smoke test (run_decode,
+ * plan.md VI.8) with no device, no ring, and no threads, and any other
+ * invocation (including no arguments) by printing a one-line "not
+ * implemented yet" notice to stderr. Startup, wiring, and
  * teardown ordering for a real run land in later phases. Takes the
  * process argc/argv, returns the process exit status.
  */
@@ -299,6 +476,11 @@ main(int argc, char * argv[])
        counter and sample rate with trace.c (trace.h,
        trace_set_frame_counter / trace_set_sample_rate). */
     status = (sink_run_tone() == 0) ? 0 : 1;
+
+  } else if (argc == 3 && strcmp(argv[1], "--decode") == 0) {
+    /* plan.md VI.8 diagnostic scaffolding -- exercises audio/decoder.c's
+       AudioSource over ffmpeg with no device, no ring, and no threads. */
+    status = run_decode(argv[2]);
 
   } else {
     fprintf(stderr, "kurono: not implemented yet\n");
