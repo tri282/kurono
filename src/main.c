@@ -2,6 +2,7 @@
 #include "../include/config.h"
 #include "../include/event.h"
 #include "../include/audio/sink.h"
+#include "../include/audio/trace.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -74,6 +75,56 @@ print_paths(const Config * c)
   printf("config_path   %s  (unused in v1)\n", c->config_path);
   printf("no_scan       %d  (KURONO_NO_SCAN)\n", c->no_scan);
 } /* print_paths */
+
+/*
+ * resolve_trace_log_path: build the KURONO_TRACE log path --
+ * $XDG_STATE_HOME/kurono/trace.log, falling back to
+ * $HOME/.local/state/kurono/trace.log (DESIGN.md IV.10/X, README.md) --
+ * or return NULL if KURONO_TRACE is not set to "1", or the environment
+ * cannot resolve a base directory (no $XDG_STATE_HOME and no $HOME).
+ * Mirrors config.c's xdg_or_home fallback shape, but is not folded into
+ * Config: KURONO_TRACE governs trace.c's own opt-in file, not a startup
+ * path every caller of config_init needs. Takes nothing, returns an
+ * owned string or NULL -- the caller passes the result straight to
+ * trace_init, which treats NULL as "record only, no file" and never
+ * fails on it (a missing/unwritable directory is reported there, once,
+ * non-fatally).
+ */
+static char *
+resolve_trace_log_path(void)
+{
+  const char * flag = getenv("KURONO_TRACE");
+  if (flag == NULL || strcmp(flag, "1") != 0) {
+    return NULL;
+  }
+
+  const char * xdg = getenv("XDG_STATE_HOME");
+  char * base;
+  if (xdg != NULL && xdg[0] != '\0') {
+    base = strdup(xdg);
+  } else {
+    const char * home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') {
+      return NULL;
+    }
+    size_t len = strlen(home) + strlen("/.local/state") + 1;
+    base = malloc(len);
+    if (base != NULL) {
+      snprintf(base, len, "%s/.local/state", home);
+    }
+  }
+  if (base == NULL) {
+    return NULL;
+  }
+
+  size_t len = strlen(base) + strlen("/kurono/trace.log") + 1;
+  char * path = malloc(len);
+  if (path != NULL) {
+    snprintf(path, len, "%s/kurono/trace.log", base);
+  }
+  free(base);
+  return path;
+} /* resolve_trace_log_path */
 
 /*
  * evsrc_name: the diagnostic label for an EventSource, for the
@@ -192,15 +243,19 @@ run_headless(void)
 
 /*
  * Entry point. Handles --version by printing "kurono <version>" to
- * stdout and returning 0, --paths by resolving the Config and printing
- * it (see print_paths), --headless by running the phase-4 event-loop
- * smoke test (see run_headless) until SIGINT/SIGTERM/SIGHUP or a tty
- * hangup, and --tone by running the phase-5 sink/ring/callback smoke
- * test (sink_run_tone, plan.md VI.8) with no event loop and no audio
- * file. Any other invocation (including no arguments) prints a one-line
- * "not implemented yet" notice to stderr and returns 1 -- startup,
- * wiring, and teardown land in later phases. Takes the process
- * argc/argv, returns the process exit status.
+ * stdout and returning 0 immediately -- no trace lifecycle, nothing
+ * runs. Every other invocation is wrapped in the trace ring's lifetime
+ * (trace_init before, trace_drain / trace_summary_line / trace_shutdown
+ * after) so every run yields evidence at no configuration cost
+ * (DESIGN.md IV.10): --paths by resolving the Config and printing it
+ * (see print_paths), --headless by running the phase-4 event-loop smoke
+ * test (see run_headless) until SIGINT/SIGTERM/SIGHUP or a tty hangup,
+ * --tone by running the phase-5 sink/ring/callback smoke test
+ * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
+ * and any other invocation (including no arguments) by printing a
+ * one-line "not implemented yet" notice to stderr. Startup, wiring, and
+ * teardown ordering for a real run land in later phases. Takes the
+ * process argc/argv, returns the process exit status.
  */
 int
 main(int argc, char * argv[])
@@ -210,6 +265,19 @@ main(int argc, char * argv[])
     return 0;
   }
 
+  char * trace_path = resolve_trace_log_path();
+  if (trace_init(trace_path) != 0) {
+    /* Ring allocation failed. Not fatal, by the same rule that makes a
+       missing log file not fatal: trace_emit degrades to counting drops
+       against a zero-capacity ring, so the run continues and the exit
+       line reports the drops rather than the player refusing to start. */
+    fprintf(stderr, "kurono: warning: trace ring allocation failed -- "
+                    "continuing without recording\n");
+  }
+  free(trace_path);
+
+  int status;
+
   if (argc == 2 && strcmp(argv[1], "--paths") == 0) {
     Config cfg;
     if (config_init(&cfg) != 0) {
@@ -217,21 +285,36 @@ main(int argc, char * argv[])
     }
     print_paths(&cfg);
     config_free(&cfg);
-    return 0;
-  }
+    status = 0;
 
-  if (argc == 2 && strcmp(argv[1], "--headless") == 0) {
+  } else if (argc == 2 && strcmp(argv[1], "--headless") == 0) {
     /* Temporary, plan.md VI.8 diagnostic scaffolding -- removed in
        phase 11 when ui/tui.c gives kurono a real event loop body. */
-    return run_headless();
-  }
+    status = run_headless();
 
-  if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
+  } else if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
     /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
-       device, ring, and callback with no ffmpeg and no audio file. */
-    return (sink_run_tone() == 0) ? 0 : 1;
+       device, ring, and callback with no ffmpeg and no audio file.
+       sink_run_tone drives sink_open_impl, which registers the frame
+       counter and sample rate with trace.c (trace.h,
+       trace_set_frame_counter / trace_set_sample_rate). */
+    status = (sink_run_tone() == 0) ? 0 : 1;
+
+  } else {
+    fprintf(stderr, "kurono: not implemented yet\n");
+    status = 1;
   }
 
-  fprintf(stderr, "kurono: not implemented yet\n");
-  return 1;
+  /* No redraw tick and no pipe wakeup exist yet to drive trace_drain
+     (DESIGN.md IV.10) -- there is no TUI and no event loop wired to the
+     sink until later phases. One drain here, before the summary line,
+     is the temporary equivalent: it empties whatever trace_ring
+     accumulated during this run so the exit line reflects it. */
+  trace_drain();
+  char summary[128];
+  trace_summary_line(summary, sizeof summary);
+  fprintf(stderr, "%s\n", summary);
+  trace_shutdown();
+
+  return status;
 } /* main */

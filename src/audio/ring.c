@@ -87,9 +87,11 @@ ring_free(Ring * r)
 /* ring_write: copy up to n bytes from src into r, returning the number of
    bytes actually written (n, or less if the ring does not have that much
    free space). Producer side only. Never blocks, never allocates, bounded
-   by n -- safe to call from T2 (pcm_ring producer) and legal to call from
-   T1 during ma_device_start's synchronous pre-fill (viz_ring producer is
-   always T1). Not on the callback (T3) path. */
+   by n -- and therefore legal on the callback (T3) path, which is where
+   two of the three producers actually live: T2 produces into pcm_ring,
+   but T3 produces into viz_ring (the callback's step 5) and into
+   trace_ring (via trace_emit). T1 is a producer only during
+   ma_device_start's synchronous pre-fill. */
 size_t
 ring_write(Ring * r, const void * src, size_t n)
 {

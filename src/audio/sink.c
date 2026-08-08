@@ -38,10 +38,12 @@
 #include "../../include/audio/format.h"
 #include "../../include/audio/ring.h"
 #include "../../include/audio/sink.h"
+#include "../../include/audio/trace.h"
 
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -64,22 +66,17 @@
    rule 6). */
 #define VIZ_RING_BYTES (64u * 1024u)
 
-/* Placeholder pending phase 5b's real measurement (DESIGN.md IV.4 rule
-   6, IV.2 step 3; plan.md VII gap 12). trace_emit is a no-op in this
-   phase, so this value has no observable effect yet -- only that the
-   call site exists at the right spot. ~100 ms at 48 kHz. */
+/* Still a placeholder value (DESIGN.md IV.4 rule 6, IV.2 step 3; plan.md
+   VII gap 12): no numeric threshold is given anywhere in DESIGN.md or
+   the phase files, and phase 5b's own job is to turn this into a real
+   measurement via TRACE_RING_LOW, not to pick the number -- that is
+   deferred to phase 18 once real playback (phase 7+) generates data to
+   look at. trace_emit is real as of phase 5b, so this threshold now has
+   an observable effect (it gates when TRACE_RING_LOW's edge fires).
+   ~100 ms at 48 kHz. */
 #define RING_LOW_WATER_FRAMES 4800u
 #define RING_LOW_WATER_BYTES \
   ((size_t) RING_LOW_WATER_FRAMES * SINK_CHANNELS * sizeof(float))
-
-/* trace event ids -- local placeholders. audio/trace.c (phase 5b)
-   defines the real TraceEvent enum (DESIGN.md IV.10); when it lands,
-   these three #defines and the no-op trace_emit below are deleted and
-   replaced by "#include "../../include/audio/trace.h"". The call
-   sites in the two callbacks below do not change. */
-#define TRACE_UNDERRUN 0u
-#define TRACE_RING_LOW 1u
-#define TRACE_NOTIFY   2u
 
 /* --tone (plan.md VI.8): a 441 Hz SineSource with no ffmpeg and no
    file, per DESIGN.md VI. */
@@ -112,8 +109,32 @@ static atomic_bool           g_flushing        = false;
 static atomic_uint_least64_t g_frames_consumed = 0;
 static atomic_uint           g_cb_seq          = 0;
 static atomic_uint           g_underrun_count  = 0;
-static atomic_bool           g_cb_alive        = false; /* residual-risk-3 mitigation, phase-5-sink.md I.3 */
+static atomic_bool           g_cb_alive        = false; /* residual-risk-2 mitigation, phase-5-sink.md I.3 */
 static atomic_int            g_device_event    = -1;    /* last ma_device_notification_type, or -1 = none */
+
+/* The best (lowest) pcm_ring occupancy seen so far this device lifetime,
+   in bytes. TRACE_RING_LOW fires only when occupancy sets a new minimum
+   below RING_LOW_WATER_FRAMES, which is what makes the record stream
+   both bounded and truthful:
+
+     - Level-triggered (emit on every callback below the threshold)
+       measures the real minimum but floods a 4096-record trace_ring
+       during pre-fill and every quiet stretch, dropping the very
+       records the PCM_LEAD_SECONDS measurement depends on.
+     - Purely edge-triggered (emit once on the way below) is bounded but
+       reports the threshold back at you -- the record carries occupancy
+       at the crossing, so the low-water mark reads ~RING_LOW_WATER_FRAMES
+       on every run no matter how close to empty playback actually came.
+
+   New-minimum-only is self-limiting: each record must be strictly lower
+   than the last, so a burst converges in a handful of records rather
+   than thousands, and the final drain-to-empty at the end of playback --
+   the case a rising-edge scheme misses entirely -- is captured.
+
+   T3-owned exclusively: only kurono_data_callback reads or writes it, so
+   it needs no atomic. Reset in sink_open_impl for each new device
+   lifetime, before T3 can run. */
+static size_t g_ring_low_best = SIZE_MAX;
 
 /* IEEE-754 bit pattern of the current gain, DESIGN.md IV.2: "One
    representation, no lock-freedom check, no fallback branch." */
@@ -123,20 +144,6 @@ _Static_assert(sizeof(float) == 4, "gain bit-pattern atomic requires a 4-byte fl
 /* Cached, never owned -- see sink_set_event_pipe and DESIGN.md IV.9.b
    step 9's warning. -1 means "no wakeup pipe registered". */
 static int g_event_pipe_w = -1;
-
-/* trace_emit: no-op in phase 5. audio/trace.c (phase 5b) replaces this
-   with the real SPSC trace ring (DESIGN.md IV.10). The call sites are
-   written now, at the exact points the callback and notification-
-   callback contracts specify (DESIGN.md IV.2 step 3/4, IV.3), so the
-   callback is never reopened later just to add them. */
-static void
-trace_emit(uint32_t event, uint32_t a, uint32_t b, uint32_t c)
-{
-  (void) event;
-  (void) a;
-  (void) b;
-  (void) c;
-} /* trace_emit */
 
 /* apply_gain: multiply n interleaved f32 samples in buf by the current
    gain, in place. T3-only. One relaxed atomic load, one union
@@ -183,7 +190,10 @@ kurono_data_callback(ma_device * dev, void * out, const void * in,
 
   /* 3 */ size_t got = ring_read(&g_pcm_ring, out, want);
           size_t occ = ring_fill(&g_pcm_ring);
-          if (occ < RING_LOW_WATER_BYTES) {
+          /* New minimum only, not every callback below the threshold and
+             not just the crossing -- see g_ring_low_best above. */
+          if (occ < RING_LOW_WATER_BYTES && occ < g_ring_low_best) {
+            g_ring_low_best = occ;
             trace_emit(TRACE_RING_LOW,
                        (uint32_t) (occ / (SINK_CHANNELS * sizeof(float))), 0, 0);
           }
@@ -320,6 +330,17 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
   atomic_store_explicit(&g_cb_seq, 0, memory_order_release);
   atomic_store_explicit(&g_underrun_count, 0, memory_order_relaxed);
   atomic_store_explicit(&g_device_event, -1, memory_order_release);
+  g_ring_low_best = SIZE_MAX; /* fresh device lifetime -- see its declaration */
+
+  /* Register g_frames_consumed and R with audio/trace.c (trace.h: "call
+     once, from sink.c ... once R is known"). Must happen before
+     ma_device_start (sink_start_impl, called separately) -- T3 does not
+     exist as a running consumer of these until then, but trace_emit is
+     reachable from the very first pre-fill invocation on T1
+     (DESIGN.md IV.1), so both registrations belong here, at the end of
+     open, not deferred to start. */
+  trace_set_frame_counter(&g_frames_consumed);
+  trace_set_sample_rate(r);
 
   atomic_store_explicit(&g_device_open, true, memory_order_release);
   return 0;

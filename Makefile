@@ -28,7 +28,10 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # its first real caller (pcm_ring/viz_ring), so ring.c can no longer sit
 # out of the main link the way it did while only tools/ring_stress.c
 # used it.
-SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c
+# src/audio/trace.c (phase 5b) is wired in immediately, same as ring.c
+# and sink.c before it -- audio/sink.c's callbacks are its only callers.
+SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
+       src/audio/trace.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
@@ -105,9 +108,11 @@ build/tsan/%.o: src/%.c
 # own implementation inside audio/sink.c -- that block is bracketed by a
 # #pragma GCC diagnostic push/ignored/pop around the #include, scoped to
 # exactly the vendored code, not ours (see the top of sink.c).
-build/default/audio/ring.o build/default/audio/sink.o \
-build/asan/audio/ring.o    build/asan/audio/sink.o \
-build/tsan/audio/ring.o    build/tsan/audio/sink.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
+# audio/trace.c (phase 5b) joins the same rule: it is the third SPSC ring
+# instance and shares the same scrutiny as ring.c and sink.c.
+build/default/audio/ring.o build/default/audio/sink.o build/default/audio/trace.o \
+build/asan/audio/ring.o    build/asan/audio/sink.o    build/asan/audio/trace.o \
+build/tsan/audio/ring.o    build/tsan/audio/sink.o    build/tsan/audio/trace.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
 
 # pkg-config failure must name the missing MODULE, never a distro
 # package -- module names are the stable cross-distro interface
