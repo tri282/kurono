@@ -1,6 +1,7 @@
 #include "../include/main.h"
 #include "../include/config.h"
 #include "../include/event.h"
+#include "../include/audio/sink.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -192,11 +193,13 @@ run_headless(void)
 /*
  * Entry point. Handles --version by printing "kurono <version>" to
  * stdout and returning 0, --paths by resolving the Config and printing
- * it (see print_paths), and --headless by running the phase-4 event-loop
+ * it (see print_paths), --headless by running the phase-4 event-loop
  * smoke test (see run_headless) until SIGINT/SIGTERM/SIGHUP or a tty
- * hangup. Any other invocation (including no arguments) prints a
- * one-line "not implemented yet" notice to stderr and returns 1 --
- * startup, wiring, and teardown land in later phases. Takes the process
+ * hangup, and --tone by running the phase-5 sink/ring/callback smoke
+ * test (sink_run_tone, plan.md VI.8) with no event loop and no audio
+ * file. Any other invocation (including no arguments) prints a one-line
+ * "not implemented yet" notice to stderr and returns 1 -- startup,
+ * wiring, and teardown land in later phases. Takes the process
  * argc/argv, returns the process exit status.
  */
 int
@@ -221,6 +224,12 @@ main(int argc, char * argv[])
     /* Temporary, plan.md VI.8 diagnostic scaffolding -- removed in
        phase 11 when ui/tui.c gives kurono a real event loop body. */
     return run_headless();
+  }
+
+  if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
+    /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
+       device, ring, and callback with no ffmpeg and no audio file. */
+    return (sink_run_tone() == 0) ? 0 : 1;
   }
 
   fprintf(stderr, "kurono: not implemented yet\n");

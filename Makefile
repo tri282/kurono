@@ -21,20 +21,21 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 
 # Explicit, not a wildcard: an orphaned file must be visible, not silently
 # picked up. src/config.c lands in phase 3, src/event.c in phase 4, and
-# both are linked immediately -- audio/sink.c, audio/decoder.c,
-# audio/engine.c, queue.c, ui/*, library/* land in their own phases and
-# get added here then.
-# src/audio/ring.c (phase 1) is not yet linked into the kurono binary --
-# nothing wires it in before audio/engine.c (phase 7) -- so it is not in
-# SRCS; it is built separately by the ring-stress target below.
-SRCS = src/main.c src/config.c src/event.c
+# both are linked immediately -- audio/decoder.c, audio/engine.c,
+# queue.c, ui/*, library/* land in their own phases and get added here
+# then.
+# src/audio/ring.c (phase 1) moves in here in phase 5: audio/sink.c is
+# its first real caller (pcm_ring/viz_ring), so ring.c can no longer sit
+# out of the main link the way it did while only tools/ring_stress.c
+# used it.
+SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c
 
 # Sources that exist and must be statically analysed, but are not yet
-# linked into the kurono binary. src/audio/ring.c is the phase-1 ring and
-# is the single most analysis-worthy file in the tree, so `make analyze`
-# must not skip it just because nothing links it before phase 7. Move
-# each entry into SRCS when its phase wires it in.
-UNLINKED_SRCS = src/audio/ring.c
+# linked into the kurono binary. Move each entry into SRCS when its
+# phase wires it in. Empty as of phase 5 -- audio/ring.c moved into SRCS
+# above; kept as a named list (not deleted) so a future orphaned file is
+# visible here rather than silently unanalysed.
+UNLINKED_SRCS =
 
 OBJS_DEFAULT = $(SRCS:src/%.c=build/default/%.o)
 OBJS_ASAN    = $(SRCS:src/%.c=build/asan/%.o)
@@ -100,10 +101,10 @@ build/tsan/%.o: src/%.c
 	$(CC) $(CFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
 # DESIGN.md XII.5 / plan.md VI.1: -Wvla -Wshadow -Wconversion for the
-# audio path specifically. Listed against every mode's object path for
-# both ring.o and sink.o even though audio/sink.c does not exist until
-# phase 5 -- a target-specific variable on a file that is never built is
-# inert, and this way the rule does not need editing when sink.c lands.
+# audio path specifically. -Wconversion does not reach vendor/miniaudio.h's
+# own implementation inside audio/sink.c -- that block is bracketed by a
+# #pragma GCC diagnostic push/ignored/pop around the #include, scoped to
+# exactly the vendored code, not ours (see the top of sink.c).
 build/default/audio/ring.o build/default/audio/sink.o \
 build/asan/audio/ring.o    build/asan/audio/sink.o \
 build/tsan/audio/ring.o    build/tsan/audio/sink.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
@@ -139,10 +140,10 @@ analyze:
 	done
 
 # Pure, dependency-free, TSan-checkable: no PKGS, no check-deps. Links
-# tools/ring_stress.c against src/audio/ring.c directly -- ring.c is not
-# part of SRCS/kurono's own link yet (see the SRCS comment above), so it
-# is compiled here into its own build/tsan/audio/ring.o, which is the
-# same object the EXTRA_WARN rule above already covers.
+# tools/ring_stress.c against src/audio/ring.c directly, compiled here
+# into build/tsan/audio/ring.o -- the same object path (and so the same
+# EXTRA_WARN rule above) that linking kurono-tsan itself produces, now
+# that ring.c is in SRCS (phase 5).
 # -fsanitize=thread is set on tools/ring_stress itself, not on the
 # ring-stress phony alias, so that `make tools/ring_stress` typed
 # directly cannot build non-TSan objects into build/tsan/.
