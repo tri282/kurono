@@ -314,6 +314,56 @@ run_decode(const char * path)
    (plan.md VI.8, phase-7-engine.md I.9: "position printed at 1 Hz"). */
 #define PLAY_POLL_MS 1000
 
+/* Seek-stress target step. A prime, so consecutive targets land far
+   apart in the file rather than walking forward: the flush_gen defect
+   this row exists to stress is a flush arriving while T2 is midway
+   through writing a decoded chunk, and adjacent targets let T2 satisfy
+   the next seek out of work it has already done. */
+#define SEEK_STRESS_STEP_MS 7919
+
+/* Settle time after the stress burst before the position is sampled --
+   long enough for T2 to refill and T3 to consume past the resync
+   point, short enough not to drift into the next second. */
+#define SEEK_SETTLE_MS 500
+
+/* How far the settled position may sit from the final seek target
+   before the resync is called wrong. Generous on purpose: this is
+   looking for the counters diverging permanently, which shows up as
+   seconds or minutes of error, not as jitter. */
+#define SEEK_TOLERANCE_MS 1000
+
+/* Bound on the wait for T2 to work through the seek backlog and settle
+   on the final target, and the poll step inside that wait. Generous:
+   under TSan every flush costs far more than it does in the default
+   build, and a false RESYNC FAIL from an impatient harness is worse
+   than a slow test. */
+#define SEEK_DRAIN_WAIT_MS 20000
+#define SEEK_DRAIN_POLL_MS 100
+
+/* engine_flush_begin's fence cap is FLUSH_FENCE_CAP_MS (200) in
+   audio/engine.c; the DESIGN.md IV.7.5 skip returns in microseconds.
+   Anything under this proves the skip branch fired. */
+#define FENCE_SKIP_MAX_MS 20
+
+/* Upper bound on the wait for T2 to make the paused-seek resync
+   visible. Must exceed engine.c's 200 ms fence cap by enough that a
+   fence that did run still reports a number instead of timing out. */
+#define FLUSH_FENCE_WAIT_MS 400
+
+/*
+ * PlayMode: which driver --play runs after EV_STREAM_INFO confirms the
+ * track is open. PLAY_PLAIN and PLAY_SEEK_ONCE are the two shapes
+ * --play already had. The other two exist to drive the two phase-7
+ * verify rows the 1 Hz poll loop cannot reach on its own
+ * (status/kurono/STATUS.md, "Phase 7 verify debt").
+ */
+typedef enum {
+  PLAY_PLAIN,
+  PLAY_SEEK_ONCE,
+  PLAY_SEEK_STRESS,
+  PLAY_SEEK_PAUSED
+} PlayMode;
+
 /*
  * play_sleep_ms: nanosleep for ms milliseconds. --play's poll-loop
  * helper only -- mirrors audio/sink.c's own sleep_ms, kept as a
@@ -330,6 +380,170 @@ play_sleep_ms(long ms)
 } /* play_sleep_ms */
 
 /*
+ * elapsed_ms: wall time between two CLOCK_MONOTONIC samples. Takes the
+ * earlier and later timespec, returns the difference in milliseconds.
+ */
+static double
+elapsed_ms(const struct timespec * t0, const struct timespec * t1)
+{
+  return (double) (t1->tv_sec - t0->tv_sec) * 1000.0
+       + (double) (t1->tv_nsec - t0->tv_nsec) / 1000000.0;
+} /* elapsed_ms */
+
+/*
+ * position_ms: the playback position implied by the frame counter.
+ * Reads g_frames_consumed (never the decoder -- DESIGN.md IV.1) and
+ * converts with the negotiated rate. Takes the counter and the sample
+ * rate, returns milliseconds, or -1 if the rate is not yet known.
+ */
+static int64_t
+position_ms(const atomic_uint_least64_t * pos, int rate)
+{
+  if (rate <= 0) {
+    return -1;
+  }
+  uint64_t frames = atomic_load_explicit(pos, memory_order_relaxed);
+  return (int64_t) (frames * 1000u / (uint64_t) rate);
+} /* position_ms */
+
+/*
+ * drive_seek_stress: the phase-7 "50 seeks in 5 s" verify row. Issues n
+ * back-to-back engine_seek calls with no sleep between them, so that
+ * commands land while T2 is mid-chunk -- which is the only state in
+ * which the flush_gen check in engine.c's fill loop does any work. The
+ * burst is naturally paced by cmd_push blocking on a full 16-slot
+ * queue, so T2 provably processes every one rather than coalescing.
+ *
+ * Then settles and checks that g_frames_consumed agrees with the last
+ * target: a broken resync leaves the write counter and the consumed
+ * counter permanently apart, which reads here as a position nowhere
+ * near where the seek asked for. Takes the Engine, the frame counter,
+ * the negotiated sample rate, the track duration, and the seek count;
+ * returns nothing (verdict goes to stderr).
+ */
+static void
+drive_seek_stress(Engine * e, const atomic_uint_least64_t * pos, int rate,
+                  int64_t duration_ms, int n)
+{
+  /* Keep targets a second clear of the end so a seek does not land on
+     EOF and end the run mid-burst. */
+  int64_t span = (duration_ms > 2000) ? duration_ms - 1000 : 1000;
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (int i = 0; i < n; i++) {
+    engine_seek(e, ((int64_t) i * SEEK_STRESS_STEP_MS) % span);
+  }
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  fprintf(stderr, "seek-stress: %d seeks issued in %.1f ms\n",
+          n, elapsed_ms(&t0, &t1));
+
+  int64_t target = span / 2;
+  engine_seek(e, target);
+
+  /* The burst leaves T2 with a backlog -- engine_seek only queues, and
+     cmd_push blocking at 16 slots means the caller returns long before
+     the last flush has run. Sampling on a fixed sleep reads whichever
+     intermediate target T2 happened to be on, which is not the thing
+     under test. Wait for convergence instead, and require two
+     consecutive in-tolerance samples that are advancing: a single one
+     could be an intermediate target that happens to sit near the final
+     one, but it will be seeked away from, while the settled position
+     stays and grows. */
+  int64_t got = -1, prev = -1, delta = -1;
+  int     converged = 0;
+  double  drain_ms  = 0.0;
+  struct timespec d0, d1;
+  clock_gettime(CLOCK_MONOTONIC, &d0);
+
+  for (int i = 0; i < SEEK_DRAIN_WAIT_MS / SEEK_DRAIN_POLL_MS; i++) {
+    play_sleep_ms(SEEK_DRAIN_POLL_MS);
+    got   = position_ms(pos, rate);
+    delta = (got >= target) ? got - target : target - got;
+    if (delta <= SEEK_TOLERANCE_MS && prev >= 0 && got > prev
+        && (prev >= target ? prev - target : target - prev) <= SEEK_TOLERANCE_MS) {
+      converged = 1;
+      clock_gettime(CLOCK_MONOTONIC, &d1);
+      drain_ms = elapsed_ms(&d0, &d1);
+      break;
+    }
+    prev = got;
+  }
+
+  fprintf(stderr,
+          "seek-stress: target=%lld ms position=%lld ms delta=%lld ms "
+          "drain=%.0f ms -- %s\n",
+          (long long) target, (long long) got, (long long) delta,
+          drain_ms, converged ? "RESYNC OK" : "RESYNC FAIL");
+} /* drive_seek_stress */
+
+/*
+ * drive_seek_paused: the phase-7 "seek while paused" verify row, which
+ * exists to prove the DESIGN.md IV.7.5 fence skip. engine.c never
+ * stops the device -- that is T1's job and does not exist as a policy
+ * until phase 8/12 -- so this harness, which *is* T1, stops it
+ * directly. That is the whole point: with the device stopped,
+ * sink_is_started returns false and engine_flush_begin must reset
+ * immediately instead of burning the 200 ms fence cap.
+ *
+ * Timing is the assertion. A skipped fence returns in microseconds; a
+ * fence that ran polls at 1 ms up to 200 ms. Note this proves the skip
+ * mechanism, not phase 8/12's pause policy. Takes the Engine, the
+ * sink, the frame counter, the sample rate, and the seek target;
+ * returns nothing (verdict goes to stderr).
+ */
+static void
+drive_seek_paused(Engine * e, AudioSink * sink, const atomic_uint_least64_t * pos,
+                  int rate, int64_t seek_ms)
+{
+  engine_pause(e);
+  play_sleep_ms(SEEK_SETTLE_MS); /* let T2 reach its park before the device stops */
+
+  sink->stop(sink->self); /* T1 only, DESIGN.md IV.9.b; synchronous */
+  fprintf(stderr, "seek-paused: device stopped, sink_is_started=%d\n",
+          sink_is_started(sink));
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  engine_seek(e, seek_ms);
+
+  /* engine_seek only queues; the flush happens on T2. Wait for the
+     resync to become visible in the counter rather than timing the
+     queue push, which would measure nothing. */
+  int64_t got = -1;
+  double  ms  = 0.0;
+  for (int i = 0; i < FLUSH_FENCE_WAIT_MS; i++) {
+    got = position_ms(pos, rate);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = elapsed_ms(&t0, &t1);
+    if (got >= 0 && llabs((long long) (got - seek_ms)) <= SEEK_TOLERANCE_MS) {
+      break;
+    }
+    play_sleep_ms(1);
+  }
+
+  fprintf(stderr,
+          "seek-paused: resync visible after %.2f ms (position=%lld ms) -- %s\n",
+          ms, (long long) got,
+          (ms < (double) FENCE_SKIP_MAX_MS) ? "FENCE SKIPPED" : "FENCE RAN");
+
+  if (sink->start(sink->self) != 0) {
+    fprintf(stderr, "seek-paused: sink restart failed\n");
+  }
+  engine_resume(e);
+
+  /* Prove the resume actually produced audio: the counter must advance
+     past the seek target, which it cannot do unless T3 is running again
+     and T2 refilled the ring the flush emptied. */
+  int64_t before = position_ms(pos, rate);
+  play_sleep_ms(SEEK_SETTLE_MS);
+  int64_t after = position_ms(pos, rate);
+  fprintf(stderr, "seek-paused: after resume %lld -> %lld ms -- %s\n",
+          (long long) before, (long long) after,
+          (after > before) ? "PLAYBACK RESUMED" : "STALLED");
+} /* drive_seek_paused */
+
+/*
  * run_play: implements --play FILE [--seek MS] (plan.md VI.8,
  * phase-7-engine.md I.9). Opens the sink, wires an Engine to it
  * (engine_create), starts T2 and the device, pushes CMD_PLAY, and
@@ -341,11 +555,13 @@ play_sleep_ms(long ms)
  * is built for this diagnostic -- engine_set_event_pipe is never
  * called, so Engine's doorbell write is skipped (fd stays -1), exactly
  * the pattern sink_run_tone already uses to run standalone. Takes the
- * file path, whether --seek was given, and the seek target in ms;
- * returns 0 on a clean EOF, 1 on any open/decode failure.
+ * file path, the PlayMode, and its argument (a seek target in ms for
+ * PLAY_SEEK_ONCE and PLAY_SEEK_PAUSED, a seek count for
+ * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN); returns 0 on a clean EOF,
+ * 1 on any open/decode failure.
  */
 static int
-run_play(const char * path, int has_seek, int64_t seek_ms)
+run_play(const char * path, PlayMode mode, int64_t mode_arg)
 {
   AudioSink sink;
   sink_get(&sink);
@@ -387,7 +603,7 @@ run_play(const char * path, int has_seek, int64_t seek_ms)
   engine_play(e, path, PLAY_HEADLESS_TRACK_ID);
 
   const atomic_uint_least64_t * pos = sink_frames_consumed();
-  int seeked = 0;
+  int driven = 0; /* latches the one-shot driver in the EV_STREAM_INFO branch */
   int status = 0;
   int done   = 0;
 
@@ -402,9 +618,37 @@ run_play(const char * path, int has_seek, int64_t seek_ms)
                   "stream: codec=%s rate=%d channels=%d duration_ms=%lld\n",
                   ev.info.codec, ev.info.sample_rate, ev.info.channels,
                   (long long) ev.info.duration_ms);
-          if (has_seek && !seeked) {
-            engine_seek(e, seek_ms);
-            seeked = 1;
+          /* Every driver is one-shot and runs from here because this is
+             the first point at which the track is provably open and
+             ev.info.duration_ms is known. */
+          if (!driven) {
+            driven = 1;
+            switch (mode) {
+              case PLAY_SEEK_ONCE:
+                engine_seek(e, mode_arg);
+                break;
+              /* fmt.sample_rate, not ev.info.sample_rate: g_frames_consumed
+                 counts frames in the session format the sink negotiated,
+                 which is what the decoder resamples *to*. The source rate
+                 is a property of the file and is off by the resample
+                 ratio -- 44100 vs 48000 here. */
+              /* Both stress drivers end the run rather than playing on
+                 to EOF: the verdict is already decided, and a bounded
+                 run is what lets the sanitizer builds observe the full
+                 DESIGN.md IV.9.b teardown instead of being killed by an
+                 external timeout partway through a 4-minute track. */
+              case PLAY_SEEK_STRESS:
+                drive_seek_stress(e, pos, fmt.sample_rate,
+                                  ev.info.duration_ms, (int) mode_arg);
+                done = 1;
+                break;
+              case PLAY_SEEK_PAUSED:
+                drive_seek_paused(e, &sink, pos, fmt.sample_rate, mode_arg);
+                done = 1;
+                break;
+              case PLAY_PLAIN:
+                break;
+            }
           }
           break;
         case EV_OPEN_FAILED:
@@ -582,7 +826,8 @@ run_headless(void)
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
  * --decode FILE by running the phase-6 decoder smoke test (run_decode,
  * plan.md VI.8) with no device, no ring, and no threads, --play FILE
- * [--seek MS] by running the phase-7 engine smoke test (run_play,
+ * [--seek MS | --seek-stress N | --seek-paused MS] by running the
+ * phase-7 engine smoke test (run_play,
  * plan.md VI.8) -- a real sink and decoder wired together through
  * audio/engine.c's T2, headless -- and any other invocation (including
  * no arguments) by printing a one-line "not implemented yet" notice to
@@ -644,11 +889,16 @@ main(int argc, char * argv[])
        headless. Optional trailing "--seek MS" exercises the flush
        handshake once EV_STREAM_INFO confirms the track is open. */
     if (argc == 3) {
-      status = run_play(argv[2], 0, 0);
+      status = run_play(argv[2], PLAY_PLAIN, 0);
     } else if (argc == 5 && strcmp(argv[3], "--seek") == 0) {
-      status = run_play(argv[2], 1, (int64_t) atoll(argv[4]));
+      status = run_play(argv[2], PLAY_SEEK_ONCE, (int64_t) atoll(argv[4]));
+    } else if (argc == 5 && strcmp(argv[3], "--seek-stress") == 0) {
+      status = run_play(argv[2], PLAY_SEEK_STRESS, (int64_t) atoll(argv[4]));
+    } else if (argc == 5 && strcmp(argv[3], "--seek-paused") == 0) {
+      status = run_play(argv[2], PLAY_SEEK_PAUSED, (int64_t) atoll(argv[4]));
     } else {
-      fprintf(stderr, "kurono: usage: --play FILE [--seek MS]\n");
+      fprintf(stderr, "kurono: usage: --play FILE [--seek MS | "
+                      "--seek-stress N | --seek-paused MS]\n");
       status = 1;
     }
 
