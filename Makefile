@@ -34,8 +34,10 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # in immediately for the same reason: --decode (main.c) is its only
 # caller in this phase, and an unlinked ffmpeg-facing file would go
 # unanalysed by `make analyze` until someone remembered to move it.
+# src/audio/engine.c (phase 7) is T2, wired in the same way -- --play
+# (main.c) is its only caller in this phase.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
-       src/audio/trace.c src/audio/decoder.c
+       src/audio/trace.c src/audio/decoder.c src/audio/engine.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
@@ -48,8 +50,8 @@ OBJS_DEFAULT = $(SRCS:src/%.c=build/default/%.o)
 OBJS_ASAN    = $(SRCS:src/%.c=build/asan/%.o)
 OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
-.PHONY: all release debug asan tsan analyze check-layering check-deps \
-        ring-stress install uninstall clean
+.PHONY: all release debug asan tsan analyze check check-layering check-flush \
+        check-deps ring-stress install uninstall clean
 
 all: kurono
 
@@ -114,9 +116,11 @@ build/tsan/%.o: src/%.c
 # exactly the vendored code, not ours (see the top of sink.c).
 # audio/trace.c (phase 5b) joins the same rule: it is the third SPSC ring
 # instance and shares the same scrutiny as ring.c and sink.c.
-build/default/audio/ring.o build/default/audio/sink.o build/default/audio/trace.o \
-build/asan/audio/ring.o    build/asan/audio/sink.o    build/asan/audio/trace.o \
-build/tsan/audio/ring.o    build/tsan/audio/sink.o    build/tsan/audio/trace.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
+# audio/engine.c (phase 7) joins too -- it is T2, on the audio path,
+# and holds the pcm_ring producer side.
+build/default/audio/ring.o build/default/audio/sink.o build/default/audio/trace.o build/default/audio/engine.o \
+build/asan/audio/ring.o    build/asan/audio/sink.o    build/asan/audio/trace.o    build/asan/audio/engine.o \
+build/tsan/audio/ring.o    build/tsan/audio/sink.o    build/tsan/audio/trace.o    build/tsan/audio/engine.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
 
 # pkg-config failure must name the missing MODULE, never a distro
 # package -- module names are the stable cross-distro interface
@@ -138,6 +142,37 @@ check-layering:
 	@! grep -rn 'include/ui/' src/audio src/library 2>/dev/null \
 	  || { echo "layering violation: audio/ or library/ includes ui/"; exit 1; }
 	@echo "layering ok"
+
+# amendment-02-trace-ring.md decision 9 / DESIGN.md IV.8.b's generalising
+# rule: ring_reset(pcm_ring) may only ever be called from inside
+# pcm_flush_and_resync (src/audio/engine.c). Matches ring_reset( calls
+# whose argument mentions pcm_ring specifically -- not every ring_reset(
+# call (boundary_ring's own reset is unrestricted) and not ring.c's own
+# function definition, `ring_reset(Ring * r)`, whose parameter name does
+# not contain "pcm_ring" -- then counts that pattern against the count
+# inside pcm_flush_and_resync's body (the lines from its column-0
+# signature to its column-0 closing-brace comment) and fails if they
+# differ. A third call site, or a call site outside the function, no
+# longer builds. The same mechanical move check-layering makes for the
+# dependency graph, applied to this invariant instead. Like
+# check-layering, this is a grep and can be defeated by a macro or an
+# alias -- catches the accidental case, not the adversarial one
+# (amendment-02-trace-ring.md residual risks).
+check-flush:
+	@total=$$(grep -rnE 'ring_reset\([^)]*pcm_ring' src --include=*.c | wc -l | tr -d ' '); \
+	 infn=$$(awk '/^pcm_flush_and_resync\(/{f=1} f && /ring_reset\([^)]*pcm_ring/{c++} /^} \/\* pcm_flush_and_resync \*\//{f=0} END{print c+0}' src/audio/engine.c); \
+	 if [ "$$total" != "$$infn" ]; then \
+	   echo "check-flush: ring_reset(...pcm_ring...) called outside pcm_flush_and_resync (src/audio/engine.c)"; \
+	   echo "  $$total occurrence(s) in src/, $$infn inside the function:"; \
+	   grep -rnE 'ring_reset\([^)]*pcm_ring' src --include=*.c; \
+	   exit 1; \
+	 fi; \
+	 echo "check-flush ok ($$total ring_reset(...pcm_ring...) call(s), all inside pcm_flush_and_resync)"
+
+# Aggregate for the two grep-based invariants (DESIGN.md III.1, IV.8.b).
+# Each also runs standalone; this is the one-word form for a phase's
+# verify block.
+check: check-layering check-flush
 
 # -fanalyzer over every SRC, no output produced. DEFS/TB_OPT_ATTR_W=32
 # carried even though no SRC yet includes termbox2.h -- see the DEFS

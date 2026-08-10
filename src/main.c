@@ -2,14 +2,17 @@
 #include "../include/config.h"
 #include "../include/event.h"
 #include "../include/audio/decoder.h"
+#include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c; a local constant here
@@ -301,6 +304,156 @@ run_decode(const char * path)
   return status;
 } /* run_decode */
 
+/* Arbitrary: --play has no library, so there is no real track_id to
+   report in EV_STREAM_INFO/EV_OPEN_FAILED/EV_DECODE_ERROR. Any
+   constant works here -- phase 12+ replaces this whole diagnostic path
+   with a real queue cursor. */
+#define PLAY_HEADLESS_TRACK_ID 1
+
+/* Position-print / event-poll interval for --play's headless loop
+   (plan.md VI.8, phase-7-engine.md I.9: "position printed at 1 Hz"). */
+#define PLAY_POLL_MS 1000
+
+/*
+ * play_sleep_ms: nanosleep for ms milliseconds. --play's poll-loop
+ * helper only -- mirrors audio/sink.c's own sleep_ms, kept as a
+ * separate static here rather than exported, the same non-sharing
+ * choice sink.c already made for its identical helper.
+ */
+static void
+play_sleep_ms(long ms)
+{
+  struct timespec ts;
+  ts.tv_sec  = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+} /* play_sleep_ms */
+
+/*
+ * run_play: implements --play FILE [--seek MS] (plan.md VI.8,
+ * phase-7-engine.md I.9). Opens the sink, wires an Engine to it
+ * (engine_create), starts T2 and the device, pushes CMD_PLAY, and
+ * polls once per second: drains every posted Event (printing
+ * EV_STREAM_INFO once and issuing the one-shot --seek on it if
+ * requested, exiting the loop on EV_OPEN_FAILED/EV_DECODE_ERROR/
+ * EV_EOF) and otherwise prints the current position computed from
+ * sink_frames_consumed() and the negotiated sample rate. No event loop
+ * is built for this diagnostic -- engine_set_event_pipe is never
+ * called, so Engine's doorbell write is skipped (fd stays -1), exactly
+ * the pattern sink_run_tone already uses to run standalone. Takes the
+ * file path, whether --seek was given, and the seek target in ms;
+ * returns 0 on a clean EOF, 1 on any open/decode failure.
+ */
+static int
+run_play(const char * path, int has_seek, int64_t seek_ms)
+{
+  AudioSink sink;
+  sink_get(&sink);
+
+  SessionFormat fmt;
+  memset(&fmt, 0, sizeof(fmt));
+
+  if (sink.open(sink.self, &fmt, NULL, NULL) != 0) {
+    fprintf(stderr, "kurono: --play: sink open failed\n");
+    return 1;
+  }
+
+  Engine * e = engine_create(&fmt, &sink);
+  if (e == NULL) {
+    fprintf(stderr, "kurono: --play: engine_create failed\n");
+    sink.close(sink.self);
+    sink_free_rings();
+    return 1;
+  }
+
+  if (engine_start(e) != 0) {
+    fprintf(stderr, "kurono: --play: engine_start failed\n");
+    engine_destroy(e);
+    sink.close(sink.self);
+    sink_free_rings(); /* T2 never started, so nothing can still reach the rings */
+    return 1;
+  }
+
+  if (sink.start(sink.self) != 0) {
+    fprintf(stderr, "kurono: --play: sink start failed\n");
+    sink.close(sink.self);
+    engine_quit(e);
+    engine_join(e);
+    sink_free_rings();
+    engine_destroy(e);
+    return 1;
+  }
+
+  engine_play(e, path, PLAY_HEADLESS_TRACK_ID);
+
+  const atomic_uint_least64_t * pos = sink_frames_consumed();
+  int seeked = 0;
+  int status = 0;
+  int done   = 0;
+
+  while (!done) {
+    play_sleep_ms(PLAY_POLL_MS);
+
+    Event ev;
+    while (!done && engine_poll_event(e, &ev)) {
+      switch (ev.kind) {
+        case EV_STREAM_INFO:
+          fprintf(stderr,
+                  "stream: codec=%s rate=%d channels=%d duration_ms=%lld\n",
+                  ev.info.codec, ev.info.sample_rate, ev.info.channels,
+                  (long long) ev.info.duration_ms);
+          if (has_seek && !seeked) {
+            engine_seek(e, seek_ms);
+            seeked = 1;
+          }
+          break;
+        case EV_OPEN_FAILED:
+          fprintf(stderr, "kurono: --play: open failed (error %d)\n", ev.averror);
+          status = 1;
+          done   = 1;
+          break;
+        case EV_DECODE_ERROR:
+          fprintf(stderr, "kurono: --play: decode error (error %d)\n", ev.averror);
+          status = 1;
+          done   = 1;
+          break;
+        case EV_EOF:
+          done = 1;
+          break;
+      }
+    }
+
+    if (!done) {
+      uint64_t frames  = atomic_load_explicit(pos, memory_order_relaxed);
+      double   seconds = (fmt.sample_rate > 0)
+                            ? (double) frames / (double) fmt.sample_rate
+                            : 0.0;
+      fprintf(stderr, "position: %.2f s\n", seconds);
+    }
+  }
+
+  /* DESIGN.md IV.9.b, in its exact order. Steps 4 and 5 must not be
+     moved above step 2: if T2 exits while T3 is still consuming, T3
+     plays out the ring and then silence -- harmless on its own, but it
+     puts the ring free (step 6) within reach of a live callback, which
+     is a use-after-free on the audio thread. Stopping the device first
+     makes that ordering error impossible to write. Step 6 is
+     sink_free_rings, split out of AudioSink.close for this phase
+     precisely because T2 also touches pcm_ring and is not joined until
+     step 5. engine_destroy frees boundary_ring, whose only toucher is
+     the now-joined T2. There is no step 1 here (no g_shutdown flag and
+     no device-loss policy until phase 8) and no steps 7-10 (no db, no
+     TUI, no event loop in this diagnostic). */
+  sink.stop(sink.self);   /* step 2: synchronous; T3 has finished its last invocation */
+  sink.close(sink.self);  /* step 3: ma_device_uninit joins T3 */
+  engine_quit(e);         /* step 4 */
+  engine_join(e);         /* step 5: the only legal way to know T2 is done */
+  sink_free_rings();      /* step 6: both touchers of pcm_ring provably gone */
+  engine_destroy(e);
+
+  return status;
+} /* run_play */
+
 /*
  * evsrc_name: the diagnostic label for an EventSource, for the
  * headless loop's one-line-per-wakeup stderr output. Takes the tag,
@@ -428,9 +581,12 @@ run_headless(void)
  * --tone by running the phase-5 sink/ring/callback smoke test
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
  * --decode FILE by running the phase-6 decoder smoke test (run_decode,
- * plan.md VI.8) with no device, no ring, and no threads, and any other
- * invocation (including no arguments) by printing a one-line "not
- * implemented yet" notice to stderr. Startup, wiring, and
+ * plan.md VI.8) with no device, no ring, and no threads, --play FILE
+ * [--seek MS] by running the phase-7 engine smoke test (run_play,
+ * plan.md VI.8) -- a real sink and decoder wired together through
+ * audio/engine.c's T2, headless -- and any other invocation (including
+ * no arguments) by printing a one-line "not implemented yet" notice to
+ * stderr. Startup, wiring, and
  * teardown ordering for a real run land in later phases. Takes the
  * process argc/argv, returns the process exit status.
  */
@@ -481,6 +637,20 @@ main(int argc, char * argv[])
     /* plan.md VI.8 diagnostic scaffolding -- exercises audio/decoder.c's
        AudioSource over ffmpeg with no device, no ring, and no threads. */
     status = run_decode(argv[2]);
+
+  } else if (argc >= 3 && strcmp(argv[1], "--play") == 0) {
+    /* plan.md VI.8 diagnostic scaffolding, phase-7-engine.md I.9 --
+       exercises audio/engine.c's T2 wired to a real sink and decoder,
+       headless. Optional trailing "--seek MS" exercises the flush
+       handshake once EV_STREAM_INFO confirms the track is open. */
+    if (argc == 3) {
+      status = run_play(argv[2], 0, 0);
+    } else if (argc == 5 && strcmp(argv[3], "--seek") == 0) {
+      status = run_play(argv[2], 1, (int64_t) atoll(argv[4]));
+    } else {
+      fprintf(stderr, "kurono: usage: --play FILE [--seek MS]\n");
+      status = 1;
+    }
 
   } else {
     fprintf(stderr, "kurono: not implemented yet\n");

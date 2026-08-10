@@ -136,6 +136,15 @@ static atomic_int            g_device_event    = -1;    /* last ma_device_notifi
    lifetime, before T3 can run. */
 static size_t g_ring_low_best = SIZE_MAX;
 
+/* Phase 7 carry-in item (plans/kurono/05-impl/phase-7.md): gates
+   TRACE_RING_LOW so it measures playback headroom, not the terminal
+   drain-to-empty every run ends with once T2 parks. T3-read (relaxed,
+   inside the callback), T2-written via sink_set_producer_active on
+   every producing/parked transition -- see that function's comment in
+   sink.h. Defaults false: before engine.c's first CMD_PLAY succeeds,
+   the ring is provably not being actively filled. */
+static atomic_bool g_producer_active = false;
+
 /* IEEE-754 bit pattern of the current gain, DESIGN.md IV.2: "One
    representation, no lock-freedom check, no fallback branch." */
 static _Atomic uint32_t g_gain_bits;
@@ -191,8 +200,14 @@ kurono_data_callback(ma_device * dev, void * out, const void * in,
   /* 3 */ size_t got = ring_read(&g_pcm_ring, out, want);
           size_t occ = ring_fill(&g_pcm_ring);
           /* New minimum only, not every callback below the threshold and
-             not just the crossing -- see g_ring_low_best above. */
-          if (occ < RING_LOW_WATER_BYTES && occ < g_ring_low_best) {
+             not just the crossing -- see g_ring_low_best above. Also
+             gated on g_producer_active (phase 7 carry-in item, sink.h's
+             comment on sink_set_producer_active): without this gate the
+             low-water mark always converges to 0 by the end of any run,
+             because T2 parking at EOF drains the ring to empty on
+             purpose, which is not a measurement of playback headroom. */
+          if (occ < RING_LOW_WATER_BYTES && occ < g_ring_low_best
+              && atomic_load_explicit(&g_producer_active, memory_order_relaxed)) {
             g_ring_low_best = occ;
             trace_emit(TRACE_RING_LOW,
                        (uint32_t) (occ / (SINK_CHANNELS * sizeof(float))), 0, 0);
@@ -375,14 +390,14 @@ sink_stop_impl(void * self)
 } /* sink_stop_impl */
 
 /* sink_close_impl: AudioSink.close. Joins T3 (ma_device_uninit,
-   DESIGN.md IV.9.b step 3), then frees pcm_ring and viz_ring. Safe to
-   fold ring_free in here for phase 5's only caller (--tone, single-
-   threaded besides T3, which is provably gone once ma_device_uninit
-   returns). See phase-5.md "Open questions" for why phase 7/8's fuller
-   teardown -- where T2 also touches pcm_ring -- may need to split this
-   into a separate step ordered after the T2 join (DESIGN.md IV.9.b
-   step 6 is after step 5's join, not bundled with step 3's uninit).
-   Never closes g_event_pipe_w -- that fd is cached, not owned. */
+   DESIGN.md IV.9.b step 3) and uninitialises the context. Does NOT
+   free the rings -- that is step 6, and step 6 is after step 5's T2
+   join, not bundled with step 3's uninit. Phase 5 folded the two
+   together because --tone had no T2; phase 7 gives pcm_ring a second
+   toucher, so the split phase-5.md's "Open questions" anticipated is
+   now required. Every caller pairs this with sink_free_rings once T2
+   is joined. Never closes g_event_pipe_w -- that fd is cached, not
+   owned. */
 static void
 sink_close_impl(void * self)
 {
@@ -396,9 +411,15 @@ sink_close_impl(void * self)
   atomic_store_explicit(&g_device_open, false, memory_order_release);
   ma_device_uninit(&g_device); /* joins T3 */
   ma_context_uninit(&g_context);
+} /* sink_close_impl */
+
+/* sink_free_rings: see include/audio/sink.h. */
+void
+sink_free_rings(void)
+{
   ring_free(&g_pcm_ring);
   ring_free(&g_viz_ring);
-} /* sink_close_impl */
+} /* sink_free_rings */
 
 /* sink_get: see include/audio/sink.h. */
 void
@@ -422,6 +443,57 @@ sink_is_started(const AudioSink * s)
   }
   return ma_device_get_state(&g_device) == ma_device_state_started;
 } /* sink_is_started */
+
+/* sink_pcm_ring: see include/audio/sink.h. */
+Ring *
+sink_pcm_ring(void)
+{
+  if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+    return NULL;
+  }
+  return &g_pcm_ring;
+} /* sink_pcm_ring */
+
+/* sink_flush_flag: see include/audio/sink.h. */
+atomic_bool *
+sink_flush_flag(void)
+{
+  return &g_flushing;
+} /* sink_flush_flag */
+
+/* sink_cb_seq: see include/audio/sink.h. */
+const atomic_uint *
+sink_cb_seq(void)
+{
+  return &g_cb_seq;
+} /* sink_cb_seq */
+
+/* sink_frames_consumed: see include/audio/sink.h. */
+atomic_uint_least64_t *
+sink_frames_consumed(void)
+{
+  return &g_frames_consumed;
+} /* sink_frames_consumed */
+
+/* sink_set_gain: see include/audio/sink.h. */
+void
+sink_set_gain(float gain)
+{
+  union {
+    uint32_t bits;
+    float    f;
+  } u;
+  u.f = gain;
+  atomic_store_explicit(&g_gain_bits, u.bits, memory_order_relaxed);
+} /* sink_set_gain */
+
+/* sink_set_producer_active: see include/audio/sink.h. */
+void
+sink_set_producer_active(int active)
+{
+  atomic_store_explicit(&g_producer_active, active ? true : false,
+                         memory_order_relaxed);
+} /* sink_set_producer_active */
 
 /* sleep_ms: nanosleep for ms milliseconds. Main-thread (T1) helper for
    --tone's producer loop only -- never called from T2 or T3. */
@@ -499,6 +571,7 @@ sink_run_tone(void)
           if (sink.start(sink.self) != 0) {
             fprintf(stderr, "kurono: --tone: sink start failed\n");
             sink.close(sink.self);
+            sink_free_rings(); /* IV.9.b step 6; no T2 in --tone, so it is safe here */
             return -1;
           }
           started = 1;
@@ -512,6 +585,7 @@ sink_run_tone(void)
   if (!started && sink.start(sink.self) != 0) {
     fprintf(stderr, "kurono: --tone: sink start failed\n");
     sink.close(sink.self);
+    sink_free_rings();
     return -1;
   }
 
@@ -535,5 +609,6 @@ sink_run_tone(void)
          atomic_load_explicit(&g_underrun_count, memory_order_relaxed));
 
   sink.close(sink.self);
+  sink_free_rings();
   return 0;
 } /* sink_run_tone */
