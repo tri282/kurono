@@ -9,9 +9,11 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/signalfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -310,9 +312,18 @@ run_decode(const char * path)
    with a real queue cursor. */
 #define PLAY_HEADLESS_TRACK_ID 1
 
-/* Position-print / event-poll interval for --play's headless loop
-   (plan.md VI.8, phase-7-engine.md I.9: "position printed at 1 Hz"). */
-#define PLAY_POLL_MS 1000
+/* Redraw tick rate for the player loop (DESIGN.md VIII.3, ~30 Hz). It
+   drives the device-state watchdog (IV.8.a), the trace drain (IV.10),
+   and the 1 Hz position line -- the same tick, not three timers. */
+#define PLAYER_REDRAW_HZ 30
+
+/* Ticks between position lines, so the 30 Hz timer still prints at the
+   1 Hz phase-7-engine.md I.9 asks for. */
+#define PLAYER_POSITION_TICKS PLAYER_REDRAW_HZ
+
+/* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c, as HEADLESS_MAX_FIRED
+   is -- a local constant keeps main.c ignorant of that internal. */
+#define PLAYER_MAX_FIRED 8
 
 /* Seek-stress target step. A prime, so consecutive targets land far
    apart in the file rather than walking forward: the flush_gen defect
@@ -543,159 +554,870 @@ drive_seek_paused(Engine * e, AudioSink * sink, const atomic_uint_least64_t * po
           (after > before) ? "PLAYBACK RESUMED" : "STALLED");
 } /* drive_seek_paused */
 
+/* ---------------------------------------------------------------------
+ * Phase 8: startup and teardown ordering (DESIGN.md IV.9), the
+ * device-loss watchdog (IV.8.a), the reopen ladder (IV.8.b), and
+ * browse-only degradation (XI.2). All of it on T1.
+ * ------------------------------------------------------------------- */
+
 /*
- * run_play: implements --play FILE [--seek MS] (plan.md VI.8,
- * phase-7-engine.md I.9). Opens the sink, wires an Engine to it
- * (engine_create), starts T2 and the device, pushes CMD_PLAY, and
- * polls once per second: drains every posted Event (printing
- * EV_STREAM_INFO once and issuing the one-shot --seek on it if
- * requested, exiting the loop on EV_OPEN_FAILED/EV_DECODE_ERROR/
- * EV_EOF) and otherwise prints the current position computed from
- * sink_frames_consumed() and the negotiated sample rate. No event loop
- * is built for this diagnostic -- engine_set_event_pipe is never
- * called, so Engine's doorbell write is skipped (fd stays -1), exactly
- * the pattern sink_run_tone already uses to run standalone. Takes the
- * file path, the PlayMode, and its argument (a seek target in ms for
- * PLAY_SEEK_ONCE and PLAY_SEEK_PAUSED, a seek count for
- * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN); returns 0 on a clean EOF,
- * 1 on any open/decode failure.
+ * Teardown step 1's flag (DESIGN.md IV.9.b). Load-bearing, not
+ * cosmetic: step 2's ma_device_stop raises a `stopped` notification, and
+ * without this flag the policy table below would read our own orderly
+ * shutdown as device loss and start a reopen ladder against a device we
+ * are in the middle of destroying. It also disarms the IV.8.a watchdog.
+ * Written by T1 only, but read on the notification-dispatch path, so it
+ * is atomic rather than a plain int.
+ */
+static atomic_bool g_shutdown = false;
+
+/*
+ * IV.8.b step 3's ladder: 250 ms, 500 ms, 1 s, 2 s, 4 s, then every 4 s,
+ * giving up after 60 s of total failure and degrading to browse-only.
+ */
+static const int g_ladder_backoff_ms[] = { 250, 500, 1000, 2000, 4000 };
+#define LADDER_TAIL_MS    4000
+#define LADDER_GIVE_UP_MS 60000
+
+/*
+ * DeviceState: T1's own view of the device, distinct from EngineState.
+ * DESIGN.md IV.8 names a DEVICE_LOST engine state, but T1 storing it
+ * into the Engine's atomic would park T2 behind its back -- bypassing
+ * park(), leaving the producer-active flag set and the step 1 handshake
+ * stale. T1 tracks device policy here and parks T2 the one supported
+ * way, through engine_park_sync. See include/audio/engine.h's note on
+ * ENG_DEVICE_LOST.
+ */
+typedef enum { DEV_READY, DEV_LOST, DEV_BROWSE_ONLY } DeviceState;
+
+/*
+ * Player: everything one headless run of the audio spine owns, in
+ * construction order (DESIGN.md IV.9.a) so that teardown can be read as
+ * its exact reverse. Lives on run_player's stack for the whole run; the
+ * pointer registered with AudioSink.open as the notification user
+ * pointer is this struct, which is why it must outlive the sink.
+ */
+typedef struct {
+  Config        cfg;
+  AudioSink     sink;
+  SessionFormat fmt;
+  Engine *      e;
+  EventLoop *   el;
+
+  DeviceState     dev;
+  int             ladder_attempt;    /* index into g_ladder_backoff_ms */
+  int             ladder_elapsed_ms; /* against LADDER_GIVE_UP_MS */
+  struct timespec loss_at;           /* for the detection/recovery timings */
+  int64_t         pos_origin_ms;     /* IV.8.b step 5's elapsed-time origin */
+
+  PlayMode     mode;
+  int64_t      mode_arg;
+  int          driven;       /* latches the one-shot driver */
+
+  /* Raised across the ladder's own device teardown and reopen. Step 2's
+     ma_device_stop and step 6's ma_device_start each raise a
+     notification of their own, and those say nothing about the device
+     the user did or did not unplug -- they are our own actions coming
+     back. Without the mute, the `stopped` our step 2 caused can still be
+     sitting in sink.c's single pending slot when step 6 restores
+     DEV_READY, and the very next drain would read it as a fresh loss and
+     re-enter the ladder against a device that just came back. Exactly
+     the same reason g_shutdown exists for teardown step 2, applied to
+     the other place we stop the device on purpose. */
+  int notify_muted;
+
+  int running;
+  int status;
+  int tick;                  /* redraw ticks since the last position line */
+  int redraw_armed;
+} Player;
+
+static void player_ladder_begin(Player * p, const char * detector);
+static void player_ladder_attempt(Player * p);
+static void player_on_notify(void * user, int notification_type);
+
+/*
+ * trace_report_and_shutdown: teardown step 10 (DESIGN.md IV.9.b) --
+ * drain whatever trace_ring still holds, print the one-line summary and
+ * the flush snapshot (amendment 03), then free the ring. It sits at step
+ * 10 rather than step 6 for two reasons that pull in opposite
+ * directions: trace_shutdown frees a ring whose producer is T3, so it
+ * must follow step 3's uninit, but the drain and the summary write to
+ * stderr, which is unavailable until tb_shutdown at step 8.
+ *
+ * Idempotent, because two callers reach it: shutdown_all for a real run,
+ * and main for every diagnostic mode that never built a Player. Takes
+ * and returns nothing.
+ */
+static void
+trace_report_and_shutdown(void)
+{
+  static int done = 0;
+  if (done) {
+    return;
+  }
+  done = 1;
+
+  trace_drain();
+  char summary[128];
+  trace_summary_line(summary, sizeof summary);
+  fprintf(stderr, "%s\n", summary);
+
+  /* The flush snapshot is not in trace_ring and so is not in the drained
+     log (DESIGN.md IV.10, amendment 03). Rendered here for the same
+     reason trace_drain is: phase 11's redraw tick, which owns both, does
+     not exist yet. Suppressed when no flush ever happened, so plain
+     --tone and --headless runs stay one line. */
+  uint64_t flush_w = 0, flush_c = 0;
+  uint64_t flush_gen = engine_last_flush(&flush_w, &flush_c);
+  if (flush_gen > 0) {
+    fprintf(stderr, "kurono: %llu flush(es), last at write=%llu consumed=%llu\n",
+            (unsigned long long) flush_gen, (unsigned long long) flush_w,
+            (unsigned long long) flush_c);
+  }
+
+  trace_shutdown();
+} /* trace_report_and_shutdown */
+
+/*
+ * player_position_ms: the playback position T1 reports. Always
+ * g_frames_consumed, never the decoder (DESIGN.md IV.1), offset by the
+ * elapsed-time origin IV.8.b step 5 sets: a reopen resyncs both frame
+ * counters to 0, so without the origin every device loss would rewind
+ * the displayed clock to zero rather than continuing from where the
+ * track actually was. Takes the Player, returns milliseconds.
+ */
+static int64_t
+player_position_ms(const Player * p)
+{
+  int64_t since_flush = position_ms(sink_frames_consumed(), (int) p->fmt.sample_rate);
+  return (since_flush < 0) ? p->pos_origin_ms : p->pos_origin_ms + since_flush;
+} /* player_position_ms */
+
+/*
+ * player_set_redraw: arm or disarm redraw_timerfd. DESIGN.md VIII.3 arms
+ * it exactly while playing, which is what makes the IV.8.a watchdog cost
+ * one atomic load per tick and exist only when it can do something --
+ * there is nothing to poll while the device is gone or the track has
+ * ended. Takes the Player and 1 to arm / 0 to disarm, returns nothing.
+ */
+static void
+player_set_redraw(Player * p, int on)
+{
+  if (p->redraw_armed == on) {
+    return;
+  }
+  if (event_arm_redraw(p->el, on ? PLAYER_REDRAW_HZ : 0) != 0) {
+    fprintf(stderr, "kurono: warning: could not %s the redraw timer\n",
+            on ? "arm" : "disarm");
+    return;
+  }
+  p->redraw_armed = on;
+} /* player_set_redraw */
+
+/*
+ * notify_name: the status-bar label for a SinkNotification. Takes the
+ * value, returns a static string -- never NULL.
+ */
+static const char *
+notify_name(int type)
+{
+  switch (type) {
+    case SINK_NOTIFY_STARTED:            return "started";
+    case SINK_NOTIFY_STOPPED:            return "stopped";
+    case SINK_NOTIFY_REROUTED:           return "rerouted";
+    case SINK_NOTIFY_INTERRUPTION_BEGAN: return "interruption_began";
+    case SINK_NOTIFY_INTERRUPTION_ENDED: return "interruption_ended";
+    default:                             return "unknown";
+  }
+} /* notify_name */
+
+/*
+ * player_browse_only: DESIGN.md XI.2's degraded state. Reached when the
+ * device could not be opened at startup (IV.9.a step 5) or when the
+ * reopen ladder gave up after 60 s (IV.8.b step 3). Reallocates the
+ * rings at the default f32/48000/2 session format and rebinds the engine
+ * to them, so every ring pointer stays non-NULL and every code path
+ * stays uniform -- T2 remains created and parked rather than special-
+ * cased away.
+ *
+ * The run then ends. In the finished player this state keeps the TUI up
+ * with browsing, searching, and queueing live and playback actions
+ * reporting "no audio device"; there is no TUI in this phase, so there
+ * is nothing headless to browse and continuing would only block on an
+ * event loop with every timer disarmed. Takes the Player and the reason
+ * to report, returns nothing.
+ */
+static void
+player_browse_only(Player * p, const char * why)
+{
+  p->dev          = DEV_BROWSE_ONLY;
+  p->notify_muted = 0;
+  player_set_redraw(p, 0);
+  (void) event_arm_reconnect(p->el, 0);
+
+  /* Only when the rings are actually gone -- which is the ladder path,
+     where step 2 freed them. Reached from startup they were already
+     allocated at this same default format before T2 was created, and
+     freeing and reallocating them underneath a live (if parked) T2 for
+     no reason is precisely the move the rest of this phase exists to
+     make impossible. */
+  if (sink_pcm_ring() == NULL) {
+    if (sink_alloc_default_rings(&p->fmt) != 0) {
+      fprintf(stderr, "kurono: browse-only: ring allocation failed\n");
+      p->status  = 1;
+      p->running = 0;
+      return;
+    }
+    if (p->e != NULL && engine_device_reflush(p->e, &p->fmt) != 0) {
+      fprintf(stderr, "kurono: browse-only: engine rebind failed\n");
+    }
+  }
+
+  fprintf(stderr,
+          "device: BROWSE-ONLY (%s) -- no audio device; playback actions "
+          "report \"no audio device\". Rings allocated at f32/%u/%u, T2 "
+          "created and parked (DESIGN.md XI.2).\n",
+          why, p->fmt.sample_rate, p->fmt.channels);
+
+  p->running = 0;
+} /* player_browse_only */
+
+/*
+ * player_ladder_retry: IV.8.b step 3's failure arm -- schedule the next
+ * reopen attempt on reconnect_timerfd at the next backoff interval, or
+ * degrade to browse-only once 60 s of failure have accumulated. Takes
+ * the Player, returns nothing.
+ */
+static void
+player_ladder_retry(Player * p)
+{
+  const int nsteps = (int) (sizeof g_ladder_backoff_ms / sizeof g_ladder_backoff_ms[0]);
+  int delay = (p->ladder_attempt < nsteps) ? g_ladder_backoff_ms[p->ladder_attempt]
+                                           : LADDER_TAIL_MS;
+
+  if (p->ladder_elapsed_ms + delay > LADDER_GIVE_UP_MS) {
+    player_browse_only(p, "reopen ladder exhausted after 60 s");
+    return;
+  }
+
+  p->ladder_elapsed_ms += delay;
+  p->ladder_attempt++;
+
+  if (event_arm_reconnect(p->el, delay) != 0) {
+    player_browse_only(p, "reconnect timer could not be armed");
+    return;
+  }
+
+  fprintf(stderr, "device: reopen attempt %d failed, retrying in %d ms "
+                  "(%d ms of 60000 spent)\n",
+          p->ladder_attempt, delay, p->ladder_elapsed_ms);
+} /* player_ladder_retry */
+
+/*
+ * player_ladder_attempt: IV.8.b steps 3 through 6 -- one attempt at
+ * reopening the device, and on success the mandatory flush/resync, the
+ * restart, and the resume. Called once directly from
+ * player_ladder_begin and thereafter from every reconnect_timerfd
+ * expiry. Takes the Player, returns nothing.
+ */
+static void
+player_ladder_attempt(Player * p)
+{
+  if (atomic_load_explicit(&g_shutdown, memory_order_relaxed) || p->dev != DEV_LOST) {
+    return;
+  }
+
+  /* Step 3. */
+  if (p->sink.open(p->sink.self, &p->fmt, player_on_notify, p) != 0) {
+    player_ladder_retry(p);
+    return;
+  }
+
+  /* Step 4: unconditional flush and resync to frame 0, plus the
+     resampler retarget to the newly negotiated R. Legal because T3
+     provably does not exist yet (the device is initialised but not
+     started) and T2 is parked by step 1. A refusal here means the
+     handshake was skipped or the rings are gone -- resuming with the two
+     frame counters apart is the silent, permanent corruption step 5's
+     warning is about, so the run degrades instead. */
+  if (engine_device_reflush(p->e, &p->fmt) != 0) {
+    p->sink.close(p->sink.self);
+    player_browse_only(p, "flush/resync refused after reopen");
+    return;
+  }
+
+  /* Step 5 is already done: the elapsed-time origin was captured in
+     player_ladder_begin, before the flush zeroed the counter, and both
+     frame counters were resynced inside pcm_flush_and_resync. Writing
+     either counter again here would be a second store site that
+     `make check-flush` does not guard, because it guards ring_reset
+     calls and not counter stores. */
+
+  /* Step 6. */
+  if (p->sink.start(p->sink.self) != 0) {
+    p->sink.close(p->sink.self);
+    player_ladder_retry(p);
+    return;
+  }
+  engine_resume(p->e);
+  p->dev = DEV_READY;
+  (void) event_arm_reconnect(p->el, 0);
+  player_set_redraw(p, 1);
+
+  /* Drop everything our own stop/start put in the pending slot before
+     unmuting, so the first drain after recovery cannot read step 2's
+     `stopped` as a fresh loss. From here on the poll and the
+     notification both describe the new device. */
+  while (sink_dispatch_notifications()) {
+    /* discarded by the mute inside player_on_notify */
+  }
+  p->notify_muted = 0;
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  fprintf(stderr,
+          "device: REOPENED after %.0f ms (rate=%u), resumed at %lld ms\n",
+          elapsed_ms(&p->loss_at, &now), p->fmt.sample_rate,
+          (long long) p->pos_origin_ms);
+} /* player_ladder_attempt */
+
+/*
+ * player_ladder_begin: IV.8.b steps 1 and 2, then the first attempt.
+ * Entered from either detector -- the redraw-tick poll (authoritative)
+ * or a `stopped` notification arriving while playing (an early wakeup
+ * only). Takes the Player and the name of the detector that fired,
+ * returns nothing.
+ */
+static void
+player_ladder_begin(Player * p, const char * detector)
+{
+  if (p->dev != DEV_READY
+      || atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+    return;
+  }
+
+  p->dev               = DEV_LOST;
+  p->ladder_attempt    = 0;
+  p->ladder_elapsed_ms = 0;
+  clock_gettime(CLOCK_MONOTONIC, &p->loss_at);
+
+  /* Step 5's origin, captured here rather than after the reopen: the
+     flush in step 4 resyncs g_frames_consumed to 0, so the pre-loss
+     position has to be read while it still exists. */
+  p->pos_origin_ms = player_position_ms(p);
+  player_set_redraw(p, 0);
+
+  fprintf(stderr, "device: LOST (detected by %s) at %lld ms\n",
+          detector, (long long) p->pos_origin_ms);
+
+  /* Step 1. The synchronous park, not a bare CMD_PAUSE: step 4's
+     ring_reset runs on T1, and without this handshake it can land while
+     T2 is still inside its ring_write loop -- two threads mutating one
+     SPSC ring's write index. */
+  engine_park_sync(p->e);
+
+  /* Step 2, from T1 and only T1: both calls self-deadlock from T3
+     (DESIGN.md IV.3). Separate and in order -- ma_device_uninit
+     explicitly does not stop the device. Muted first: everything these
+     two raise is our own doing. */
+  p->notify_muted = 1;
+  p->sink.stop(p->sink.self);
+  p->sink.close(p->sink.self);
+
+  player_ladder_attempt(p);
+} /* player_ladder_begin */
+
+/*
+ * player_on_notify: DESIGN.md IV.8.a's notification policy table, in
+ * full. Registered with AudioSink.open and invoked by
+ * sink_dispatch_notifications on T1 -- never on T3, which only records
+ * the type and rings the doorbell. The notification is deliberately not
+ * the detector: `stopped` here is an early wakeup and the source of the
+ * status-bar message, and the poll in player_watchdog is what is
+ * authoritative. Takes the user pointer (the Player) and the
+ * SinkNotification, returns nothing.
+ */
+static void
+player_on_notify(void * user, int notification_type)
+{
+  Player * p = (Player *) user;
+
+  /* Row 5: anything at all while shutting down is discarded. Teardown
+     step 2 raises `stopped` by design. */
+  if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+    return;
+  }
+
+  fprintf(stderr, "device: notification %s%s\n", notify_name(notification_type),
+          p->notify_muted ? " (ours, during the ladder -- ignored)" : "");
+
+  /* Our own stop/start coming back to us -- see Player.notify_muted. */
+  if (p->notify_muted) {
+    return;
+  }
+
+  switch (notification_type) {
+    case SINK_NOTIFY_REROUTED:
+      /* Row 1: a status line and nothing else, in any state. PulseAudio
+         moved the stream transparently and the negotiated format is
+         unchanged; reopening would cause an audible gap for no benefit. */
+      fprintf(stderr, "device: stream rerouted (no reopen)\n");
+      break;
+
+    case SINK_NOTIFY_STOPPED:
+      /* Rows 2 and 3. Ignored unless the engine believes it is playing,
+         which is what makes PipeWire's idle-suspend a non-event while
+         paused or stopped. */
+      if (p->dev == DEV_READY && engine_state(p->e) == ENG_PLAYING) {
+        player_ladder_begin(p, "notification");
+      }
+      break;
+
+    case SINK_NOTIFY_STARTED:
+      /* Row 4: cancel the ladder and return to playing, but only if the
+         device-state poll agrees. Reachable only in the window between
+         a loss being declared and step 2 tearing the device down, which
+         this implementation makes vanishingly small by running steps 1-6
+         synchronously from the declaration -- kept because the policy
+         table is normative and a later phase may widen that window. */
+      if (p->dev == DEV_LOST && sink_is_started(&p->sink)) {
+        (void) event_arm_reconnect(p->el, 0);
+        p->dev = DEV_READY;
+        engine_resume(p->e);
+        player_set_redraw(p, 1);
+        fprintf(stderr, "device: recovered without a reopen\n");
+      }
+      break;
+
+    default:
+      break;
+  }
+} /* player_on_notify */
+
+/*
+ * player_watchdog: DESIGN.md IV.8.a's authoritative detector. On every
+ * redraw tick, if the engine is playing and the device is not started,
+ * declare device loss. One atomic load per tick, and the tick is armed
+ * only while playing, so it costs nothing when it cannot fire.
+ *
+ * It exists because the notification cannot be trusted: miniaudio raises
+ * `stopped` only when onDeviceStop returned MA_SUCCESS, and PulseAudio's
+ * onDeviceStop is a cork that fails when the stream is already dead --
+ * exactly the yanked-DAC case. The worker sets ma_device_state_stopped
+ * unconditionally, which is what this poll reads. Worst-case latency is
+ * one tick, 33 ms.
+ *
+ * Takes the Player, returns nothing.
+ */
+static void
+player_watchdog(Player * p)
+{
+  if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+    return; /* teardown stops the device on purpose */
+  }
+  if (p->dev != DEV_READY || engine_state(p->e) != ENG_PLAYING) {
+    return;
+  }
+  if (sink_is_started(&p->sink)) {
+    return;
+  }
+
+  /* If PipeWire's idle-suspend ever trips this with no device actually
+     lost (plan phase-8 III.2 / residual risk 3), the chosen fix is to
+     require two consecutive disagreeing ticks before declaring loss, and
+     it belongs here and nowhere else. Not applied speculatively. */
+  player_ladder_begin(p, "poll");
+} /* player_watchdog */
+
+/*
+ * player_handle_engine_event: drain one Event from T2 and act on it.
+ * EV_STREAM_INFO is where every --play driver fires, because it is the
+ * first point at which the track is provably open and its duration is
+ * known. Takes the Player and the event, returns nothing.
+ */
+static void
+player_handle_engine_event(Player * p, const Event * ev)
+{
+  switch (ev->kind) {
+    case EV_STREAM_INFO:
+      fprintf(stderr, "stream: codec=%s rate=%d channels=%d duration_ms=%lld\n",
+              ev->info.codec, ev->info.sample_rate, ev->info.channels,
+              (long long) ev->info.duration_ms);
+      if (p->driven) {
+        break;
+      }
+      p->driven = 1;
+      switch (p->mode) {
+        case PLAY_SEEK_ONCE:
+          engine_seek(p->e, p->mode_arg);
+          break;
+        /* fmt.sample_rate, not ev->info.sample_rate: g_frames_consumed
+           counts frames in the session format the sink negotiated, which
+           is what the decoder resamples *to*. The source rate is a
+           property of the file and is off by the resample ratio. */
+        /* Both stress drivers end the run rather than playing on to EOF:
+           the verdict is already decided, and a bounded run is what lets
+           the sanitiser builds observe the full IV.9.b teardown instead
+           of being killed by an external timeout partway through a
+           four-minute track. */
+        case PLAY_SEEK_STRESS:
+          drive_seek_stress(p->e, sink_frames_consumed(), (int) p->fmt.sample_rate,
+                            ev->info.duration_ms, (int) p->mode_arg);
+          p->running = 0;
+          break;
+        case PLAY_SEEK_PAUSED:
+          drive_seek_paused(p->e, &p->sink, sink_frames_consumed(),
+                            (int) p->fmt.sample_rate, p->mode_arg);
+          p->running = 0;
+          break;
+        case PLAY_PLAIN:
+          break;
+      }
+      break;
+
+    case EV_OPEN_FAILED:
+      fprintf(stderr, "kurono: --play: open failed (error %d)\n", ev->averror);
+      p->status  = 1;
+      p->running = 0;
+      break;
+
+    case EV_DECODE_ERROR:
+      fprintf(stderr, "kurono: --play: decode error (error %d)\n", ev->averror);
+      p->status  = 1;
+      p->running = 0;
+      break;
+
+    case EV_EOF:
+      player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
+      p->running = 0;
+      break;
+  }
+} /* player_handle_engine_event */
+
+/*
+ * player_drain_pipe: the EVSRC_PIPE branch. The doorbell carries no
+ * payload, so every byte is drained first and the two things that ring
+ * it are then polled in turn: T3's notification callback (dispatched to
+ * player_on_notify on this thread) and T2's event queue. trace_ring is
+ * drained here as well as on the tick, per DESIGN.md IV.10 -- no new fd,
+ * no new timer. Takes the Player, returns nothing.
+ */
+static void
+player_drain_pipe(Player * p)
+{
+  char    buf[64];
+  ssize_t r;
+  while ((r = read(event_pipe_read_fd(p->el), buf, sizeof buf)) > 0) {
+    /* discard: the byte is a wakeup, not a message */
+  }
+
+  while (sink_dispatch_notifications()) {
+    /* policy ran on T1; loop in case a second one landed meanwhile */
+  }
+
+  Event ev;
+  while (p->running && engine_poll_event(p->e, &ev)) {
+    player_handle_engine_event(p, &ev);
+  }
+
+  trace_drain();
+} /* player_drain_pipe */
+
+/*
+ * player_tick: the EVSRC_REDRAW branch, ~30 Hz. Runs the device-state
+ * watchdog, drains trace_ring, and prints the position line once a
+ * second. Phase 11 replaces this body with a real repaint and inherits
+ * the same three responsibilities. Takes the Player, returns nothing.
+ */
+static void
+player_tick(Player * p)
+{
+  player_watchdog(p);
+  trace_drain();
+
+  if (++p->tick < PLAYER_POSITION_TICKS) {
+    return;
+  }
+  p->tick = 0;
+
+  if (p->dev == DEV_READY) {
+    fprintf(stderr, "position: %.2f s\n", (double) player_position_ms(p) / 1000.0);
+  }
+} /* player_tick */
+
+/*
+ * shutdown_all: DESIGN.md IV.9.b, the normative teardown table, in
+ * order, with no merges. ACT_QUIT and SIGINT/SIGTERM/SIGHUP both
+ * converge here; there is no other exit path from a running state.
+ *
+ * The rule that generates the order: stop the threads you cannot join
+ * before you free anything they can reach; then stop and join the
+ * threads you can; then free. Steps 2 and 3 must not be merged or
+ * reordered -- ma_device_uninit explicitly does not stop the device --
+ * and steps 4 and 5 must not move above step 2, which is what makes the
+ * ordering error where step 6 frees rings a live callback is still
+ * reading impossible to write.
+ *
+ * Takes the Player, returns nothing.
+ */
+static void
+shutdown_all(Player * p)
+{
+  /* 1 */ atomic_store_explicit(&g_shutdown, true, memory_order_release);
+
+  /* 2. Synchronous: on return T3 has finished its last invocation and
+        will not be called again. Both calls are no-ops when no device is
+        open, which is the browse-only and mid-ladder case. */
+  p->sink.stop(p->sink.self);
+
+  /* The four-line residual-risk-2 mitigation phase 5 adopted: step 2
+     claims the callback is provably done, and this is what keeps that a
+     measurement rather than a belief. Reported, not assert(3)ed --
+     assert compiles out under -DNDEBUG. */
+  if (sink_cb_alive()) {
+    fprintf(stderr, "kurono: WARNING: data callback still alive after "
+                    "AudioSink.stop returned (DESIGN.md IV.9.b step 2)\n");
+  }
+
+  /* 3. Joins T3. g_event_pipe_w must still be open through this call:
+        step 2 fired a `stopped` notification from T3, which writes to
+        it. event_destroy closes it at step 9 and nowhere earlier. */
+  p->sink.close(p->sink.self);
+
+  /* 4 and 5. Guarded because a startup that failed before engine_create
+        reaches this function with no T2 to quit -- the ordering is
+        unchanged, the steps are simply empty. */
+  if (p->e != NULL) {
+    /* 4 */ engine_quit(p->e);
+    /* 5 */ engine_join(p->e); /* the only legal way to know T2 is done */
+  }
+
+  /* 6. Both touchers of pcm_ring are now provably gone: T3 joined by
+        step 3, T2 by step 5. engine_destroy frees boundary_ring, whose
+        only toucher is the joined T2, and closes whatever file the
+        AudioSource still had open. */
+  sink_free_rings();
+  engine_destroy(p->e);
+  p->e = NULL;
+
+  /* 7. sqlite3_finalize / sqlite3_close_v2 -- phase 13. */
+  /* 8. tb_shutdown -- phase 11. After it, and only after it, stderr may
+        be written again; there is no TUI in this phase, so stderr has
+        been available throughout. */
+
+  /* 9. UI state and the queue land in later phases; the config strings
+        and the event loop -- which owns the epoll fd, the signalfd, both
+        timerfds, and both ends of the self-pipe -- are what exist now.
+        The pipe's write end closes here and nowhere earlier, which is
+        why event.c owns it and sink.c only cached it. */
+  config_free(&p->cfg);
+  event_destroy(p->el);
+  p->el = NULL;
+
+  /* 10 */ trace_report_and_shutdown();
+} /* shutdown_all */
+
+/*
+ * player_loop: DESIGN.md IV.9.a step 10, the event loop. One epoll wait,
+ * four branches, no polling and no sleeping -- the 1 Hz position line
+ * that phase 7's diagnostic got from a nanosleep now comes off the same
+ * redraw tick that carries the device-state watchdog, which is the whole
+ * point of VIII.3's "one timer, several jobs".
+ *
+ * The tty and resize sources are phase 11's; event_create already
+ * registered everything event.c owns, so nothing here needs adding.
+ * Takes the Player, returns nothing -- the verdict is p->status.
+ */
+static void
+player_loop(Player * p)
+{
+  while (p->running) {
+    EventSource fired[PLAYER_MAX_FIRED];
+    int n = event_wait(p->el, fired, PLAYER_MAX_FIRED, -1);
+    if (n < 0) {
+      fprintf(stderr, "kurono: event_wait failed\n");
+      p->status  = 1;
+      p->running = 0;
+      break;
+    }
+
+    for (int i = 0; i < n && p->running; i++) {
+      switch (fired[i]) {
+        case EVSRC_SIGNAL: {
+          /* Drained rather than merely observed: the signalfd is
+             level-triggered, and naming the signal is what makes the
+             SIGINT and SIGTERM verify rows distinguishable in the log.
+             Both converge on shutdown_all, as does SIGHUP -- DESIGN.md
+             VIII.2 makes all three unconditional-shutdown sources. */
+          struct signalfd_siginfo si;
+          ssize_t r = read(event_signalfd(p->el), &si, sizeof si);
+          fprintf(stderr, "signal: %u -- shutting down\n",
+                  (r == (ssize_t) sizeof si) ? si.ssi_signo : 0u);
+          p->running = 0;
+          break;
+        }
+
+        case EVSRC_PIPE:
+          player_drain_pipe(p);
+          break;
+
+        case EVSRC_REDRAW:
+          player_tick(p);
+          break;
+
+        case EVSRC_RECONNECT:
+          player_ladder_attempt(p);
+          break;
+
+        case EVSRC_TTY:
+        case EVSRC_TTY_HUP:
+        case EVSRC_RESIZE:
+        case EVSRC_NONE:
+        case EVSRC_COUNT:
+        default:
+          break; /* phase 11 owns the terminal sources */
+      }
+    }
+  }
+} /* player_loop */
+
+/*
+ * run_play: implements --play FILE [--seek MS | --seek-stress N |
+ * --seek-paused MS] (plan.md VI.8, phase-7-engine.md I.9), rebuilt in
+ * phase 8 as the real thing rather than a poll loop: DESIGN.md IV.9.a's
+ * ten startup steps in order, the IV.9.a step 10 event loop with the
+ * IV.8.a device-loss watchdog on its redraw tick and the IV.8.b reopen
+ * ladder on its reconnect timer, and IV.9.b's teardown table on the way
+ * out. Steps 3, 4, and 9 are the only stubs -- db_open, scan_run, and
+ * tb_init belong to phases 13, 14, and 11.
+ *
+ * A device that cannot be opened or started is not fatal (DESIGN.md
+ * XI.2): the rings are allocated at the default session format, T2 is
+ * created and parked anyway, and the run reports browse-only.
+ *
+ * Takes the file path, the PlayMode, and its argument (a seek target in
+ * ms for PLAY_SEEK_ONCE and PLAY_SEEK_PAUSED, a seek count for
+ * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN); returns 0 on a clean EOF or
+ * a clean signalled exit, 1 on any open/decode failure.
  */
 static int
 run_play(const char * path, PlayMode mode, int64_t mode_arg)
 {
-  AudioSink sink;
-  sink_get(&sink);
+  Player p;
+  memset(&p, 0, sizeof p);
+  p.mode     = mode;
+  p.mode_arg = mode_arg;
+  p.dev      = DEV_READY;
+  p.running  = 1;
 
-  SessionFormat fmt;
-  memset(&fmt, 0, sizeof(fmt));
+  /* Step 1: config_init. */
+  if (config_init(&p.cfg) != 0) {
+    kurono_die("failed to initialize configuration");
+  }
 
-  if (sink.open(sink.self, &fmt, NULL, NULL) != 0) {
+  /* Step 2: event_create -- which carries the pthread_sigmask blocking
+     INT/TERM/HUP, and so must run before any pthread_create and before
+     ma_device_start. New threads inherit the mask, which is what keeps
+     T2 and miniaudio's T3 from ever taking a signal. It also opens the
+     signalfd, both timerfds (disarmed), the self-pipe, and the epoll fd,
+     and registers everything it owns. */
+  p.el = event_create();
+  if (p.el == NULL) {
+    fprintf(stderr, "kurono: --play: event_create failed\n");
+    config_free(&p.cfg);
+    return 1;
+  }
+
+  /* Step 3: db_open -- phase 13.
+     Step 4: scan_run -- phase 14. In the finished player this is the
+     last point at which stderr may be written; there is no TUI in this
+     phase, so stderr stays available throughout. */
+
+  /* Step 5: sink_open. ma_context_init and ma_device_init with the
+     notification callback set, but NOT ma_device_start. The pipe's write
+     fd is cached first, because ma_device_init itself can raise a
+     notification. pcm_ring and viz_ring are allocated inside this call,
+     sized from the negotiated format. */
+  sink_get(&p.sink);
+  sink_set_event_pipe(event_pipe_write_fd(p.el));
+  int have_device = (p.sink.open(p.sink.self, &p.fmt, player_on_notify, &p) == 0);
+  if (!have_device) {
     fprintf(stderr, "kurono: --play: sink open failed\n");
-    return 1;
+    if (sink_alloc_default_rings(&p.fmt) != 0) {
+      fprintf(stderr, "kurono: --play: ring allocation failed\n");
+      config_free(&p.cfg);
+      event_destroy(p.el);
+      return 1;
+    }
   }
 
-  Engine * e = engine_create(&fmt, &sink);
-  if (e == NULL) {
+  /* Step 6: there is no separate ring-allocation step. pcm_ring and
+     viz_ring came from step 5 (or, with no device, from
+     sink_alloc_default_rings just above); boundary_ring is allocated
+     inside engine_create below. The ordering guarantee this step exists
+     to state still holds and is what matters: every ring exists before
+     T2 is created and before ma_device_start, so every ring pointer is
+     stable for both threads' whole lifetime and none of them needs to be
+     atomic. */
+
+  /* Step 7: engine_create then engine_start. T2 starts parked on the
+     command condvar with no track loaded. */
+  p.e = engine_create(&p.fmt, &p.sink);
+  if (p.e == NULL) {
     fprintf(stderr, "kurono: --play: engine_create failed\n");
-    sink.close(sink.self);
+    p.sink.close(p.sink.self);
     sink_free_rings();
+    config_free(&p.cfg);
+    event_destroy(p.el);
     return 1;
   }
-
-  if (engine_start(e) != 0) {
+  engine_set_event_pipe(p.e, event_pipe_write_fd(p.el));
+  if (engine_start(p.e) != 0) {
     fprintf(stderr, "kurono: --play: engine_start failed\n");
-    engine_destroy(e);
-    sink.close(sink.self);
-    sink_free_rings(); /* T2 never started, so nothing can still reach the rings */
+    p.sink.close(p.sink.self);
+    sink_free_rings(); /* T2 never started, so nothing can still reach them */
+    engine_destroy(p.e);
+    config_free(&p.cfg);
+    event_destroy(p.el);
     return 1;
   }
 
-  if (sink.start(sink.self) != 0) {
+  /* DESIGN.md XI.2: a device that never opened is browse-only, not a
+     failure to start. Everything above still got built -- that is the
+     point of the state, and the reason it is entered here rather than at
+     step 5. */
+  if (!have_device) {
+    player_browse_only(&p, "device open failed at startup");
+    shutdown_all(&p);
+    return p.status;
+  }
+
+  /* Step 8: ma_device_start. T3 begins and immediately underruns into
+     silence, which is correct -- the first invocation happens on this
+     thread, inside this call, from PulseAudio's pre-fill. */
+  if (p.sink.start(p.sink.self) != 0) {
     fprintf(stderr, "kurono: --play: sink start failed\n");
-    sink.close(sink.self);
-    engine_quit(e);
-    engine_join(e);
-    sink_free_rings();
-    engine_destroy(e);
-    return 1;
+    player_browse_only(&p, "device start failed at startup");
+    shutdown_all(&p);
+    return p.status;
   }
 
-  engine_play(e, path, PLAY_HEADLESS_TRACK_ID);
+  /* Step 9: tb_init and the remaining epoll registrations -- phase 11.
+     event_create already registered the signalfd, the pipe read end, and
+     both timerfds at step 2; only the tty and resize fds are left, and
+     they do not exist yet. */
 
-  const atomic_uint_least64_t * pos = sink_frames_consumed();
-  int driven = 0; /* latches the one-shot driver in the EV_STREAM_INFO branch */
-  int status = 0;
-  int done   = 0;
+  /* VIII.3's warning: the tick is armed BEFORE the first CMD_PLAY, not
+     after, or the first boundary is observed late. */
+  player_set_redraw(&p, 1);
+  engine_play(p.e, path, PLAY_HEADLESS_TRACK_ID);
 
-  while (!done) {
-    play_sleep_ms(PLAY_POLL_MS);
+  /* Step 10: enter the event loop. */
+  player_loop(&p);
 
-    Event ev;
-    while (!done && engine_poll_event(e, &ev)) {
-      switch (ev.kind) {
-        case EV_STREAM_INFO:
-          fprintf(stderr,
-                  "stream: codec=%s rate=%d channels=%d duration_ms=%lld\n",
-                  ev.info.codec, ev.info.sample_rate, ev.info.channels,
-                  (long long) ev.info.duration_ms);
-          /* Every driver is one-shot and runs from here because this is
-             the first point at which the track is provably open and
-             ev.info.duration_ms is known. */
-          if (!driven) {
-            driven = 1;
-            switch (mode) {
-              case PLAY_SEEK_ONCE:
-                engine_seek(e, mode_arg);
-                break;
-              /* fmt.sample_rate, not ev.info.sample_rate: g_frames_consumed
-                 counts frames in the session format the sink negotiated,
-                 which is what the decoder resamples *to*. The source rate
-                 is a property of the file and is off by the resample
-                 ratio -- 44100 vs 48000 here. */
-              /* Both stress drivers end the run rather than playing on
-                 to EOF: the verdict is already decided, and a bounded
-                 run is what lets the sanitizer builds observe the full
-                 DESIGN.md IV.9.b teardown instead of being killed by an
-                 external timeout partway through a 4-minute track. */
-              case PLAY_SEEK_STRESS:
-                drive_seek_stress(e, pos, fmt.sample_rate,
-                                  ev.info.duration_ms, (int) mode_arg);
-                done = 1;
-                break;
-              case PLAY_SEEK_PAUSED:
-                drive_seek_paused(e, &sink, pos, fmt.sample_rate, mode_arg);
-                done = 1;
-                break;
-              case PLAY_PLAIN:
-                break;
-            }
-          }
-          break;
-        case EV_OPEN_FAILED:
-          fprintf(stderr, "kurono: --play: open failed (error %d)\n", ev.averror);
-          status = 1;
-          done   = 1;
-          break;
-        case EV_DECODE_ERROR:
-          fprintf(stderr, "kurono: --play: decode error (error %d)\n", ev.averror);
-          status = 1;
-          done   = 1;
-          break;
-        case EV_EOF:
-          done = 1;
-          break;
-      }
-    }
-
-    if (!done) {
-      uint64_t frames  = atomic_load_explicit(pos, memory_order_relaxed);
-      double   seconds = (fmt.sample_rate > 0)
-                            ? (double) frames / (double) fmt.sample_rate
-                            : 0.0;
-      fprintf(stderr, "position: %.2f s\n", seconds);
-    }
-  }
-
-  /* DESIGN.md IV.9.b, in its exact order. Steps 4 and 5 must not be
-     moved above step 2: if T2 exits while T3 is still consuming, T3
-     plays out the ring and then silence -- harmless on its own, but it
-     puts the ring free (step 6) within reach of a live callback, which
-     is a use-after-free on the audio thread. Stopping the device first
-     makes that ordering error impossible to write. Step 6 is
-     sink_free_rings, split out of AudioSink.close for this phase
-     precisely because T2 also touches pcm_ring and is not joined until
-     step 5. engine_destroy frees boundary_ring, whose only toucher is
-     the now-joined T2. There is no step 1 here (no g_shutdown flag and
-     no device-loss policy until phase 8) and no steps 7-10 (no db, no
-     TUI, no event loop in this diagnostic). */
-  sink.stop(sink.self);   /* step 2: synchronous; T3 has finished its last invocation */
-  sink.close(sink.self);  /* step 3: ma_device_uninit joins T3 */
-  engine_quit(e);         /* step 4 */
-  engine_join(e);         /* step 5: the only legal way to know T2 is done */
-  sink_free_rings();      /* step 6: both touchers of pcm_ring provably gone */
-  engine_destroy(e);
-
-  return status;
+  shutdown_all(&p);
+  return p.status;
 } /* run_play */
 
 /*
@@ -826,14 +1548,15 @@ run_headless(void)
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
  * --decode FILE by running the phase-6 decoder smoke test (run_decode,
  * plan.md VI.8) with no device, no ring, and no threads, --play FILE
- * [--seek MS | --seek-stress N | --seek-paused MS] by running the
- * phase-7 engine smoke test (run_play,
- * plan.md VI.8) -- a real sink and decoder wired together through
- * audio/engine.c's T2, headless -- and any other invocation (including
- * no arguments) by printing a one-line "not implemented yet" notice to
- * stderr. Startup, wiring, and
- * teardown ordering for a real run land in later phases. Takes the
- * process argc/argv, returns the process exit status.
+ * [--seek MS | --seek-stress N | --seek-paused MS] by running the audio
+ * spine headless (run_play, plan.md VI.8) -- a real sink and decoder
+ * wired together through audio/engine.c's T2, now with DESIGN.md
+ * IV.9.a's startup order, the IV.9.a step 10 event loop carrying the
+ * IV.8.a device-loss watchdog and the IV.8.b reopen ladder, and
+ * IV.9.b's teardown table -- and any other invocation (including no
+ * arguments) by printing a one-line "not implemented yet" notice to
+ * stderr. The TUI itself lands in phase 11. Takes the process
+ * argc/argv, returns the process exit status.
  */
 int
 main(int argc, char * argv[])
@@ -907,30 +1630,12 @@ main(int argc, char * argv[])
     status = 1;
   }
 
-  /* No redraw tick and no pipe wakeup exist yet to drive trace_drain
-     (DESIGN.md IV.10) -- there is no TUI and no event loop wired to the
-     sink until later phases. One drain here, before the summary line,
-     is the temporary equivalent: it empties whatever trace_ring
-     accumulated during this run so the exit line reflects it. */
-  trace_drain();
-  char summary[128];
-  trace_summary_line(summary, sizeof summary);
-  fprintf(stderr, "%s\n", summary);
-
-  /* The flush snapshot is not in trace_ring and so is not in the
-     drained log (DESIGN.md IV.10, amendment 03). Rendered here for the
-     same reason trace_drain is called here: phase 11's redraw tick,
-     which owns both, does not exist yet. Suppressed when no flush ever
-     happened, so plain --tone and --headless runs stay one line. */
-  uint64_t flush_w = 0, flush_c = 0;
-  uint64_t flush_gen = engine_last_flush(&flush_w, &flush_c);
-  if (flush_gen > 0) {
-    fprintf(stderr, "kurono: %llu flush(es), last at write=%llu consumed=%llu\n",
-            (unsigned long long) flush_gen, (unsigned long long) flush_w,
-            (unsigned long long) flush_c);
-  }
-
-  trace_shutdown();
+  /* Teardown step 10 (DESIGN.md IV.9.b), for the diagnostic modes that
+     never built a Player. --play reaches it inside shutdown_all, where
+     the table puts it; the helper is idempotent, so this call is a no-op
+     after that path ran. The other modes have no redraw tick and no pipe
+     wakeup to drive trace_drain, so the drain here is their only one. */
+  trace_report_and_shutdown();
 
   return status;
 } /* main */

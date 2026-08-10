@@ -25,11 +25,18 @@
  * EngineState: T2's own view of whether it is producing. ENG_STOPPED
  * (parked, no track or a track was explicitly stopped), ENG_PLAYING
  * (actively filling pcm_ring), ENG_PAUSED (parked by CMD_PAUSE with a
- * track still open). ENG_DEVICE_LOST is reserved for phase 8's
- * reopen-ladder policy, which lives on T1 (DESIGN.md IV.8) -- engine.c
- * never sets it itself; it is part of this enum only because
- * plan.md's phase-7-engine.md I.1 gives all four values together and
- * phase 8 needs the same type.
+ * track still open). ENG_DEVICE_LOST is reserved for the reopen-ladder
+ * policy, which lives on T1 (DESIGN.md IV.8) -- engine.c never sets it
+ * itself; it is part of this enum only because plan.md's
+ * phase-7-engine.md I.1 gives all four values together.
+ *
+ * Phase 8 built the ladder and deliberately did NOT start storing this
+ * value into the Engine: T1 writing T2's state atomic would park T2
+ * behind its back, bypassing park() and leaving both the
+ * producer-active flag and the IV.8.b step 1 handshake stale. T1 keeps
+ * its own device-policy state and parks T2 the one supported way,
+ * through engine_park_sync. The value stays for a later phase that
+ * wants to surface it.
  */
 typedef enum { ENG_STOPPED, ENG_PLAYING, ENG_PAUSED, ENG_DEVICE_LOST } EngineState;
 
@@ -155,6 +162,70 @@ void engine_seek(Engine * e, int64_t ms);
 void engine_stop(Engine * e);
 void engine_quit(Engine * e);
 void engine_set_gain(Engine * e, float gain);
+
+/*
+ * engine_park_sync: push CMD_PAUSE and block until T2 has actually
+ * stopped writing to pcm_ring. T1 only. This is DESIGN.md IV.8.b step 1
+ * (phase-8-device-loss.md I.5 step 1) and it exists because CMD_PAUSE on
+ * its own is not enough.
+ *
+ * engine_pause only *queues*: T2 observes the command when it next
+ * reaches a drain point, and until then it may be blocked inside
+ * AudioSource.read decoding, or partway through the ring_write loop of a
+ * chunk it has already decoded. Steps 2-4 of the ladder do not wait for
+ * it, so step 4's flush -- a ring_reset on T1 -- can land while T2 is
+ * still writing: two threads mutating one SPSC ring's write index, which
+ * ring.h says breaks silently. ma_device_uninit plus ma_device_init are
+ * slow enough that T2 will usually have parked first, which makes the
+ * unsynchronised version correct almost every time and therefore worse,
+ * not better.
+ *
+ * Polling engine_state for ENG_PAUSED does not fix it either: park
+ * stores the state memory_order_relaxed and engine_state loads relaxed,
+ * so observing the new state carries no happens-before edge against T2's
+ * ring writes. The handshake is positive instead of a poll -- T2 sets a
+ * parked flag under cmd_mtx and broadcasts, T1 waits on cmd_cond -- and
+ * it is the mutex that supplies the release/acquire edge. On return, T1
+ * is guaranteed to see every ring write T2 completed, including the case
+ * of a T2 blocked in a slow read that a state spin would have missed.
+ *
+ * Idempotent and safe when T2 is already parked or was never started;
+ * the wait is unbounded by design, because a bounded one would reopen
+ * exactly the race this closes. Takes the Engine, returns nothing.
+ */
+void engine_park_sync(Engine * e);
+
+/*
+ * engine_device_reflush: the device-reopen ladder's flush (DESIGN.md
+ * IV.8.b step 4), and the third and last legal path to
+ * pcm_flush_and_resync. T1 only, and only between engine_park_sync and
+ * the CMD_RESUME of step 6.
+ *
+ * Rebinds pcm_ring (the reopen freed and reallocated it, so a pointer
+ * cached at engine_create is not to be trusted), retargets the decoder's
+ * resampler to the newly negotiated rate (decoder_retarget_rate), then
+ * unconditionally flushes and resyncs both frame counters to 0 and
+ * publishes the flush snapshot. Unconditional rather than gated on the
+ * rate having changed: one extra ring reset on an event that is already
+ * gapped buys a path that runs every time instead of only on the rarest
+ * and least-tested day.
+ *
+ * It calls pcm_flush_and_resync rather than ring_reset -- that function
+ * is file-static and is the only legal caller of ring_reset(pcm_ring) in
+ * the tree, which `make check-flush` enforces mechanically. The counter
+ * resync is inside it and must never be repeated at the call site:
+ * check-flush guards ring_reset calls, not counter stores, so a second
+ * store here would not be caught.
+ *
+ * Emits nothing to trace_ring: trace_emit is T3-only and this runs on
+ * T1. The counters go to the flush snapshot (amendment 03), which
+ * pcm_flush_and_resync already publishes and engine_last_flush reads.
+ *
+ * Takes the Engine and the newly negotiated session format; returns 0 on
+ * success, or -1 if T2 is not parked (the caller skipped step 1) or the
+ * rings are not currently allocated -- in both cases nothing is touched.
+ */
+int engine_device_reflush(Engine * e, const SessionFormat * fmt);
 
 /*
  * engine_poll_event: pop one Event if the queue is non-empty. T1 only.

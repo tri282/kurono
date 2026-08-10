@@ -49,6 +49,55 @@ void sink_get(AudioSink * out);
 int sink_is_started(const AudioSink * s);
 
 /*
+ * sink_cb_alive: 1 iff the data callback is currently executing, from
+ * the g_cb_alive flag phase 5 added as the residual-risk-2 mitigation
+ * (phase-5-sink.md I.3). Phase 8's teardown reads it immediately after
+ * AudioSink.stop returns: DESIGN.md IV.9.b step 2 asserts stop is
+ * synchronous and the callback is provably finished on return, and this
+ * is the one cheap way to keep observing that rather than trusting it.
+ * Reported, never assert(3)ed -- assert compiles out under -DNDEBUG,
+ * which is precisely the release build where a broken assumption here
+ * would matter most. Takes nothing, returns 1 or 0.
+ */
+int sink_cb_alive(void);
+
+/*
+ * sink_dispatch_notifications: deliver the most recent device
+ * notification, if any, to the SinkNotifyCallback registered with
+ * AudioSink.open. T1 ONLY, called from the EVSRC_PIPE branch of the
+ * event loop once the doorbell byte the notification callback wrote has
+ * been drained (DESIGN.md IV.3, IV.8.a; format.h's SinkNotifyCallback).
+ * All device policy runs from here, on T1, and never on T3.
+ *
+ * The pending slot holds one notification, not a queue: two arriving
+ * back to back between drains collapse into the later one. That is
+ * deliberate and safe, because the notification is explicitly not the
+ * detector (DESIGN.md IV.8.a) -- the authoritative signal is T1's
+ * sink_is_started poll on the redraw tick, and this path only supplies
+ * an early wakeup and the status-bar text. Takes nothing, returns 1 if a
+ * notification was dispatched, 0 if none was pending.
+ */
+int sink_dispatch_notifications(void);
+
+/*
+ * sink_alloc_default_rings: allocate pcm_ring and viz_ring at the
+ * default session format of f32 / 48000 / 2 with no device open, and
+ * report that format in *out_fmt. This is DESIGN.md XI.2's browse-only
+ * requirement in one call: "T2 is still created but parked, and the
+ * rings are still allocated using a default session format", so every
+ * ring pointer stays non-NULL and every code path stays uniform whether
+ * or not a device was ever obtained. Reached from two places, both on
+ * T1: a device that failed to open at startup (DESIGN.md IV.9.a step 5),
+ * and a reopen ladder that gave up after 60 s (IV.8.b step 3).
+ *
+ * Does not touch the device and does not make sink_is_started true --
+ * browse-only means there is no device, not a stopped one. Takes the
+ * SessionFormat to fill, returns 0 on success or -1 if either ring could
+ * not be allocated (neither is left allocated on -1).
+ */
+int sink_alloc_default_rings(SessionFormat * out_fmt);
+
+/*
  * sink_free_rings: free pcm_ring and viz_ring -- DESIGN.md IV.9.b
  * step 6, deliberately separate from AudioSink.close (step 3). The
  * split exists because pcm_ring has two touchers: T3, which is gone
@@ -89,7 +138,15 @@ void sink_free_rings(void);
  * audio/engine.c (T2) to write into -- the producer side of the same
  * ring T3's data callback reads via ring_read (DESIGN.md IV.1: T2 owns
  * pcm_ring's write cursor). Takes nothing, returns the pointer, or
- * NULL if the device is not currently open. The only legal caller of
+ * NULL if the rings are not currently allocated.
+ *
+ * Gated on the rings existing, not on the device being open: in
+ * browse-only state (DESIGN.md XI.2) there is no device and the rings
+ * are allocated anyway, by sink_alloc_default_rings, precisely so this
+ * never returns NULL to a caller that would then need a second code
+ * path. Callers that cache the returned pointer across a device reopen
+ * (IV.8.b) must re-fetch it afterwards -- engine_device_reflush does.
+ * The only legal caller of
  * ring_reset on the pointer this returns is pcm_flush_and_resync
  * (audio/engine.c) -- DESIGN.md IV.4 rule 5, enforced by
  * `make check-flush`.

@@ -54,9 +54,10 @@ typedef struct {
   int               stream_index;
 
   /* The session format this source was constructed against (DESIGN.md
-     II.2). Never changes across opens; only phase 8's device-reopen
-     path (not built here) would ever replace it, and only while T3
-     provably does not exist. */
+     II.2). Never changes across opens. The single exception is the
+     device-reopen ladder's decoder_retarget_rate (IV.8.b step 4), which
+     may replace the rate precisely because T3 provably does not exist
+     and T2 is parked at that moment. */
   SessionFormat target_fmt;
 
   /* Residual buffer: interleaved stereo f32 frames swr_convert produced
@@ -245,6 +246,34 @@ decode_one_frame(Decoder * d)
 } /* decode_one_frame */
 
 /*
+ * decoder_build_swr: (re)build d->swr to convert the currently open
+ * file's codec output into interleaved f32 stereo at d->target_fmt's
+ * sample rate. Any existing context is freed first rather than
+ * reconfigured in place, so the caller never has to reason about which
+ * options swr_alloc_set_opts2 does and does not overwrite on a live
+ * context. Requires d->codec_ctx to be open. Takes the decoder, returns
+ * 0 on success or a negative AVERROR.
+ */
+static int
+decoder_build_swr(Decoder * d)
+{
+  if (d->swr != NULL) {
+    swr_free(&d->swr);
+  }
+
+  AVChannelLayout out_ch = AV_CHANNEL_LAYOUT_STEREO;
+  int ret = swr_alloc_set_opts2(&d->swr,
+          &out_ch, AV_SAMPLE_FMT_FLT, (int) d->target_fmt.sample_rate,
+          &d->codec_ctx->ch_layout, d->codec_ctx->sample_fmt, d->codec_ctx->sample_rate,
+          0, NULL);
+  if (ret < 0 || d->swr == NULL) {
+    return (ret < 0) ? ret : AVERROR(ENOMEM);
+  }
+
+  return swr_init(d->swr);
+} /* decoder_build_swr */
+
+/*
  * decoder_close_file: release the ffmpeg objects for whichever file is
  * currently open (if any) and reset the per-file bookkeeping, including
  * the residual buffer's contents (but not its allocation -- that is
@@ -348,19 +377,7 @@ decoder_open_impl(void * self, const char * path, StreamInfo * out_info)
     goto fail;
   }
 
-  AVChannelLayout out_ch = AV_CHANNEL_LAYOUT_STEREO;
-  ret = swr_alloc_set_opts2(&d->swr,
-          &out_ch, AV_SAMPLE_FMT_FLT, (int) d->target_fmt.sample_rate,
-          &d->codec_ctx->ch_layout, d->codec_ctx->sample_fmt, d->codec_ctx->sample_rate,
-          0, NULL);
-  if (ret < 0 || d->swr == NULL) {
-    if (ret == 0) {
-      ret = AVERROR(ENOMEM);
-    }
-    goto fail;
-  }
-
-  ret = swr_init(d->swr);
+  ret = decoder_build_swr(d);
   if (ret < 0) {
     goto fail;
   }
@@ -576,6 +593,36 @@ decoder_destroy(AudioSource * src)
 
   memset(src, 0, sizeof(*src));
 } /* decoder_destroy */
+
+/* decoder_retarget_rate: see include/audio/decoder.h. */
+int
+decoder_retarget_rate(AudioSource * src, uint32_t sample_rate)
+{
+  if (src == NULL || src->self == NULL || sample_rate == 0) {
+    return AVERROR(EINVAL);
+  }
+
+  Decoder * d = (Decoder *) src->self;
+  d->target_fmt.sample_rate = sample_rate;
+
+  /* The residual holds frames resampled to the *old* rate. They belong
+     to the ring contents the ladder is about to discard, so they go with
+     them -- keeping them would splice a few ms of wrong-rate audio into
+     the first block after the reopen. */
+  d->residual_len = 0;
+  d->residual_off = 0;
+
+  if (d->fmt_ctx == NULL || d->codec_ctx == NULL) {
+    return 0; /* nothing open -- the new rate applies at the next open() */
+  }
+
+  int ret = decoder_build_swr(d);
+  if (ret < 0) {
+    return ret;
+  }
+  d->swr_flushed = 0; /* a fresh context has its own delay left to flush */
+  return 0;
+} /* decoder_retarget_rate */
 
 /* decoder_diag_step: see include/audio/decoder.h. */
 long

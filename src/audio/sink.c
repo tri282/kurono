@@ -78,6 +78,13 @@
 #define RING_LOW_WATER_BYTES \
   ((size_t) RING_LOW_WATER_FRAMES * SINK_CHANNELS * sizeof(float))
 
+/* DESIGN.md XI.2: browse-only allocates the rings from a default
+   session format of f32 / 48000 / 2 so every pointer stays non-NULL when
+   no device was ever obtained. The rate is a placeholder for sizing and
+   for T1's position arithmetic; nothing consumes these rings in that
+   state. */
+#define BROWSE_ONLY_SAMPLE_RATE 48000u
+
 /* --tone (plan.md VI.8): a 441 Hz SineSource with no ffmpeg and no
    file, per DESIGN.md VI. */
 #define TONE_HZ               441.0
@@ -104,6 +111,17 @@ static atomic_bool g_device_open = false;
 
 static Ring g_pcm_ring;
 static Ring g_viz_ring;
+
+/* Whether g_pcm_ring/g_viz_ring currently hold an allocation. Distinct
+   from g_device_open on purpose: browse-only (DESIGN.md XI.2) has rings
+   and no device, and the reopen ladder (IV.8.b) briefly has neither.
+   T1-only -- every writer (sink_open_impl, sink_alloc_default_rings,
+   sink_free_rings) and the one reader that matters (sink_pcm_ring, from
+   T1 and from T2 at engine_create/engine_device_reflush) run while the
+   rings are provably not being resized, but atomic anyway for the same
+   reason g_device_open is: a plain int read from two threads is a data
+   race whatever the surrounding argument says. */
+static atomic_bool g_rings_ready = false;
 
 static atomic_bool           g_flushing        = false;
 static atomic_uint_least64_t g_frames_consumed = 0;
@@ -153,6 +171,17 @@ _Static_assert(sizeof(float) == 4, "gain bit-pattern atomic requires a 4-byte fl
 /* Cached, never owned -- see sink_set_event_pipe and DESIGN.md IV.9.b
    step 9's warning. -1 means "no wakeup pipe registered". */
 static int g_event_pipe_w = -1;
+
+/* The T1-side notification handler registered through AudioSink.open
+   (format.h's SinkNotifyCallback), and its user pointer. Written by T1
+   in sink_open_impl, read by T1 in sink_dispatch_notifications -- never
+   by T3, which only records the notification type into g_device_event
+   and rings the doorbell. Keeping the *call* off T3 is what makes
+   DESIGN.md IV.3's "it must never call ma_device_stop/uninit/start"
+   enforceable at all: the policy that wants to do exactly that runs on
+   the thread that may. */
+static SinkNotifyCallback g_on_notify   = NULL;
+static void *             g_notify_user = NULL;
 
 /* apply_gain: multiply n interleaved f32 samples in buf by the current
    gain, in place. T3-only. One relaxed atomic load, one union
@@ -261,6 +290,51 @@ sink_set_event_pipe(int fd)
   g_event_pipe_w = fd;
 } /* sink_set_event_pipe */
 
+/* notify_from_ma: translate a ma_device_notification_type into the
+   backend-independent SinkNotification of format.h. Runs on T1, inside
+   sink_dispatch_notifications -- deliberately not on T3, so the
+   notification callback gains no line at all in this phase. An
+   unrecognised type (a miniaudio upgrade adding one) maps to
+   SINK_NOTIFY_UNKNOWN rather than onto one of the four that carry
+   policy. Takes the raw ma type, returns the SinkNotification. */
+static SinkNotification
+notify_from_ma(int ma_type)
+{
+  switch (ma_type) {
+    case ma_device_notification_type_started:           return SINK_NOTIFY_STARTED;
+    case ma_device_notification_type_stopped:           return SINK_NOTIFY_STOPPED;
+    case ma_device_notification_type_rerouted:          return SINK_NOTIFY_REROUTED;
+    case ma_device_notification_type_interruption_began: return SINK_NOTIFY_INTERRUPTION_BEGAN;
+    case ma_device_notification_type_interruption_ended: return SINK_NOTIFY_INTERRUPTION_ENDED;
+    default:                                            return SINK_NOTIFY_UNKNOWN;
+  }
+} /* notify_from_ma */
+
+/* sink_dispatch_notifications: see include/audio/sink.h. */
+int
+sink_dispatch_notifications(void)
+{
+  /* Exchange, not load-then-clear: T3 may store a new notification at
+     any moment, and taking the slot in one operation means the worst
+     case is dispatching a notification twice's worth of staleness, never
+     losing one that arrived during the read-modify-write. */
+  int raw = atomic_exchange_explicit(&g_device_event, -1, memory_order_acquire);
+  if (raw < 0) {
+    return 0;
+  }
+  if (g_on_notify != NULL) {
+    g_on_notify(g_notify_user, (int) notify_from_ma(raw));
+  }
+  return 1;
+} /* sink_dispatch_notifications */
+
+/* sink_cb_alive: see include/audio/sink.h. */
+int
+sink_cb_alive(void)
+{
+  return atomic_load_explicit(&g_cb_alive, memory_order_relaxed) ? 1 : 0;
+} /* sink_cb_alive */
+
 /* sink_open_impl: AudioSink.open. Opens the device once at the
    negotiated native rate (DESIGN.md II.2, sampleRate = 0), reads back
    the session format into *inout_fmt, and allocates pcm_ring/viz_ring
@@ -274,12 +348,17 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
                SinkNotifyCallback on_notify, void * user)
 {
   (void) self;
-  (void) on_notify; /* stored/dispatched starting phase 8; unused until then */
-  (void) user;
 
   if (atomic_load_explicit(&g_device_open, memory_order_acquire)) {
     return -1; /* one device per process; already open */
   }
+
+  /* Registered before ma_device_init, not after: init can itself raise a
+     notification, and a handler that is not yet installed when the first
+     one lands is the failure DESIGN.md IV.9.a step 5 warns about for the
+     pipe fd, applied to the handler. */
+  g_on_notify   = on_notify;
+  g_notify_user = user;
 
   if (ma_context_init(NULL, 0, NULL, &g_context) != MA_SUCCESS) {
     return -1;
@@ -320,6 +399,18 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
   inout_fmt->internal_format   = (int) g_device.playback.internalFormat;
   inout_fmt->internal_channels = (uint32_t) g_device.playback.internalChannels;
 
+  /* A reopen from the device-loss ladder (DESIGN.md IV.8.b step 3)
+     arrives here with the previous device lifetime's rings still
+     allocated, and the negotiated rate may differ, so they are sized
+     afresh rather than reused. Freeing first is what keeps that from
+     leaking both buffers on every reopen. Legal at this exact point and
+     nowhere else: the ladder parks T2 synchronously before step 2
+     (engine_park_sync), and step 2's ma_device_uninit has already joined
+     T3 -- both touchers of pcm_ring are provably gone, the same
+     condition IV.9.b step 6 requires. ring_free is idempotent, so the
+     first-open path pays one pair of free(NULL) calls. */
+  sink_free_rings();
+
   size_t pcm_bytes = (size_t) PCM_LEAD_SECONDS * r * SINK_CHANNELS * sizeof(float);
   if (ring_init(&g_pcm_ring, pcm_bytes) != 0) {
     ma_device_uninit(&g_device);
@@ -332,6 +423,7 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
     ma_context_uninit(&g_context);
     return -1;
   }
+  atomic_store_explicit(&g_rings_ready, true, memory_order_release);
 
   union {
     uint32_t bits;
@@ -417,9 +509,45 @@ sink_close_impl(void * self)
 void
 sink_free_rings(void)
 {
+  atomic_store_explicit(&g_rings_ready, false, memory_order_release);
   ring_free(&g_pcm_ring);
   ring_free(&g_viz_ring);
 } /* sink_free_rings */
+
+/* sink_alloc_default_rings: see include/audio/sink.h. */
+int
+sink_alloc_default_rings(SessionFormat * out_fmt)
+{
+  sink_free_rings(); /* idempotent; a ladder that gave up freed them at step 2 */
+
+  size_t pcm_bytes = (size_t) PCM_LEAD_SECONDS * BROWSE_ONLY_SAMPLE_RATE
+                     * SINK_CHANNELS * sizeof(float);
+  if (ring_init(&g_pcm_ring, pcm_bytes) != 0) {
+    return -1;
+  }
+  if (ring_init(&g_viz_ring, VIZ_RING_BYTES) != 0) {
+    ring_free(&g_pcm_ring);
+    return -1;
+  }
+  atomic_store_explicit(&g_rings_ready, true, memory_order_release);
+
+  memset(out_fmt, 0, sizeof(*out_fmt));
+  out_fmt->sample_rate = BROWSE_ONLY_SAMPLE_RATE;
+  out_fmt->channels    = SINK_CHANNELS;
+
+  /* The counters are reset even though nothing will consume them: a
+     stale g_frames_consumed from the device lifetime that just died
+     would make T1's position readout wrong for the rest of the process,
+     and browse-only is a state the player can sit in for hours. */
+  atomic_store_explicit(&g_flushing, false, memory_order_release);
+  atomic_store_explicit(&g_frames_consumed, 0, memory_order_release);
+  atomic_store_explicit(&g_cb_seq, 0, memory_order_release);
+  g_ring_low_best = SIZE_MAX;
+
+  trace_set_frame_counter(&g_frames_consumed);
+  trace_set_sample_rate(BROWSE_ONLY_SAMPLE_RATE);
+  return 0;
+} /* sink_alloc_default_rings */
 
 /* sink_get: see include/audio/sink.h. */
 void
@@ -448,7 +576,7 @@ sink_is_started(const AudioSink * s)
 Ring *
 sink_pcm_ring(void)
 {
-  if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+  if (!atomic_load_explicit(&g_rings_ready, memory_order_acquire)) {
     return NULL;
   }
   return &g_pcm_ring;

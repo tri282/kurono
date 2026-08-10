@@ -119,6 +119,19 @@ struct Engine {
   Command cmd_q[CMD_QUEUE_CAP];
   int cmd_head, cmd_tail, cmd_count;
 
+  /* The park handshake of DESIGN.md IV.8.b step 1, guarded by cmd_mtx
+     and announced on cmd_cond. Set by T2 in park() once it has stopped
+     writing to pcm_ring, cleared by T2 in unpark() before it resumes;
+     waited on by T1 in engine_park_sync. It lives under the command
+     mutex rather than beside `state` because the point is the
+     release/acquire edge the mutex supplies -- `state` is relaxed on
+     both sides and gives none, which is exactly why observing
+     ENG_PAUSED is not a substitute (see engine_park_sync). Starts at 1:
+     T2 begins parked with no track (DESIGN.md IV.9.a step 7), so the
+     flag is truthful from creation and a ladder that runs before
+     anything has played returns immediately instead of hanging. */
+  int parked;
+
   pthread_mutex_t evt_mtx;
   Event evt_q[EVT_QUEUE_CAP];
   int evt_head, evt_tail, evt_count;
@@ -305,11 +318,16 @@ engine_flush_begin(Engine * e)
  * pcm_ring in the tree (DESIGN.md IV.8.b's generalising rule; enforced
  * by `make check-flush`). Resets pcm_ring and boundary_ring and sets both
  * T2's monotonic write counter and g_frames_consumed to at_frame.
- * Reached from exactly two places in this phase -- do_play and do_seek
- * below (DESIGN.md IV.7, V.1 step 3) -- with phase 8's device-reopen
- * ladder as the third and last legal caller still to come
- * (DESIGN.md IV.8.b step 4). Takes the Engine and the frame index to
- * resync to, returns nothing. T2 only, and only inside a flush window.
+ * Reached from exactly three places, which DESIGN.md IV.8.b calls the
+ * complete and final list: do_play and do_seek below (IV.7, V.1 step 3),
+ * both on T2, and engine_device_reflush (IV.8.b step 4) on T1. Takes the
+ * Engine and the frame index to resync to, returns nothing.
+ *
+ * Called from T2 inside a flush window, or from T1 inside the reopen
+ * ladder with T2 parked by engine_park_sync and T3 joined by
+ * ma_device_uninit -- in both cases exactly one thread can touch
+ * pcm_ring's write index at the moment of the reset, which is the
+ * property the SPSC contract actually requires.
  *
  * Publishes the flush snapshot rather than emitting TRACE_FLUSH
  * (amendment 03). DESIGN.md IV.7/IV.8.b used to say this function
@@ -381,18 +399,104 @@ engine_flush_end(Engine * e)
   atomic_store_explicit(sink_flush_flag(), false, memory_order_release);
 } /* engine_flush_end */
 
+/* engine_device_reflush: see include/audio/engine.h. */
+int
+engine_device_reflush(Engine * e, const SessionFormat * fmt)
+{
+  if (e == NULL || fmt == NULL) {
+    return -1;
+  }
+
+  /* Step 1's handshake is a precondition, not a suggestion: without it
+     the ring_reset below races T2's write index. Checked rather than
+     assumed, because the failure it guards against is silent -- a caller
+     that skipped engine_park_sync gets -1 and a reported error, not a
+     ring that is quietly corrupt for the rest of the process. */
+  pthread_mutex_lock(&e->cmd_mtx);
+  int parked = e->parked;
+  pthread_mutex_unlock(&e->cmd_mtx);
+  if (!parked) {
+    return -1;
+  }
+
+  /* The reopen freed and reallocated the rings at the newly negotiated
+     rate, so the pointer cached at engine_create is refetched rather
+     than trusted. */
+  Ring * pcm = sink_pcm_ring();
+  if (pcm == NULL) {
+    return -1;
+  }
+  e->pcm_ring    = pcm;
+  e->sample_rate = fmt->sample_rate;
+
+  /* DESIGN.md II.2's warning permits the resampler's target to change on
+     this path and on no other, because T3 provably does not exist here
+     (step 2's ma_device_uninit joined it) and T2 is parked. Reported but
+     not fatal: a rebuild failure leaves a source that cannot decode this
+     file, which the next read surfaces as EV_DECODE_ERROR through the
+     normal per-file path (DESIGN.md XI.1), and the flush below must
+     still run either way or the counters stay apart. */
+  int ret = decoder_retarget_rate(&e->src, fmt->sample_rate);
+
+  /* The same two routines the seek window uses, not a second divergent
+     implementation of the sequence (DESIGN.md IV.7.8). The fence inside
+     engine_flush_begin costs nothing here: sink_is_started is false with
+     the device freshly initialised and not yet started, so IV.7.5's skip
+     branch takes it. */
+  engine_flush_begin(e);
+  pcm_flush_and_resync(e, 0);
+  engine_flush_end(e);
+
+  return (ret < 0) ? -1 : 0;
+} /* engine_device_reflush */
+
 /* ---------------------------------------------------------------------
  * Command handlers.
  * ------------------------------------------------------------------- */
 
-/* park: stop producing and record new_state. T2 only. Takes the
-   Engine and the EngineState to record, returns nothing. */
+/* park: stop producing, record new_state, and complete the IV.8.b step 1
+   handshake by raising `parked` under cmd_mtx and broadcasting. T2 only.
+
+   Every call site is a point past which T2 performs no further
+   ring_write on this chunk: the command handlers all return into a loop
+   that re-reads `state` and falls through to the idle wait, and the
+   backpressure wait's caller breaks out of the write loop the moment
+   state leaves ENG_PLAYING. That is what makes the flag mean "T2 is not
+   writing" and not merely "T2 intends to stop". The mutex is not held on
+   entry -- cmd_pop_wait and cmd_try_pop both release it before handing a
+   command to handle_command -- so taking it here cannot deadlock.
+
+   Takes the Engine and the EngineState to record, returns nothing. */
 static void
 park(Engine * e, EngineState new_state)
 {
   sink_set_producer_active(0);
   atomic_store_explicit(&e->state, new_state, memory_order_relaxed);
+
+  pthread_mutex_lock(&e->cmd_mtx);
+  e->parked = 1;
+  pthread_cond_broadcast(&e->cmd_cond);
+  pthread_mutex_unlock(&e->cmd_mtx);
 } /* park */
+
+/* unpark: the exact inverse of park -- clear the handshake flag, mark
+   the producer active, and enter ENG_PLAYING. T2 only, and always
+   before the first ring_write of the resumed run rather than after, so
+   there is no window in which T2 is writing while `parked` still reads
+   1. Called from the two places T2 resumes producing: a successful
+   CMD_PLAY and CMD_RESUME (phase-8-device-loss.md I.5 step 1, "clear
+   parked wherever T2 resumes producing"). Takes the Engine, returns
+   nothing. */
+static void
+unpark(Engine * e)
+{
+  pthread_mutex_lock(&e->cmd_mtx);
+  e->parked = 0;
+  pthread_mutex_unlock(&e->cmd_mtx);
+
+  sink_set_producer_active(1);
+  atomic_store_explicit(&e->state, ENG_PLAYING, memory_order_relaxed);
+} /* unpark */
 
 /* do_play: CMD_PLAY, inside a flush window (DESIGN.md V.1 step 3).
    Closes any previously open file, opens cmd->path via AudioSource,
@@ -426,8 +530,7 @@ do_play(Engine * e, const Command * cmd)
   if (ret == 0) {
     e->cur_track_id = cmd->track_id;
     e->has_track     = 1;
-    sink_set_producer_active(1);
-    atomic_store_explicit(&e->state, ENG_PLAYING, memory_order_relaxed);
+    unpark(e);
 
     ev.kind = EV_STREAM_INFO;
     ev.info = info;
@@ -490,8 +593,7 @@ handle_command(Engine * e, const Command * cmd, int * quit)
     case CMD_RESUME:
       if (e->has_track
           && atomic_load_explicit(&e->state, memory_order_relaxed) == ENG_PAUSED) {
-        sink_set_producer_active(1);
-        atomic_store_explicit(&e->state, ENG_PLAYING, memory_order_relaxed);
+        unpark(e);
       }
       break;
 
@@ -686,6 +788,7 @@ engine_create(const SessionFormat * fmt, AudioSink * sink)
   e->pcm_ring     = sink_pcm_ring();
   e->sample_rate  = fmt->sample_rate;
   e->event_pipe_w = -1;
+  e->parked       = 1; /* T2 starts parked with no track, IV.9.a step 7 */
   atomic_store_explicit(&e->state, ENG_STOPPED, memory_order_relaxed);
 
   pthread_mutex_init(&e->cmd_mtx, NULL);
@@ -776,6 +879,31 @@ engine_resume(Engine * e)
   cmd.kind = CMD_RESUME;
   cmd_push(e, &cmd);
 } /* engine_resume */
+
+/* engine_park_sync: see include/audio/engine.h. */
+void
+engine_park_sync(Engine * e)
+{
+  if (e == NULL) {
+    return;
+  }
+
+  /* A never-started T2 can never set the flag, so waiting for it would
+     hang. It is also already true that no thread is writing pcm_ring in
+     that case, which is the whole postcondition this function owes its
+     caller. */
+  if (!e->thread_started) {
+    return;
+  }
+
+  engine_pause(e);
+
+  pthread_mutex_lock(&e->cmd_mtx);
+  while (!e->parked) {
+    pthread_cond_wait(&e->cmd_cond, &e->cmd_mtx);
+  }
+  pthread_mutex_unlock(&e->cmd_mtx);
+} /* engine_park_sync */
 
 /* engine_seek: see include/audio/engine.h. */
 void

@@ -51,6 +51,30 @@ AudioSource decoder_create(const SessionFormat * fmt);
 void decoder_destroy(AudioSource * src);
 
 /*
+ * decoder_retarget_rate: replace the session sample rate this source
+ * resamples to, and rebuild the SwrContext against it for whichever file
+ * is currently open. This is DESIGN.md IV.8.b step 4's "reinitialise the
+ * SwrContext to the new R" -- the one and only path on which the target
+ * a source was constructed with may change (see decoder_create's note,
+ * and DESIGN.md II.2's warning).
+ *
+ * Legal exclusively from inside the device-reopen ladder, on T1, and
+ * only after engine_park_sync has returned: T3 provably does not exist
+ * at that moment (step 2's ma_device_uninit joined it) and T2 is parked,
+ * so this is single-threaded access to state T2 otherwise owns
+ * exclusively. Reached through engine_device_reflush, never called
+ * directly by T1.
+ *
+ * Any resample delay swr had buffered from before the reopen is dropped
+ * along with the residual, since it belongs to the discarded ring
+ * contents. Takes the AudioSource and the new rate in Hz; returns 0 on
+ * success -- including when no file is open, in which case the rate is
+ * simply recorded for the next open() -- or a negative AVERROR if the
+ * resampler could not be rebuilt.
+ */
+int decoder_retarget_rate(AudioSource * src, uint32_t sample_rate);
+
+/*
  * decoder_diag_step: --decode-only diagnostic (plan.md VI.8,
  * phase-6-decoder.md I.7), not part of the AudioSource contract and
  * never called by phase 7's engine. AudioSource.read clips its return
