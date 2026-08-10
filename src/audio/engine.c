@@ -17,12 +17,15 @@
  * sink pointer (used only for sink_is_started's fence check --
  * sink.open/start/stop/close stay on T1, DESIGN.md IV.9).
  *
- * See plans/kurono/05-impl/phase-7.md for two things this file
- * deliberately does NOT do, both flagged rather than improvised
- * around: TRACE_FLUSH is not emitted anywhere (trace_emit is T3-only,
- * contradicting DESIGN.md IV.7/IV.8.b's own text -- see
- * pcm_flush_and_resync's comment), and EOF never takes the "no flush"
- * transition path of DESIGN.md V.3 because no CommandKind exists yet
+ * The TRACE_FLUSH contradiction phase 7 flagged here is settled by
+ * amendment 03: the flush record is not a trace_ring record at all but
+ * a single-slot snapshot (g_flush_stat below), because trace_ring is
+ * single-producer T3-only while pcm_flush_and_resync runs on T2 and,
+ * from phase 8, on T1. trace_emit is still never called from this file.
+ *
+ * See plans/kurono/05-impl/phase-7.md for the one thing this file
+ * still deliberately does NOT do: EOF never takes the "no flush"
+ * transition path of DESIGN.md V.3, because no CommandKind exists yet
  * for T1 to hand T2 a next track ahead of end-of-stream.
  */
 
@@ -64,6 +67,32 @@
 #define BOUNDARY_RING_BYTES ((size_t) BOUNDARY_RING_SLOTS * sizeof(BoundaryEntry))
 
 _Static_assert(sizeof(BoundaryEntry) == 16, "BoundaryEntry must stay 16 bytes");
+
+/*
+ * FlushStat: the flush record (DESIGN.md IV.10, amendment 03). One
+ * slot, not a ring -- a flush is an event per minute, so nothing ever
+ * wants the second-most-recent one, and trace_ring's wait-free lossy
+ * design exists for the audio callback's constraints, which neither of
+ * this snapshot's writers has.
+ *
+ * Written by whichever thread is inside a flush window: T2 for the seek
+ * path (DESIGN.md IV.7), T1 for phase 8's reopen ladder (IV.8.b step
+ * 4). Two writers is safe here in a way multi-producer trace_emit would
+ * not have been -- every field is an independent atomic, so there is no
+ * slot claiming, no CAS loop, and no unbounded retry anywhere. Read by
+ * T1 on the tick that drains trace_ring.
+ *
+ * gen is stored last with release and read first and last with acquire:
+ * a seqlock over 24 bytes. A reader that sees gen change between its
+ * two loads retries.
+ */
+typedef struct {
+  atomic_uint_least64_t gen;             /* 0 until the first flush */
+  atomic_uint_least64_t write_frames;
+  atomic_uint_least64_t frames_consumed;
+} FlushStat;
+
+static FlushStat g_flush_stat;
 
 /*
  * Engine: T2's exclusive state (DESIGN.md IV.1) -- the AudioSource,
@@ -282,20 +311,15 @@ engine_flush_begin(Engine * e)
  * (DESIGN.md IV.8.b step 4). Takes the Engine and the frame index to
  * resync to, returns nothing. T2 only, and only inside a flush window.
  *
- * Deliberately does NOT emit TRACE_FLUSH. DESIGN.md IV.8.b's own text
- * says this function "emits TRACE_FLUSH carrying both counters," and
- * so did this phase's plan file -- but trace_emit's contract
- * (include/audio/trace.h; amendment-02-trace-ring.md decision 2)
- * restricts trace_ring to a single producer, T3, and says T1 and T2
- * "must never call this." This function runs on T2 here and will run
- * on T1 for phase 8's reopen ladder; neither is T3. Calling trace_emit
- * from here would make trace_ring's producer migrate across three
- * threads -- the exact silent-breakage case ring.h's SPSC contract
- * warns about -- for the sake of one diagnostic line. This is a real
- * contradiction between DESIGN.md IV.7/IV.8.b and IV.10/amendment-02,
- * flagged in plans/kurono/05-impl/phase-7.md rather than resolved
- * unilaterally. No TRACE_FLUSH record exists in this build until that
- * contradiction is settled by the person who can amend the design.
+ * Publishes the flush snapshot rather than emitting TRACE_FLUSH
+ * (amendment 03). DESIGN.md IV.7/IV.8.b used to say this function
+ * "emits TRACE_FLUSH carrying both counters," which contradicted
+ * trace_emit's own contract: trace_ring is single-producer T3-only,
+ * and this function runs on T2 here and on T1 in phase 8's reopen
+ * ladder. Calling trace_emit from either would migrate that ring's
+ * producer across three threads -- the exact silent-breakage case
+ * ring.h's SPSC contract warns about -- for one diagnostic line. The
+ * counters still get recorded; they go to g_flush_stat instead.
  */
 static void
 pcm_flush_and_resync(Engine * e, uint64_t at_frame)
@@ -310,7 +334,43 @@ pcm_flush_and_resync(Engine * e, uint64_t at_frame)
      samples this counter before it starts and abandons the chunk if it
      changed. T2-only, so a plain increment is enough. */
   e->flush_gen++;
+
+  /* Publish the snapshot (DESIGN.md IV.10, amendment 03). Fields
+     relaxed, gen released last -- a reader that sees the new gen is
+     guaranteed to see both fields that go with it. */
+  atomic_store_explicit(&g_flush_stat.write_frames, e->write_frames,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_flush_stat.frames_consumed, at_frame,
+                        memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_flush_stat.gen, 1, memory_order_release);
 } /* pcm_flush_and_resync */
+
+/* engine_last_flush: see include/audio/engine.h. */
+uint64_t
+engine_last_flush(uint64_t * write_frames, uint64_t * frames_consumed)
+{
+  /* Seqlock read: gen, payload, gen again. Bounded by construction --
+     a retry only happens if a flush landed between the two loads, and
+     a flush is a per-seek event, not a per-callback one. */
+  for (;;) {
+    uint64_t g0 = atomic_load_explicit(&g_flush_stat.gen, memory_order_acquire);
+    uint64_t w  = atomic_load_explicit(&g_flush_stat.write_frames,
+                                       memory_order_relaxed);
+    uint64_t c  = atomic_load_explicit(&g_flush_stat.frames_consumed,
+                                       memory_order_relaxed);
+    uint64_t g1 = atomic_load_explicit(&g_flush_stat.gen, memory_order_acquire);
+
+    if (g0 == g1) {
+      if (write_frames != NULL) {
+        *write_frames = w;
+      }
+      if (frames_consumed != NULL) {
+        *frames_consumed = c;
+      }
+      return g0;
+    }
+  }
+} /* engine_last_flush */
 
 /* engine_flush_end: release the flush window (DESIGN.md IV.7.6, .8).
    Takes the Engine, returns nothing. */

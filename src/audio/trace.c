@@ -39,7 +39,7 @@
 static const char * const TRACE_NAMES[TRACE_COUNT] = {
   [TRACE_UNDERRUN] = "UNDERRUN",
   [TRACE_RING_LOW] = "RING_LOW",
-  [TRACE_FLUSH]    = "FLUSH",
+  [TRACE_FLUSH]    = "FLUSH", /* reserved, never emitted -- amendment 03 */
   [TRACE_NOTIFY]   = "NOTIFY",
 };
 

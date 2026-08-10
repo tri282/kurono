@@ -916,6 +916,20 @@ main(int argc, char * argv[])
   char summary[128];
   trace_summary_line(summary, sizeof summary);
   fprintf(stderr, "%s\n", summary);
+
+  /* The flush snapshot is not in trace_ring and so is not in the
+     drained log (DESIGN.md IV.10, amendment 03). Rendered here for the
+     same reason trace_drain is called here: phase 11's redraw tick,
+     which owns both, does not exist yet. Suppressed when no flush ever
+     happened, so plain --tone and --headless runs stay one line. */
+  uint64_t flush_w = 0, flush_c = 0;
+  uint64_t flush_gen = engine_last_flush(&flush_w, &flush_c);
+  if (flush_gen > 0) {
+    fprintf(stderr, "kurono: %llu flush(es), last at write=%llu consumed=%llu\n",
+            (unsigned long long) flush_gen, (unsigned long long) flush_w,
+            (unsigned long long) flush_c);
+  }
+
   trace_shutdown();
 
   return status;

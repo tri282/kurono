@@ -17,6 +17,11 @@
 typedef enum {
   TRACE_UNDERRUN = 0,
   TRACE_RING_LOW,
+  /* RESERVED, never emitted (amendment 03). The flush record lives in
+     the single-slot snapshot published by pcm_flush_and_resync, not in
+     this ring: this ring is single-producer T3-only, and that function
+     runs on T2 (DESIGN.md IV.7) and on T1 (IV.8.b step 4). Kept so the
+     event ids after it do not renumber. */
   TRACE_FLUSH,
   TRACE_NOTIFY,
   TRACE_COUNT

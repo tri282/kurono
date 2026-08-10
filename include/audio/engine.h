@@ -167,6 +167,24 @@ void engine_set_gain(Engine * e, float gain);
 int engine_poll_event(Engine * e, Event * out);
 
 /*
+ * engine_last_flush: the flush snapshot (DESIGN.md IV.10, amendment
+ * 03). Reads the counters recorded by the most recent
+ * pcm_flush_and_resync -- the record that used to be TRACE_FLUSH,
+ * moved out of trace_ring because that ring is single-producer T3-only
+ * while the flush runs on T2 (IV.7) and on T1 (IV.8.b step 4).
+ *
+ * Process-wide, not per-Engine: there is one flush path and one
+ * renderer, and phase 8's ladder writes it from T1 while no Engine
+ * pointer is necessarily in scope. Either out-parameter may be NULL.
+ *
+ * T1 only, on the tick that drains trace_ring. Returns the generation
+ * counter -- 0 if no flush has happened yet, otherwise the number of
+ * flushes since process start, which is what makes "did the ladder
+ * actually flush?" answerable.
+ */
+uint64_t engine_last_flush(uint64_t * write_frames, uint64_t * frames_consumed);
+
+/*
  * engine_state: T2's current EngineState, relaxed-loaded. T1 may poll
  * this (e.g. phase 8's device-loss watchdog checks "engine state is
  * PLAYING"). Takes the Engine, returns its state.
