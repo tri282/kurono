@@ -36,8 +36,14 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # unanalysed by `make analyze` until someone remembered to move it.
 # src/audio/engine.c (phase 7) is T2, wired in the same way -- --play
 # (main.c) is its only caller in this phase.
+# src/queue.c (phase 9) is pure and dependency-free (DESIGN.md III.2: it
+# depends on nothing, not even audio/ or library/) and has no caller in
+# the linked binary yet -- ui/queueview.c and audio/engine.c's queue
+# policy land in later phases. It is wired into SRCS now anyway, same as
+# every prior phase's file, so it is not silently unanalysed by
+# `make analyze` between now and whichever phase first calls it.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
-       src/audio/trace.c src/audio/decoder.c src/audio/engine.c
+       src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
@@ -51,7 +57,7 @@ OBJS_ASAN    = $(SRCS:src/%.c=build/asan/%.o)
 OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
-        check-deps ring-stress install uninstall clean
+        check-deps ring-stress queue-test install uninstall clean
 
 all: kurono
 
@@ -201,6 +207,22 @@ build/tsan/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# Pure, dependency-free (DESIGN.md III.2, XII.2 testable tier): no
+# PKGS, no check-deps, no sanitiser by default -- the ASan+UBSan variant
+# in phase-9-queue.md III is invoked directly with gcc, not through this
+# target. Links tools/queue_test.c against src/queue.c, compiled here
+# into build/default/queue.o -- the same object path (and object) that
+# linking the default `kurono` binary produces, now that queue.c is in
+# SRCS (phase 9).
+queue-test: tools/queue_test
+
+tools/queue_test: build/default/tools/queue_test.o build/default/queue.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+build/default/tools/%.o: tools/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 install: release
 	install -d $(BINDIR)
 	install -m 755 kurono $(BINDIR)/kurono
@@ -209,4 +231,4 @@ uninstall:
 	rm -f $(BINDIR)/kurono
 
 clean:
-	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress
+	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress tools/queue_test
