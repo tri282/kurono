@@ -5,6 +5,7 @@
 #include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
+#include "../include/ui/keymap.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -54,6 +55,33 @@ kurono_die(const char * fmt, ...)
 
   exit(1);
 } /* kurono_die */
+
+/*
+ * action_dispatch: the single entry point from ui/ into every other
+ * subsystem (DESIGN.md VIII.5, declared in include/ui/keymap.h). It lives
+ * in main.c because it is the only translation unit that holds the
+ * engine, the queue, the browser and the TUI at once -- ui/ never calls
+ * back into audio/ or library/ directly. Takes a resolved Action and its
+ * table arg, returns nothing.
+ *
+ * Phase 10 stub: names the action and its arg and does nothing else.
+ * Phases 11-17 fill in the cases -- transport first (phase 11's tui.c
+ * wires the engine in), then queue and search.
+ *
+ * The report goes to stderr only while the TUI is down. Once tui_init has
+ * run, termbox2 owns the terminal and a stray write corrupts the display
+ * (CLAUDE.md), so a live-TUI dispatch is silently ignored here rather
+ * than printed; phase 11 replaces this body before that can matter.
+ */
+void
+action_dispatch(Action a, int32_t arg)
+{
+  if (g_tb_active) {
+    return;
+  }
+  fprintf(stderr, "kurono: action %s (arg %d) -- not implemented yet\n",
+          action_name(a), (int) arg);
+} /* action_dispatch */
 
 /*
  * print_paths: implements --paths (plan.md VI.8, phase-3-config.md

@@ -42,8 +42,15 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # policy land in later phases. It is wired into SRCS now anyway, same as
 # every prior phase's file, so it is not silently unanalysed by
 # `make analyze` between now and whichever phase first calls it.
+# src/ui/theme.c and src/ui/keymap.c (phase 10) are the two tables the
+# whole UI draws and dispatches through. Wired in immediately: main.c
+# holds action_dispatch (the stub phases 11-17 fill in) and calls
+# action_name, so keymap.o is already linked; theme.o has no caller until
+# ui/tui.c in phase 11 and is listed here anyway, same as every prior
+# phase's file, so it is not silently unanalysed in the meantime.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
-       src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c
+       src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
+       src/ui/theme.c src/ui/keymap.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
@@ -57,7 +64,8 @@ OBJS_ASAN    = $(SRCS:src/%.c=build/asan/%.o)
 OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
-        check-deps ring-stress queue-test install uninstall clean
+        check-theme check-deps ring-stress queue-test keymap-test install \
+        uninstall clean
 
 all: kurono
 
@@ -175,10 +183,22 @@ check-flush:
 	 fi; \
 	 echo "check-flush ok ($$total ring_reset(...pcm_ring...) call(s), all inside pcm_flush_and_resync)"
 
-# Aggregate for the two grep-based invariants (DESIGN.md III.1, IV.8.b).
-# Each also runs standalone; this is the one-word form for a phase's
-# verify block.
-check: check-layering check-flush
+# The mechanical form of CLAUDE.md's "no literal colours in draw code"
+# rule (DESIGN.md VIII.5, phase-10-theme-keymap.md III): a 6-digit hex
+# literal under src/ui/ may only appear in theme.c, which is the one file
+# that owns the palette. Same class of check as check-layering: a grep,
+# defeated by a macro or a decimal literal, catching the accidental case
+# and not the adversarial one.
+check-theme:
+	@! grep -rn '0x[0-9a-fA-F]\{6\}' src/ui --include=*.c \
+	    | grep -v '^src/ui/theme.c:' \
+	  || { echo "literal colour outside src/ui/theme.c"; exit 1; }
+	@echo "check-theme ok"
+
+# Aggregate for the three grep-based invariants (DESIGN.md III.1, IV.8.b,
+# VIII.5). Each also runs standalone; this is the one-word form for a
+# phase's verify block.
+check: check-layering check-flush check-theme
 
 # -fanalyzer over every SRC, no output produced. DEFS/TB_OPT_ATTR_W=32
 # carried even though no SRC yet includes termbox2.h -- see the DEFS
@@ -223,6 +243,17 @@ build/default/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# Pure, dependency-free (DESIGN.md XII.2 testable tier): no PKGS, no
+# check-deps, no terminal. vendor/termbox2.h is included by ui/keymap.h
+# and ui/theme.h for its declarations only -- TB_IMPL is defined nowhere
+# in this link, so there is no termbox2 implementation to link against.
+# Same object paths (and objects) the default kurono link produces.
+keymap-test: tools/keymap_test
+
+tools/keymap_test: build/default/tools/keymap_test.o build/default/ui/keymap.o \
+                   build/default/ui/theme.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
 install: release
 	install -d $(BINDIR)
 	install -m 755 kurono $(BINDIR)/kurono
@@ -231,4 +262,5 @@ uninstall:
 	rm -f $(BINDIR)/kurono
 
 clean:
-	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress tools/queue_test
+	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
+	       tools/queue_test tools/keymap_test
