@@ -50,7 +50,7 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # phase's file, so it is not silently unanalysed in the meantime.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
-       src/ui/theme.c src/ui/keymap.c
+       src/ui/theme.c src/ui/keymap.c src/ui/tui.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its

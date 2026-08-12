@@ -181,6 +181,11 @@ test_readme_bindings(void)
     { 0, '2', ACT_VIEW_SET,        1 },
     { 0, '3', ACT_VIEW_SET,        2 },
     { 0, 'q', ACT_QUIT,            0 },
+    /* Raw mode means the terminal does not turn this into SIGINT -- see
+       the row's comment in keymap.c. Checked here because an unbound
+       Ctrl-C makes the player look hung, and nothing else would catch
+       its removal. */
+    { TB_KEY_CTRL_C, 0, ACT_QUIT,  0 },
   };
 
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {

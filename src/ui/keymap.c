@@ -67,6 +67,15 @@ static const Binding g_bindings[] = {
   { 0, '3',  0, ACT_VIEW_SET,         2 },
 
   { 0, 'q',  0, ACT_QUIT,             0 },
+
+  /* Ctrl-C is a key here, not a signal. termbox2's init_term_attrs calls
+     cfmakeraw, which clears ISIG, so the terminal never generates SIGINT
+     from the keyboard -- the byte 0x03 arrives on the tty like any other
+     control key. DESIGN.md VIII.2's "SIGINT -> unconditional shutdown" is
+     unaffected and still covers `kill -INT`; this row is what makes the
+     gesture a user actually performs reach the same shutdown_all. Without
+     it Ctrl-C is silently unbound and the player looks hung. */
+  { TB_KEY_CTRL_C, 0, 0, ACT_QUIT,    0 },
 };
 
 #define BINDING_COUNT (sizeof(g_bindings) / sizeof(g_bindings[0]))

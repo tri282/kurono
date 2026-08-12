@@ -6,6 +6,7 @@
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
 #include "../include/ui/keymap.h"
+#include "../include/ui/tui.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -18,21 +19,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c; a local constant here
-   keeps main.c ignorant of that internal. */
-#define HEADLESS_MAX_FIRED 8
-/* redraw_timerfd rate for the phase-4 smoke-test loop -- DESIGN.md
-   VIII.3's ~30 Hz redraw policy. Phase 11 replaces this loop's body,
-   not its structure, and inherits the same rate. */
-#define HEADLESS_REDRAW_HZ 30
-
-/*
- * Set by tui_init, cleared by tui_shutdown (phase 11). Always 0 before
- * then, which is what makes kurono_die a plain vfprintf+exit until the
- * TUI exists.
- */
-static int g_tb_active = 0;
-
 /*
  * kurono_die: see include/main.h for the contract. Deliberately does
  * not install itself as a signal handler and is not called from one --
@@ -42,10 +28,10 @@ static int g_tb_active = 0;
 _Noreturn void
 kurono_die(const char * fmt, ...)
 {
-  if (g_tb_active) {
-    /* tb_shutdown(); -- wired in phase 11; unreachable until then since
-       g_tb_active never leaves 0 before tui_init exists. */
-  }
+  /* Idempotent, and a no-op in every diagnostic mode -- those return
+     before tui_init. Ordered first so the message below reaches a
+     restored terminal rather than the alternate screen. */
+  tui_shutdown();
 
   va_list ap;
   va_start(ap, fmt);
@@ -55,33 +41,6 @@ kurono_die(const char * fmt, ...)
 
   exit(1);
 } /* kurono_die */
-
-/*
- * action_dispatch: the single entry point from ui/ into every other
- * subsystem (DESIGN.md VIII.5, declared in include/ui/keymap.h). It lives
- * in main.c because it is the only translation unit that holds the
- * engine, the queue, the browser and the TUI at once -- ui/ never calls
- * back into audio/ or library/ directly. Takes a resolved Action and its
- * table arg, returns nothing.
- *
- * Phase 10 stub: names the action and its arg and does nothing else.
- * Phases 11-17 fill in the cases -- transport first (phase 11's tui.c
- * wires the engine in), then queue and search.
- *
- * The report goes to stderr only while the TUI is down. Once tui_init has
- * run, termbox2 owns the terminal and a stray write corrupts the display
- * (CLAUDE.md), so a live-TUI dispatch is silently ignored here rather
- * than printed; phase 11 replaces this body before that can matter.
- */
-void
-action_dispatch(Action a, int32_t arg)
-{
-  if (g_tb_active) {
-    return;
-  }
-  fprintf(stderr, "kurono: action %s (arg %d) -- not implemented yet\n",
-          action_name(a), (int) arg);
-} /* action_dispatch */
 
 /*
  * print_paths: implements --paths (plan.md VI.8, phase-3-config.md
@@ -349,8 +308,8 @@ run_decode(const char * path)
    1 Hz phase-7-engine.md I.9 asks for. */
 #define PLAYER_POSITION_TICKS PLAYER_REDRAW_HZ
 
-/* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c, as HEADLESS_MAX_FIRED
-   is -- a local constant keeps main.c ignorant of that internal. */
+/* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c; a local constant keeps
+   main.c ignorant of that internal. */
 #define PLAYER_MAX_FIRED 8
 
 /* Seek-stress target step. A prime, so consecutive targets land far
@@ -658,11 +617,90 @@ typedef struct {
   int status;
   int tick;                  /* redraw ticks since the last position line */
   int redraw_armed;
+
+  /* The status-bar line. Written by the device policy and by
+     action_dispatch, read once per repaint. A fixed buffer rather than a
+     const char * because most of what goes in it is formatted (a
+     notification name, a ladder attempt number), and phase 11 has no
+     allocation story for transient UI strings yet. */
+  char message[128];
+  int  ui;                   /* 1 when this run drives the TUI (phase 11) */
 } Player;
+
+/*
+ * The Player the TUI is driving, for action_dispatch -- the one function
+ * ui/ calls that needs to reach every subsystem, and the one place a
+ * global is unavoidable because keymap.h's prototype takes only the
+ * Action and its arg. Set by run_tui before tui_init and cleared after
+ * the loop; NULL in every diagnostic mode, which is what makes a
+ * dispatch outside a TUI run a no-op rather than a wild pointer.
+ */
+static Player * g_ui_player = NULL;
 
 static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
 static void player_on_notify(void * user, int notification_type);
+
+/*
+ * player_report: one diagnostic, to whichever channel is legal right now.
+ * With the TUI up it becomes the status-bar line; on the headless --play
+ * path it is the stderr line it has always been. Every device-policy and
+ * engine-event message on the Player path goes through here, because
+ * those paths are shared by both kinds of run and a bare fprintf in one
+ * of them corrupts the display in the other (CLAUDE.md: the TUI owns the
+ * terminal). Takes the Player and a printf format, returns nothing.
+ */
+static void
+player_report(Player * p, const char * fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  if (p->ui) {
+    vsnprintf(p->message, sizeof p->message, fmt, ap);
+    tui_mark_dirty();
+  } else {
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+  }
+  va_end(ap);
+} /* player_report */
+
+/*
+ * action_dispatch: the single entry point from ui/ into every other
+ * subsystem (DESIGN.md VIII.5, declared in include/ui/keymap.h). It lives
+ * in main.c because this is the only translation unit holding the engine,
+ * the queue, the browser and the TUI at once -- ui/ never calls back into
+ * audio/ or library/ directly. Takes a resolved Action and its table arg,
+ * returns nothing.
+ *
+ * Phase 11 implements ACT_QUIT and nothing else, on purpose: this phase
+ * is the terminal's lifecycle and the layout, and every other action
+ * needs a browser selection or a queue to act on (phases 12-17). The rest
+ * report themselves in the status bar, which is also how the binding
+ * table gets exercised end to end before there is anything to control --
+ * pressing `n` proves the key resolved and dispatched even though nothing
+ * plays yet.
+ *
+ * Never writes to stderr: termbox2 owns the terminal here.
+ */
+void
+action_dispatch(Action a, int32_t arg)
+{
+  Player * p = g_ui_player;
+  if (p == NULL) {
+    return; /* no TUI run in progress -- every diagnostic mode */
+  }
+
+  if (a == ACT_QUIT) {
+    /* Converges on the same shutdown_all as SIGINT/SIGTERM/SIGHUP;
+       there is no second exit path (DESIGN.md IV.9.b). */
+    p->running = 0;
+    return;
+  }
+
+  player_report(p, "%s (arg %d) -- not implemented yet", action_name(a),
+                (int) arg);
+} /* action_dispatch */
 
 /*
  * trace_report_and_shutdown: teardown step 10 (DESIGN.md IV.9.b) --
@@ -736,8 +774,8 @@ player_set_redraw(Player * p, int on)
     return;
   }
   if (event_arm_redraw(p->el, on ? PLAYER_REDRAW_HZ : 0) != 0) {
-    fprintf(stderr, "kurono: warning: could not %s the redraw timer\n",
-            on ? "arm" : "disarm");
+    player_report(p, "warning: could not %s the redraw timer",
+                  on ? "arm" : "disarm");
     return;
   }
   p->redraw_armed = on;
@@ -792,23 +830,30 @@ player_browse_only(Player * p, const char * why)
      make impossible. */
   if (sink_pcm_ring() == NULL) {
     if (sink_alloc_default_rings(&p->fmt) != 0) {
-      fprintf(stderr, "kurono: browse-only: ring allocation failed\n");
+      player_report(p, "browse-only: ring allocation failed");
       p->status  = 1;
       p->running = 0;
       return;
     }
     if (p->e != NULL && engine_device_reflush(p->e, &p->fmt) != 0) {
-      fprintf(stderr, "kurono: browse-only: engine rebind failed\n");
+      player_report(p, "browse-only: engine rebind failed");
     }
   }
 
-  fprintf(stderr,
-          "device: BROWSE-ONLY (%s) -- no audio device; playback actions "
-          "report \"no audio device\". Rings allocated at f32/%u/%u, T2 "
-          "created and parked (DESIGN.md XI.2).\n",
-          why, p->fmt.sample_rate, p->fmt.channels);
+  player_report(p,
+                "device: BROWSE-ONLY (%s) -- no audio device; playback "
+                "actions report \"no audio device\". Rings at f32/%u/%u, "
+                "T2 created and parked (DESIGN.md XI.2).",
+                why, p->fmt.sample_rate, p->fmt.channels);
 
-  p->running = 0;
+  /* With a TUI up this is a degraded state, not the end of the run
+     (DESIGN.md XI.2): browsing, searching and queueing stay live and only
+     playback actions report "no audio device". Headless there is nothing
+     to browse and every timer is disarmed, so continuing would only block
+     forever in epoll_wait -- that run ends here, as it always has. */
+  if (!p->ui) {
+    p->running = 0;
+  }
 } /* player_browse_only */
 
 /*
@@ -837,9 +882,9 @@ player_ladder_retry(Player * p)
     return;
   }
 
-  fprintf(stderr, "device: reopen attempt %d failed, retrying in %d ms "
-                  "(%d ms of 60000 spent)\n",
-          p->ladder_attempt, delay, p->ladder_elapsed_ms);
+  player_report(p, "device: reopen attempt %d failed, retrying in %d ms "
+                   "(%d ms of 60000 spent)",
+                p->ladder_attempt, delay, p->ladder_elapsed_ms);
 } /* player_ladder_retry */
 
 /*
@@ -904,10 +949,10 @@ player_ladder_attempt(Player * p)
 
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  fprintf(stderr,
-          "device: REOPENED after %.0f ms (rate=%u), resumed at %lld ms\n",
-          elapsed_ms(&p->loss_at, &now), p->fmt.sample_rate,
-          (long long) p->pos_origin_ms);
+  player_report(p,
+                "device: REOPENED after %.0f ms (rate=%u), resumed at %lld ms",
+                elapsed_ms(&p->loss_at, &now), p->fmt.sample_rate,
+                (long long) p->pos_origin_ms);
 } /* player_ladder_attempt */
 
 /*
@@ -936,8 +981,8 @@ player_ladder_begin(Player * p, const char * detector)
   p->pos_origin_ms = player_position_ms(p);
   player_set_redraw(p, 0);
 
-  fprintf(stderr, "device: LOST (detected by %s) at %lld ms\n",
-          detector, (long long) p->pos_origin_ms);
+  player_report(p, "device: LOST (detected by %s) at %lld ms",
+                detector, (long long) p->pos_origin_ms);
 
   /* Step 1. The synchronous park, not a bare CMD_PAUSE: step 4's
      ring_reset runs on T1, and without this handshake it can land while
@@ -977,8 +1022,8 @@ player_on_notify(void * user, int notification_type)
     return;
   }
 
-  fprintf(stderr, "device: notification %s%s\n", notify_name(notification_type),
-          p->notify_muted ? " (ours, during the ladder -- ignored)" : "");
+  player_report(p, "device: notification %s%s", notify_name(notification_type),
+                p->notify_muted ? " (ours, during the ladder -- ignored)" : "");
 
   /* Our own stop/start coming back to us -- see Player.notify_muted. */
   if (p->notify_muted) {
@@ -990,7 +1035,7 @@ player_on_notify(void * user, int notification_type)
       /* Row 1: a status line and nothing else, in any state. PulseAudio
          moved the stream transparently and the negotiated format is
          unchanged; reopening would cause an audible gap for no benefit. */
-      fprintf(stderr, "device: stream rerouted (no reopen)\n");
+      player_report(p, "device: stream rerouted (no reopen)");
       break;
 
     case SINK_NOTIFY_STOPPED:
@@ -1014,7 +1059,7 @@ player_on_notify(void * user, int notification_type)
         p->dev = DEV_READY;
         engine_resume(p->e);
         player_set_redraw(p, 1);
-        fprintf(stderr, "device: recovered without a reopen\n");
+        player_report(p, "device: recovered without a reopen");
       }
       break;
 
@@ -1069,9 +1114,9 @@ player_handle_engine_event(Player * p, const Event * ev)
 {
   switch (ev->kind) {
     case EV_STREAM_INFO:
-      fprintf(stderr, "stream: codec=%s rate=%d channels=%d duration_ms=%lld\n",
-              ev->info.codec, ev->info.sample_rate, ev->info.channels,
-              (long long) ev->info.duration_ms);
+      player_report(p, "stream: codec=%s rate=%d channels=%d duration_ms=%lld",
+                    ev->info.codec, ev->info.sample_rate, ev->info.channels,
+                    (long long) ev->info.duration_ms);
       if (p->driven) {
         break;
       }
@@ -1105,13 +1150,13 @@ player_handle_engine_event(Player * p, const Event * ev)
       break;
 
     case EV_OPEN_FAILED:
-      fprintf(stderr, "kurono: --play: open failed (error %d)\n", ev->averror);
+      player_report(p, "open failed (error %d)", ev->averror);
       p->status  = 1;
       p->running = 0;
       break;
 
     case EV_DECODE_ERROR:
-      fprintf(stderr, "kurono: --play: decode error (error %d)\n", ev->averror);
+      player_report(p, "decode error (error %d)", ev->averror);
       p->status  = 1;
       p->running = 0;
       break;
@@ -1164,6 +1209,14 @@ player_tick(Player * p)
   player_watchdog(p);
   trace_drain();
 
+  /* The tick is the progress bar and the clock, so every tick repaints
+     (DESIGN.md VIII.3). It only fires while playing -- idle, the timer is
+     disarmed and this costs nothing. */
+  if (p->ui) {
+    tui_mark_dirty();
+    return;
+  }
+
   if (++p->tick < PLAYER_POSITION_TICKS) {
     return;
   }
@@ -1173,6 +1226,26 @@ player_tick(Player * p)
     fprintf(stderr, "position: %.2f s\n", (double) player_position_ms(p) / 1000.0);
   }
 } /* player_tick */
+
+/*
+ * player_repaint: fill a TuiModel from the Player and hand it to the one
+ * tb_present in the program. Called once at the bottom of a loop
+ * iteration and only when something marked the screen dirty. Takes the
+ * Player, returns nothing.
+ */
+static void
+player_repaint(Player * p)
+{
+  TuiModel m;
+  memset(&m, 0, sizeof m);
+  m.now_playing = NULL;               /* the queue and the browser: phase 12 */
+  m.message     = (p->message[0] != '\0') ? p->message : NULL;
+  m.pos_ms      = (p->dev == DEV_READY) ? player_position_ms(p) : -1;
+  m.dur_ms      = -1;
+  m.playing     = 0;
+  m.volume_pct  = 100;
+  tui_draw(&m);
+} /* player_repaint */
 
 /*
  * shutdown_all: DESIGN.md IV.9.b, the normative teardown table, in
@@ -1202,11 +1275,11 @@ shutdown_all(Player * p)
   /* The four-line residual-risk-2 mitigation phase 5 adopted: step 2
      claims the callback is provably done, and this is what keeps that a
      measurement rather than a belief. Reported, not assert(3)ed --
-     assert compiles out under -DNDEBUG. */
-  if (sink_cb_alive()) {
-    fprintf(stderr, "kurono: WARNING: data callback still alive after "
-                    "AudioSink.stop returned (DESIGN.md IV.9.b step 2)\n");
-  }
+     assert compiles out under -DNDEBUG. Recorded here and printed after
+     step 8, not through player_report: the status bar it would write to
+     is never repainted again on this path, and the whole point of the
+     check is that its result is seen. */
+  int cb_alive = sink_cb_alive();
 
   /* 3. Joins T3. g_event_pipe_w must still be open through this call:
         step 2 fired a `stopped` notification from T3, which writes to
@@ -1230,9 +1303,17 @@ shutdown_all(Player * p)
   p->e = NULL;
 
   /* 7. sqlite3_finalize / sqlite3_close_v2 -- phase 13. */
-  /* 8. tb_shutdown -- phase 11. After it, and only after it, stderr may
-        be written again; there is no TUI in this phase, so stderr has
-        been available throughout. */
+
+  /* 8. tb_shutdown. After it, and only after it, may stderr be written
+        again -- which is exactly why step 10's trace drain and summary
+        sit below it rather than at step 6. Idempotent and a no-op for
+        every diagnostic mode, none of which claimed the terminal. */
+  tui_shutdown();
+
+  if (cb_alive) {
+    fprintf(stderr, "kurono: WARNING: data callback still alive after "
+                    "AudioSink.stop returned (DESIGN.md IV.9.b step 2)\n");
+  }
 
   /* 9. UI state and the queue land in later phases; the config strings
         and the event loop -- which owns the epoll fd, the signalfd, both
@@ -1264,7 +1345,7 @@ player_loop(Player * p)
     EventSource fired[PLAYER_MAX_FIRED];
     int n = event_wait(p->el, fired, PLAYER_MAX_FIRED, -1);
     if (n < 0) {
-      fprintf(stderr, "kurono: event_wait failed\n");
+      player_report(p, "event_wait failed");
       p->status  = 1;
       p->running = 0;
       break;
@@ -1280,14 +1361,15 @@ player_loop(Player * p)
              VIII.2 makes all three unconditional-shutdown sources. */
           struct signalfd_siginfo si;
           ssize_t r = read(event_signalfd(p->el), &si, sizeof si);
-          fprintf(stderr, "signal: %u -- shutting down\n",
-                  (r == (ssize_t) sizeof si) ? si.ssi_signo : 0u);
+          player_report(p, "signal: %u -- shutting down",
+                        (r == (ssize_t) sizeof si) ? si.ssi_signo : 0u);
           p->running = 0;
           break;
         }
 
         case EVSRC_PIPE:
           player_drain_pipe(p);
+          tui_mark_dirty();
           break;
 
         case EVSRC_REDRAW:
@@ -1296,29 +1378,152 @@ player_loop(Player * p)
 
         case EVSRC_RECONNECT:
           player_ladder_attempt(p);
+          tui_mark_dirty();
           break;
 
+        /* Both terminal sources call the same drain and dispatch on
+           ev.type. There is no fd-to-event-type correspondence:
+           tb_peek_event selects on both fds regardless of which one woke
+           epoll, so a tty wakeup can legitimately yield a resize event
+           and vice versa, and two type-specific handlers would drop
+           events (DESIGN.md VIII.2). */
         case EVSRC_TTY:
-        case EVSRC_TTY_HUP:
         case EVSRC_RESIZE:
+          tui_drain();
+          break;
+
+        /* EPOLLHUP|EPOLLERR on the tty. SIGHUP on the signalfd usually
+           covers a closed terminal, but not when kurono is not in the
+           foreground process group -- and epoll is level-triggered, so
+           without this branch the loop spins at 100% CPU forever on a
+           permanently-readable dead fd (DESIGN.md VIII.2's second
+           warning). Unconditional shutdown, no questions asked. */
+        case EVSRC_TTY_HUP:
+          p->running = 0;
+          break;
+
         case EVSRC_NONE:
         case EVSRC_COUNT:
         default:
-          break; /* phase 11 owns the terminal sources */
+          break;
       }
+    }
+
+    /* Exactly one present per wakeup, at the bottom of the iteration,
+       guarded by the dirty flag every branch above sets (DESIGN.md
+       VIII.3). Skipped entirely on the headless --play path, where
+       tui_draw is a no-op anyway. */
+    if (p->ui && p->running && tui_dirty()) {
+      player_repaint(p);
     }
   }
 } /* player_loop */
 
 /*
+ * player_start: DESIGN.md IV.9.a steps 1-7, shared by every kind of run.
+ * Extracted in phase 11 because bare `kurono` and --play now both need
+ * them and a second transcription of the startup order is exactly the
+ * kind of divergence the order exists to prevent -- phase 11 owns step 9,
+ * which sits in the middle of this sequence, so the two callers differ
+ * only after step 7.
+ *
+ * Takes the Player (zeroed, with mode/ui already set), a label for
+ * diagnostics, and an out-parameter set to 1 when a device was opened.
+ * Returns 0 with the Player fully constructed, or -1 with everything it
+ * built already torn down and nothing for the caller to release.
+ */
+static int
+player_start(Player * p, const char * who, int * have_device)
+{
+  /* Step 1: config_init. */
+  if (config_init(&p->cfg) != 0) {
+    kurono_die("failed to initialize configuration");
+  }
+
+  /* Step 2: event_create -- which carries the pthread_sigmask blocking
+     INT/TERM/HUP, and so must run before any pthread_create and before
+     ma_device_start. New threads inherit the mask, which is what keeps
+     T2 and miniaudio's T3 from ever taking a signal. It also opens the
+     signalfd, both timerfds (disarmed), the self-pipe, and the epoll fd,
+     and registers everything it owns. */
+  p->el = event_create();
+  if (p->el == NULL) {
+    fprintf(stderr, "kurono: %s: event_create failed\n", who);
+    config_free(&p->cfg);
+    return -1;
+  }
+
+  /* Step 3: db_open -- phase 13.
+     Step 4: scan_run -- phase 14. This is the last point at which stderr
+     may be written on a TUI run; tui_init is step 9, and everything after
+     it reports through player_report instead. */
+
+  /* Step 5: sink_open. ma_context_init and ma_device_init with the
+     notification callback set, but NOT ma_device_start. The pipe's write
+     fd is cached first, because ma_device_init itself can raise a
+     notification. pcm_ring and viz_ring are allocated inside this call,
+     sized from the negotiated format. */
+  sink_get(&p->sink);
+  sink_set_event_pipe(event_pipe_write_fd(p->el));
+  *have_device = (p->sink.open(p->sink.self, &p->fmt, player_on_notify, p) == 0);
+  if (!*have_device) {
+    fprintf(stderr, "kurono: %s: sink open failed\n", who);
+    if (sink_alloc_default_rings(&p->fmt) != 0) {
+      fprintf(stderr, "kurono: %s: ring allocation failed\n", who);
+      config_free(&p->cfg);
+      event_destroy(p->el);
+      p->el = NULL;
+      return -1;
+    }
+  }
+
+  /* Step 6: there is no separate ring-allocation step. pcm_ring and
+     viz_ring came from step 5 (or, with no device, from
+     sink_alloc_default_rings just above); boundary_ring is allocated
+     inside engine_create below. The ordering guarantee this step exists
+     to state still holds and is what matters: every ring exists before
+     T2 is created and before ma_device_start, so every ring pointer is
+     stable for both threads' whole lifetime and none of them needs to be
+     atomic. */
+
+  /* Step 7: engine_create then engine_start. T2 starts parked on the
+     command condvar with no track loaded. */
+  p->e = engine_create(&p->fmt, &p->sink);
+  if (p->e == NULL) {
+    fprintf(stderr, "kurono: %s: engine_create failed\n", who);
+    p->sink.close(p->sink.self);
+    sink_free_rings();
+    config_free(&p->cfg);
+    event_destroy(p->el);
+    p->el = NULL;
+    return -1;
+  }
+  engine_set_event_pipe(p->e, event_pipe_write_fd(p->el));
+  if (engine_start(p->e) != 0) {
+    fprintf(stderr, "kurono: %s: engine_start failed\n", who);
+    p->sink.close(p->sink.self);
+    sink_free_rings(); /* T2 never started, so nothing can still reach them */
+    engine_destroy(p->e);
+    p->e = NULL;
+    config_free(&p->cfg);
+    event_destroy(p->el);
+    p->el = NULL;
+    return -1;
+  }
+
+  return 0;
+} /* player_start */
+
+/*
  * run_play: implements --play FILE [--seek MS | --seek-stress N |
- * --seek-paused MS] (plan.md VI.8, phase-7-engine.md I.9), rebuilt in
- * phase 8 as the real thing rather than a poll loop: DESIGN.md IV.9.a's
- * ten startup steps in order, the IV.9.a step 10 event loop with the
- * IV.8.a device-loss watchdog on its redraw tick and the IV.8.b reopen
- * ladder on its reconnect timer, and IV.9.b's teardown table on the way
- * out. Steps 3, 4, and 9 are the only stubs -- db_open, scan_run, and
- * tb_init belong to phases 13, 14, and 11.
+ * --seek-paused MS] (plan.md VI.8, phase-7-engine.md I.9): DESIGN.md
+ * IV.9.a's ten startup steps in order, the IV.9.a step 10 event loop with
+ * the IV.8.a device-loss watchdog on its redraw tick and the IV.8.b
+ * reopen ladder on its reconnect timer, and IV.9.b's teardown table on
+ * the way out. Steps 3 and 4 are the only stubs -- db_open and scan_run
+ * belong to phases 13 and 14. Step 9 is deliberately skipped: this is the
+ * headless harness, and it must stay usable under a sanitiser with no
+ * terminal to claim.
  *
  * A device that cannot be opened or started is not fatal (DESIGN.md
  * XI.2): the rings are allocated at the default session format, T2 is
@@ -1338,76 +1543,10 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
   p.mode_arg = mode_arg;
   p.dev      = DEV_READY;
   p.running  = 1;
+  p.ui       = 0;
 
-  /* Step 1: config_init. */
-  if (config_init(&p.cfg) != 0) {
-    kurono_die("failed to initialize configuration");
-  }
-
-  /* Step 2: event_create -- which carries the pthread_sigmask blocking
-     INT/TERM/HUP, and so must run before any pthread_create and before
-     ma_device_start. New threads inherit the mask, which is what keeps
-     T2 and miniaudio's T3 from ever taking a signal. It also opens the
-     signalfd, both timerfds (disarmed), the self-pipe, and the epoll fd,
-     and registers everything it owns. */
-  p.el = event_create();
-  if (p.el == NULL) {
-    fprintf(stderr, "kurono: --play: event_create failed\n");
-    config_free(&p.cfg);
-    return 1;
-  }
-
-  /* Step 3: db_open -- phase 13.
-     Step 4: scan_run -- phase 14. In the finished player this is the
-     last point at which stderr may be written; there is no TUI in this
-     phase, so stderr stays available throughout. */
-
-  /* Step 5: sink_open. ma_context_init and ma_device_init with the
-     notification callback set, but NOT ma_device_start. The pipe's write
-     fd is cached first, because ma_device_init itself can raise a
-     notification. pcm_ring and viz_ring are allocated inside this call,
-     sized from the negotiated format. */
-  sink_get(&p.sink);
-  sink_set_event_pipe(event_pipe_write_fd(p.el));
-  int have_device = (p.sink.open(p.sink.self, &p.fmt, player_on_notify, &p) == 0);
-  if (!have_device) {
-    fprintf(stderr, "kurono: --play: sink open failed\n");
-    if (sink_alloc_default_rings(&p.fmt) != 0) {
-      fprintf(stderr, "kurono: --play: ring allocation failed\n");
-      config_free(&p.cfg);
-      event_destroy(p.el);
-      return 1;
-    }
-  }
-
-  /* Step 6: there is no separate ring-allocation step. pcm_ring and
-     viz_ring came from step 5 (or, with no device, from
-     sink_alloc_default_rings just above); boundary_ring is allocated
-     inside engine_create below. The ordering guarantee this step exists
-     to state still holds and is what matters: every ring exists before
-     T2 is created and before ma_device_start, so every ring pointer is
-     stable for both threads' whole lifetime and none of them needs to be
-     atomic. */
-
-  /* Step 7: engine_create then engine_start. T2 starts parked on the
-     command condvar with no track loaded. */
-  p.e = engine_create(&p.fmt, &p.sink);
-  if (p.e == NULL) {
-    fprintf(stderr, "kurono: --play: engine_create failed\n");
-    p.sink.close(p.sink.self);
-    sink_free_rings();
-    config_free(&p.cfg);
-    event_destroy(p.el);
-    return 1;
-  }
-  engine_set_event_pipe(p.e, event_pipe_write_fd(p.el));
-  if (engine_start(p.e) != 0) {
-    fprintf(stderr, "kurono: --play: engine_start failed\n");
-    p.sink.close(p.sink.self);
-    sink_free_rings(); /* T2 never started, so nothing can still reach them */
-    engine_destroy(p.e);
-    config_free(&p.cfg);
-    event_destroy(p.el);
+  int have_device = 0;
+  if (player_start(&p, "--play", &have_device) != 0) {
     return 1;
   }
 
@@ -1431,11 +1570,6 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
     return p.status;
   }
 
-  /* Step 9: tb_init and the remaining epoll registrations -- phase 11.
-     event_create already registered the signalfd, the pipe read end, and
-     both timerfds at step 2; only the tty and resize fds are left, and
-     they do not exist yet. */
-
   /* VIII.3's warning: the tick is armed BEFORE the first CMD_PLAY, not
      after, or the first boundary is observed late. */
   player_set_redraw(&p, 1);
@@ -1449,119 +1583,97 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
 } /* run_play */
 
 /*
- * evsrc_name: the diagnostic label for an EventSource, for the
- * headless loop's one-line-per-wakeup stderr output. Takes the tag,
- * returns a static string -- never NULL, an unrecognised value prints
- * as "EVSRC_?".
- */
-static const char *
-evsrc_name(EventSource src)
-{
-  switch (src) {
-    case EVSRC_TTY:       return "EVSRC_TTY";
-    case EVSRC_RESIZE:    return "EVSRC_RESIZE";
-    case EVSRC_SIGNAL:    return "EVSRC_SIGNAL";
-    case EVSRC_PIPE:      return "EVSRC_PIPE";
-    case EVSRC_REDRAW:    return "EVSRC_REDRAW";
-    case EVSRC_RECONNECT: return "EVSRC_RECONNECT";
-    case EVSRC_TTY_HUP:   return "EVSRC_TTY_HUP";
-    case EVSRC_NONE:
-    case EVSRC_COUNT:
-    default:              return "EVSRC_?";
-  }
-} /* evsrc_name */
-
-/*
- * run_headless: implements --headless (plan.md VI.8, phase-4-eventloop.md
- * I.6). Temporary scaffolding until phase 11 gives kurono a TUI: builds
- * an EventLoop, arms the redraw timer at HEADLESS_REDRAW_HZ, registers
- * stdin as the tty source, and prints one stderr line per source that
- * fires on every wakeup. A self-pipe wakeup is drained in full, per
- * event.h's contract, before the loop continues; a tty wakeup is
- * drained because epoll is level-triggered. Exits the loop -- not the
- * process -- on EVSRC_SIGNAL, on tty EOF, or on EVSRC_TTY_HUP; all are
- * EVSRC_TTY_HUP; both are unconditional-shutdown sources per DESIGN.md
- * VIII.2. Takes nothing, returns the process exit status.
+ * run_tui: bare `kurono` -- the real player. The same ten startup steps
+ * run_play uses, with step 9 present: tb_init, and the two fds event.c
+ * does not own registered with the epoll it does.
+ *
+ * Nothing plays. The queue and the browser are phase 12, so this phase
+ * brings up the terminal, draws DESIGN.md VIII.4's frame, and sits in
+ * epoll_wait with every timer disarmed -- which is exactly the "paused,
+ * stopped, idle -> zero wakeups, zero CPU" state VIII.3 requires, and the
+ * easiest state in which to measure it.
+ *
+ * Takes nothing, returns the process exit status.
  */
 static int
-run_headless(void)
+run_tui(void)
 {
-  EventLoop * el = event_create();
-  if (el == NULL) {
-    fprintf(stderr, "kurono: event_create failed\n");
+  Player p;
+  memset(&p, 0, sizeof p);
+  p.mode    = PLAY_PLAIN;
+  p.dev     = DEV_READY;
+  p.running = 1;
+  p.ui      = 1;
+
+  int have_device = 0;
+  if (player_start(&p, "kurono", &have_device) != 0) {
     return 1;
   }
 
-  if (event_arm_redraw(el, HEADLESS_REDRAW_HZ) != 0) {
-    fprintf(stderr, "kurono: event_arm_redraw failed\n");
-    event_destroy(el);
-    return 1;
+  /* Step 8: ma_device_start -- deliberately NOT called here, and this is
+     the one place this run departs from IV.9.a's order.
+     Measured on this host (2026-08-12, per-thread sampling of each
+     task's stat file under /proc over 12 s of idle): with the device
+     started
+     and nothing to play, T1 sat in epoll_wait at 0.00% and T2 in futex at
+     0.00% -- VIII.3's "zero wakeups, zero CPU" holding exactly -- while
+     miniaudio's T3 burned 1.33% in ppoll, waking ~53 times a second at
+     periodFrames = 900 to memset silence and count an underrun. A player
+     with nothing loaded has no reason to hold a running device.
+     Phase 11 cannot play anything at all, so the device is simply left
+     open and stopped; the general policy -- start on the first CMD_PLAY,
+     stop when playback ends -- belongs with the transport wiring in phase
+     12, and needs an amendment to IV.9.a step 8 before it lands.
+     Nothing downstream assumes a started device: the IV.8.a watchdog acts
+     only when engine_state is ENG_PLAYING, and teardown step 2's
+     AudioSink.stop is a no-op on a device that never started. */
+  if (!have_device) {
+    player_browse_only(&p, "no audio device at startup");
   }
 
-  /* Register stdin as the tty source. Phase 11 registers termbox2's
-     ttyfd here instead; until then this is what makes EVSRC_TTY_HUP
-     reachable, which is the whole point of the reclassification in
-     event_wait -- an unreachable branch is an untested one.
-     Non-fatal: epoll_ctl rejects a regular file or /dev/null with
-     EPERM, so `--headless </dev/null` must still run the timer loop
-     rather than abort. */
-  if (event_add(el, EVSRC_TTY, STDIN_FILENO) != 0) {
-    fprintf(stderr, "kurono: stdin not pollable, tty source disabled\n");
+  /* Step 9: tb_init, then the remaining epoll registrations. It comes
+     after the device is started, per IV.9.a, and before anything can
+     write to stderr again -- from here to tui_shutdown, every diagnostic
+     goes through player_report.
+     g_ui_player is set first: tui_init can deliver a resize immediately,
+     and a dispatch reaching a NULL player would be a dropped keystroke. */
+  g_ui_player = &p;
+  if (tui_init() != 0) {
+    g_ui_player = NULL;
+    fprintf(stderr, "kurono: could not initialize the terminal\n");
+    p.status = 1;
+    shutdown_all(&p);
+    return p.status;
   }
 
-  /* phase-4-eventloop.md III: the write end must be O_NONBLOCK, because
-     phase 5 writes to it from the audio thread. Reported rather than
-     asserted -- assert is compiled out under -DNDEBUG, and this is a
-     property worth seeing in the smoke test's own output. */
-  int wflags = fcntl(event_pipe_write_fd(el), F_GETFL);
-  fprintf(stderr, "pipe_write O_NONBLOCK=%d\n",
-          (wflags >= 0 && (wflags & O_NONBLOCK) != 0) ? 1 : 0);
-
-  int running = 1;
-  int status = 0;
-  while (running) {
-    EventSource fired[HEADLESS_MAX_FIRED];
-    int n = event_wait(el, fired, HEADLESS_MAX_FIRED, -1);
-    if (n < 0) {
-      fprintf(stderr, "kurono: event_wait failed\n");
-      status = 1;
-      break;
-    }
-
-    for (int i = 0; i < n; i++) {
-      fprintf(stderr, "%s\n", evsrc_name(fired[i]));
-
-      if (fired[i] == EVSRC_PIPE) {
-        /* Drain every available byte before doing anything else --
-           event.h's contract for the self-pipe. There is no event
-           queue yet (that lands with audio/engine.c in phase 7), so
-           draining the bytes is the whole of this branch for now. */
-        char    buf[64];
-        ssize_t r;
-        while ((r = read(event_pipe_read_fd(el), buf, sizeof(buf))) > 0) {
-          /* discard */
-        }
-      } else if (fired[i] == EVSRC_TTY) {
-        /* epoll is level-triggered, so an undrained tty spins at 100%
-           CPU. read() returning 0 is EOF -- a closed pty that did not
-           also deliver SIGHUP, which is the case DESIGN.md VIII.2 warns
-           about -- and is treated as a hangup. Phase 11 replaces this
-           with tb_peek_event. */
-        char    buf[256];
-        ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
-        if (r == 0) {
-          fprintf(stderr, "%s\n", evsrc_name(EVSRC_TTY_HUP));
-          running = 0;
-        }
-      } else if (fired[i] == EVSRC_SIGNAL || fired[i] == EVSRC_TTY_HUP) {
-        running = 0;
-      }
-    }
+  int ttyfd = -1, resizefd = -1;
+  tui_get_fds(&ttyfd, &resizefd);
+  if (ttyfd < 0 || resizefd < 0
+      || event_add(p.el, EVSRC_TTY, ttyfd) != 0
+      || event_add(p.el, EVSRC_RESIZE, resizefd) != 0) {
+    /* Without both fds there is no input and no resize: the loop would
+       block forever with a drawn screen and no way out but a signal. */
+    tui_shutdown();
+    g_ui_player = NULL;
+    fprintf(stderr, "kurono: could not register the terminal fds\n");
+    p.status = 1;
+    shutdown_all(&p);
+    return p.status;
   }
 
-  event_destroy(el);
-  return status;
-} /* run_headless */
+  /* First paint before the first wait, or the screen stays blank until
+     something happens to be dirty. */
+  player_repaint(&p);
+
+  /* Step 10: enter the event loop. The redraw timer stays disarmed --
+     nothing is playing, so there is nothing to tick for (DESIGN.md
+     VIII.3). */
+  player_loop(&p);
+
+  shutdown_all(&p);
+  g_ui_player = NULL;
+  return p.status;
+} /* run_tui */
 
 /*
  * Entry point. Handles --version by printing "kurono <version>" to
@@ -1570,9 +1682,8 @@ run_headless(void)
  * (trace_init before, trace_drain / trace_summary_line / trace_shutdown
  * after) so every run yields evidence at no configuration cost
  * (DESIGN.md IV.10): --paths by resolving the Config and printing it
- * (see print_paths), --headless by running the phase-4 event-loop smoke
- * test (see run_headless) until SIGINT/SIGTERM/SIGHUP or a tty hangup,
- * --tone by running the phase-5 sink/ring/callback smoke test
+ * (see print_paths), --tone by running the phase-5 sink/ring/callback
+ * smoke test
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
  * --decode FILE by running the phase-6 decoder smoke test (run_decode,
  * plan.md VI.8) with no device, no ring, and no threads, --play FILE
@@ -1581,10 +1692,14 @@ run_headless(void)
  * wired together through audio/engine.c's T2, now with DESIGN.md
  * IV.9.a's startup order, the IV.9.a step 10 event loop carrying the
  * IV.8.a device-loss watchdog and the IV.8.b reopen ladder, and
- * IV.9.b's teardown table -- and any other invocation (including no
- * arguments) by printing a one-line "not implemented yet" notice to
- * stderr. The TUI itself lands in phase 11. Takes the process
- * argc/argv, returns the process exit status.
+ * IV.9.b's teardown table.
+ *
+ * No arguments is the player itself (run_tui): the same startup, with
+ * DESIGN.md IV.9.a step 9 present, the TUI claiming the terminal, and the
+ * event loop driving repaints. Every diagnostic flag returns before
+ * tb_init and keeps stderr to itself. Anything unrecognised prints a
+ * usage line. Takes the process argc/argv, returns the process exit
+ * status.
  */
 int
 main(int argc, char * argv[])
@@ -1615,11 +1730,6 @@ main(int argc, char * argv[])
     print_paths(&cfg);
     config_free(&cfg);
     status = 0;
-
-  } else if (argc == 2 && strcmp(argv[1], "--headless") == 0) {
-    /* Temporary, plan.md VI.8 diagnostic scaffolding -- removed in
-       phase 11 when ui/tui.c gives kurono a real event loop body. */
-    status = run_headless();
 
   } else if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
     /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
@@ -1653,8 +1763,15 @@ main(int argc, char * argv[])
       status = 1;
     }
 
+  } else if (argc == 1) {
+    /* The player. Phase 4's --headless smoke loop is gone: its structure
+       is what player_loop became, and keeping a second event loop around
+       would mean two places to fix a bug in one. */
+    status = run_tui();
+
   } else {
-    fprintf(stderr, "kurono: not implemented yet\n");
+    fprintf(stderr, "kurono: usage: kurono [--version | --paths | --tone | "
+                    "--decode FILE | --play FILE [...]]\n");
     status = 1;
   }
 
