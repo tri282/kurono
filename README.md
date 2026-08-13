@@ -207,9 +207,11 @@ On first launch, `kurono` scans the music tree and builds the index, printing pr
 | artists       | albums         | tracks                      |
 | (or dirs)     | (or entries)   | (or preview)                |
 +---------------+----------------+-----------------------------+
-| status bar: progress, time, volume, shuffle, repeat          |
+| -- NORMAL -- | progress, time, volume, shuffle, repeat       |
 +--------------------------------------------------------------+
 ```
+
+The leftmost field of the status bar is the current input mode, `vim`-style. It reads `-- NORMAL --` while browsing and changes to `-- SEARCH --`, `-- HELP --` or `-- MENU --` while one of those is open.
 
 Directory, Artists, and Album Artists are the same browser widget fed by different queries, not separate screens.
 
@@ -217,22 +219,34 @@ Directory, Artists, and Album Artists are the same browser widget fed by differe
 
 ### 2. Default keybindings
 
-Vim-like. Every binding resolves through a table to an action, so a config file can remap all of them later without touching the input path.
+Arrow keys navigate; letters act. Every binding resolves through a table to an action, so a config file can remap all of them later without touching the input path.
 
 | Key | Action |
 |---|---|
-| `h` `j` `k` `l` | Move between columns and entries |
+| `↑` / `↓` | Move up / down within a column |
+| `←` / `→` | Move between columns |
 | `space` | Play / pause |
 | `enter` | Play the selection now |
 | `a` | Add the selection to the queue |
 | `d` | Remove from the queue |
 | `n` / `p` | Next / previous track |
+| `shift+←` / `shift+→` | Seek 5 s back / forward |
+| `shift+↓` / `shift+↑` | Seek 30 s back / forward |
+| `,` / `.` | Seek 5 s back / forward (fallback) |
+| `H` / `L` | Seek 30 s back / forward (fallback) |
 | `+` / `-` | Volume up / down |
 | `/` | Search |
 | `s` | Toggle shuffle |
 | `r` | Toggle repeat |
 | `tab` | Cycle view |
-| `q` | Quit |
+| `h` | Help — the key list, generated from the bindings themselves |
+| `m` | Settings menu |
+| `esc` | Close the open overlay or cancel a search |
+| `q` | Close the open overlay, or quit when none is open |
+
+`h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help; a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
+
+*Note: the `shift+arrow` bindings depend on the terminal emulator sending `CSI 1;2X` for a modified arrow. xterm, foot, kitty, ghostty and alacritty do, and `tmux` passes it through. `,` `.` `H` `L` are bound to the same seeks as an emulator-independent fallback.*
 
 ---
 
