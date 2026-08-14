@@ -11,6 +11,11 @@ build/
 tools/*
 !tools/*.c
 !tools/*.h
+# A tool source is a tool source whatever it is written in. Added at
+# phase 12: tools/pty_drive.py was ignored by the rule above despite the
+# rule's own stated intent, which is how phase 11's PTY harness was lost
+# with its scratchpad and had to be written a second time.
+!tools/*.py
 
 # graphify knowledge graph output
 graphify-out/
