@@ -52,10 +52,21 @@ static const Binding g_bindings[] = {
   { 0, 'H',  0, ACT_SEEK_BACK,        SEEK_LARGE_MS },
   { 0, 's',  0, ACT_TOGGLE_SHUFFLE,   0 },
   { 0, 'r',  0, ACT_CYCLE_REPEAT,     0 },
+  { 0, 'x',  0, ACT_STOP,             0 },
+  /* Shift-M rather than `m`: phase 12b takes `m` for the settings menu
+     (amendment-04-input-modes.md), and a binding that has to move one
+     phase later is worse than the shifted key now. */
+  { 0, 'M',  0, ACT_MUTE,             0 },
 
   /* queue */
   { 0, 'a',  0, ACT_ENQUEUE,          0 },
   { 0, 'd',  0, ACT_REMOVE,           0 },
+  { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
+  { 0, 'o',  0, ACT_JUMP_TO_PLAYING,  0 },
+
+  /* device. Shift-R because `r` is repeat; 12b's settings menu offers the
+     same action to anyone who does not know the key. */
+  { 0, 'R',  0, ACT_RETRY_DEVICE,     0 },
 
   /* search */
   { 0, '/',  0, ACT_SEARCH,           0 },

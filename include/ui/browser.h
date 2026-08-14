@@ -105,6 +105,25 @@ int browser_descend(Browser * b);
 int browser_ascend(Browser * b);
 
 /*
+ * browser_goto: list `parent_key` and put the cursor on the row whose
+ * key is `row_key` -- the jump-to-playing move, which descend and
+ * ascend cannot express because the target is usually neither a child
+ * nor the parent of the current listing.
+ *
+ * The caller supplies both keys rather than just the row, because only
+ * the caller knows how a key decomposes: the M1 source's keys are
+ * filesystem paths and main.c takes their dirname, while phase 16's
+ * queries hand back a parent of their own. The widget stays ignorant of
+ * where rows come from, which is the whole point of BrowserSource.
+ *
+ * Refuses any parent outside the root. Returns 0 on success and -1 when
+ * the parent will not load, lies outside the root, or does not contain
+ * the row -- and on -1 the browser is left as it was, so a failed jump
+ * never strands the user in a reloaded column.
+ */
+int browser_goto(Browser * b, const char * parent_key, const char * row_key);
+
+/*
  * browser_set_viewport: tell the widget how many rows the column can
  * show, so it can keep the cursor visible. Called on every resize.
  * A viewport of 0 or less is treated as 1.

@@ -605,6 +605,101 @@ browser_ascend(Browser * b)
 } /* browser_ascend */
 
 /*
+ * key_under_root: 1 when `key` is the root or lies beneath it. Takes the
+ * Browser and a key, returns 0 or 1.
+ *
+ * A '/' separator is assumed, which is the same assumption browser_ascend
+ * already makes when it takes a parent with strrchr. That is not the
+ * widget knowing it is looking at a filesystem -- it is the one shape
+ * every key format in this project shares, and phase 16's keys keep it.
+ */
+static int
+key_under_root(const Browser * b, const char * key)
+{
+  size_t rlen = strlen(b->root);
+
+  /* A root of "/" (or any key with a trailing separator) would otherwise
+     demand a second separator at the join and reject every child. */
+  while (rlen > 1 && b->root[rlen - 1] == '/') {
+    rlen--;
+  }
+
+  if (strncmp(key, b->root, rlen) != 0) {
+    return 0;
+  }
+  return key[rlen] == '\0' || key[rlen] == '/';
+} /* key_under_root */
+
+/*
+ * browser_goto: see include/ui/browser.h.
+ */
+int
+browser_goto(Browser * b, const char * parent_key, const char * row_key)
+{
+  if (b == NULL || parent_key == NULL || row_key == NULL) {
+    return -1;
+  }
+  if (!key_under_root(b, parent_key)) {
+    return -1;
+  }
+
+  /* Already listing the right directory is the common case -- jumping to
+     the playing track while browsing its own album -- and reloading it
+     would throw away rows for nothing. */
+  int same = (strcmp(b->cwd, parent_key) == 0);
+
+  char * target = strdup(parent_key);
+  if (target == NULL) {
+    return -1;
+  }
+
+  if (!same && load_into(b, target) != 0) {
+    free(target);
+    return -1;
+  }
+
+  size_t at    = 0;
+  int    found = 0;
+  for (size_t i = 0; i < b->n; i++) {
+    if (strcmp(b->rows[i].key, row_key) == 0) {
+      at    = i;
+      found = 1;
+      break;
+    }
+  }
+
+  if (!found) {
+    /* The parent listed but the row is not in it -- a track deleted or
+       renamed since it was queued. Put back what was on screen. */
+    if (!same && load_into(b, b->cwd) != 0) {
+      /* The restore failed, so `rows` is still the target's listing and
+         `cwd` must follow it: leaving the two disagreeing would draw one
+         directory while descending into another. */
+      free(b->cwd);
+      b->cwd    = target;
+      b->cursor = 0;
+      b->scroll = 0;
+      clamp(b);
+      return -1;
+    }
+    free(target);
+    clamp(b);
+    return -1;
+  }
+
+  if (same) {
+    free(target);
+  } else {
+    free(b->cwd);
+    b->cwd = target;
+  }
+  b->cursor = at;
+  b->scroll = 0; /* clamp scrolls the cursor back into view */
+  clamp(b);
+  return 0;
+} /* browser_goto */
+
+/*
  * browser_set_viewport: see include/ui/browser.h.
  */
 void

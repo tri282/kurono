@@ -176,6 +176,15 @@ test_readme_bindings(void)
     { 0, '/', ACT_SEARCH,          0 },
     { 0, 's', ACT_TOGGLE_SHUFFLE,  0 },
     { 0, 'r', ACT_CYCLE_REPEAT,    0 },
+    /* The phase-12 transport rows. Each of these is the only way to reach
+       its action from a keyboard, and two of them (mute, retry-device)
+       are the only way to drive a phase-12 verify row at all. Shifted
+       where the lowercase key is already taken now or by phase 12b. */
+    { 0, 'x', ACT_STOP,            0 },
+    { 0, 'M', ACT_MUTE,            0 },
+    { 0, 'C', ACT_CLEAR_QUEUE,     0 },
+    { 0, 'o', ACT_JUMP_TO_PLAYING, 0 },
+    { 0, 'R', ACT_RETRY_DEVICE,    0 },
     { TB_KEY_TAB, 0, ACT_VIEW_NEXT, 0 },
     { 0, '1', ACT_VIEW_SET,        0 },
     { 0, '2', ACT_VIEW_SET,        1 },

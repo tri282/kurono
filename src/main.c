@@ -5,6 +5,7 @@
 #include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
+#include "../include/queue.h"
 #include "../include/ui/browser.h"
 #include "../include/ui/keymap.h"
 #include "../include/ui/tui.h"
@@ -554,6 +555,37 @@ typedef struct {
 
   BrowserSource   brsrc;
   Browser *       br;                /* NULL on every headless run */
+  Queue *         q;                 /* NULL on every headless run */
+
+  /* The playing track, for the status bar. A copy of the basename
+     rather than a pointer into the queue: QueueEntry storage moves
+     under queue_remove and dies under queue_clear, and the status bar
+     outlives both. `dur_ms` is -1 until EV_STREAM_INFO reports it. */
+  char            now_name[192];
+  int64_t         dur_ms;
+
+  /* The playing track's full key, for ACT_JUMP_TO_PLAYING. Kept beside
+     the basename rather than derived from it, and copied for the same
+     reason: the QueueEntry it came from dies under queue_clear, which
+     ACT_CLEAR_QUEUE reaches while a track is still named here. */
+  char            now_path[PATH_MAX];
+
+  /* Volume, and the whole of gap 4's ruling (2026-08-13). T1 holds the
+     authoritative scalar because sink_set_gain and engine_set_gain are
+     write-only -- there is no getter to read the current value back.
+     `vol_pct` is what the status bar shows and is deliberately NOT
+     touched by mute, so unmuting restores `gain` by assignment from
+     `mute_saved` rather than recomputing it from a percentage. */
+  float           gain;
+  int             vol_pct;
+  float           mute_saved;
+  int             muted;
+
+  /* DESIGN.md XI.1's five-consecutive-failures rule (plan.md VII gap 7,
+     ruled 2026-08-13). Counts EV_OPEN_FAILED and EV_DECODE_ERROR alike;
+     reset by evidence of playback *progress*, never by evidence of a
+     successful open. See player_track_failed. */
+  int             fail_count;
 
   DeviceState     dev;
   PlayState       play;              /* T1's own; amendment 05 IV.9.a.i */
@@ -606,6 +638,38 @@ static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
 static void player_on_notify(void * user, int notification_type);
 
+/* Every action that moves the player through a state -- transport, the
+   queue, device recovery -- is defined below beside the state it moves
+   through, and declared here because action_dispatch sits above all of
+   it. Navigation is the exception and stays inline: it reaches nothing
+   but browser.c. */
+static void player_action(Player * p, Action a, int32_t arg);
+
+/*
+ * player_queue_find: play-order position of the first entry whose path
+ * equals `path`. Takes the queue, the path and an out-param for the
+ * position; returns 1 on a hit and 0 on a miss, leaving *out untouched
+ * on a miss.
+ *
+ * A linear scan, and deliberately in main.c rather than queue.c: queue.c
+ * depends on nothing (DESIGN.md III.2) and this is a UI policy question
+ * -- what "already queued" means -- not a property of the order model.
+ * Phase 16 answers it by track_id instead, once rows have one.
+ */
+static int
+player_queue_find(const Queue * q, const char * path, size_t * out)
+{
+  size_t n = queue_count(q);
+  for (size_t i = 0; i < n; i++) {
+    const QueueEntry * e = queue_at(q, i);
+    if (e != NULL && strcmp(e->path, path) == 0) {
+      *out = i;
+      return 1;
+    }
+  }
+  return 0;
+} /* player_queue_find */
+
 /*
  * player_report: one diagnostic, to whichever channel is legal right now.
  * With the TUI up it becomes the status-bar line; on the headless --play
@@ -638,13 +702,11 @@ player_report(Player * p, const char * fmt, ...)
  * audio/ or library/ directly. Takes a resolved Action and its table arg,
  * returns nothing.
  *
- * Phase 11 implements ACT_QUIT and nothing else, on purpose: this phase
- * is the terminal's lifecycle and the layout, and every other action
- * needs a browser selection or a queue to act on (phases 12-17). The rest
- * report themselves in the status bar, which is also how the binding
- * table gets exercised end to end before there is anything to control --
- * pressing `n` proves the key resolved and dispatched even though nothing
- * plays yet.
+ * It handles ACT_QUIT and the navigation actions itself -- the two
+ * groups that reach nothing below ui/ -- and hands everything else to
+ * player_action, which sits beside the state it moves. Actions with no
+ * M1 implementation still report themselves in the status bar, which is
+ * how the binding table stays exercised end to end.
  *
  * Never writes to stderr: termbox2 owns the terminal here.
  */
@@ -727,8 +789,9 @@ action_dispatch(Action a, int32_t arg)
     }
   }
 
-  player_report(p, "%s (arg %d) -- not implemented yet", action_name(a),
-                (int) arg);
+  /* Everything else moves the player through a state and is therefore
+     defined beside that state rather than here. */
+  player_action(p, a, arg);
 } /* action_dispatch */
 
 /*
@@ -1070,13 +1133,30 @@ player_on_notify(void * user, int notification_type)
     return;
   }
 
-  player_report(p, "device: notification %s%s", notify_name(notification_type),
-                p->notify_muted ? " (ours, during the ladder -- ignored)" : "");
-
   /* Our own stop/start coming back to us -- see Player.notify_muted. */
   if (p->notify_muted) {
+    player_report(p, "device: notification %s (ours, during the ladder -- ignored)",
+                  notify_name(notification_type));
     return;
   }
+
+  /* A `stopped` arriving while we are not playing is one we caused.
+     Amendment 05 stops the device on every transition out of
+     PLAY_PLAYING and publishes the state first, so by the time this runs
+     p->play already says so -- which is exactly what puts this on
+     IV.8.a's row 2 rather than row 3 and is why no ladder fires below.
+     The line is suppressed rather than merely ignored because reporting
+     it *overwrites* whatever the transition just put in the status bar:
+     "end of queue" and "5 consecutive failures, stopped" both became
+     "device: notification stopped" before this was added, and the user
+     never saw why playback ended. Not news in the other direction
+     either -- PipeWire's idle-suspend while stopped lands here too, and
+     XI.2 and IV.8.a agree it is a non-event. */
+  if (notification_type == SINK_NOTIFY_STOPPED && p->play != PLAY_PLAYING) {
+    return;
+  }
+
+  player_report(p, "device: notification %s", notify_name(notification_type));
 
   switch (notification_type) {
     case SINK_NOTIFY_REROUTED:
@@ -1263,6 +1343,713 @@ drive_seek_paused(Player * p, const atomic_uint_least64_t * pos,
 } /* drive_seek_paused */
 
 /*
+ * DESIGN.md XI.1: after this many consecutive failures T1 stops
+ * advancing. A queue of 500 unreadable files would otherwise spin T1 and
+ * T2 at full speed with nothing to show for it.
+ */
+#define PLAYER_MAX_FAILURES 5
+
+/*
+ * player_now_playing_set: remember the basename of `path` for the status
+ * bar. Copies rather than borrowing, because the QueueEntry it came from
+ * does not outlive queue_remove or queue_clear. Takes the Player and a
+ * path, returns nothing.
+ */
+static void
+player_now_playing_set(Player * p, const char * path)
+{
+  const char * base = strrchr(path, '/');
+  base = (base != NULL) ? base + 1 : path;
+  snprintf(p->now_name, sizeof p->now_name, "%s", base);
+  /* The full key as well, for ACT_JUMP_TO_PLAYING. A path too long to
+     fit is truncated rather than rejected: the jump then finds no row
+     and reports, which is the same outcome as any other stale key and
+     costs less than a second allocation story on this path. */
+  snprintf(p->now_path, sizeof p->now_path, "%s", path);
+  p->dur_ms = -1;
+} /* player_now_playing_set */
+
+/*
+ * player_stop: the transition to PLAY_STOPPED, shared by end of queue
+ * (DESIGN.md V.4), the five-failures cutoff (XI.1) and ACT_STOP.
+ *
+ * The order is state, timer, device -- V.4 as amended by amendment 05.
+ * Only the first pair of those is load-bearing and it is inside
+ * player_set_play_state: publish before stopping, so that "PLAY_PLAYING
+ * while the device is not started" is never observable to the watchdog.
+ * The timer disarm is placed first here to match the way V.4 reads; it
+ * could equally go last, because once the state says stopped the
+ * watchdog is inert whether or not a tick fires. Takes the Player,
+ * returns nothing.
+ */
+static void
+player_stop(Player * p)
+{
+  engine_stop(p->e);
+  player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
+  (void) player_set_play_state(p, PLAY_STOPPED);
+  p->now_name[0] = '\0';
+  p->now_path[0] = '\0';
+  p->dur_ms      = -1;
+} /* player_stop */
+
+/*
+ * player_play_entry: the T1 half of DESIGN.md V.1's track start, for one
+ * queue entry. Takes the Player and the entry, returns 0 on success and
+ * -1 if there is no device or no entry.
+ *
+ * Two orderings matter here and neither is visible from the call sites.
+ *
+ * The redraw timer is armed *before* the command is pushed, not after
+ * (VIII.3's warning): T2 can open, decode and post EV_STREAM_INFO before
+ * T1 gets another instruction, and arming afterwards leaves a window in
+ * which the position is advancing with nothing repainting it.
+ *
+ * engine_play comes before the play transition, so T2 has the command in
+ * hand while T1 starts the device. The reverse also works but is worse:
+ * PulseAudio's ma_device_start pre-fills by invoking the data callback
+ * before it uncorks, and against a pcm_ring T2 has not been told to fill
+ * yet that pre-fill is guaranteed to underrun. This does not eliminate
+ * the floor amendment 05 documented in XI.6 -- T2 may still not have
+ * decoded anything by the time the pre-fill runs -- it just stops
+ * guaranteeing it.
+ */
+static int
+player_play_entry(Player * p, const QueueEntry * ent)
+{
+  if (ent == NULL) {
+    return -1;
+  }
+  if (p->dev != DEV_READY) {
+    /* XI.2's browse-only, and the DEV_LOST window inside the ladder.
+       Queueing and browsing keep working; this one action does not. */
+    player_report(p, "no audio device -- cannot play %s", ent->path);
+    return -1;
+  }
+
+  player_set_redraw(p, 1);
+  engine_play(p->e, ent->path, ent->track_id);
+  player_now_playing_set(p, ent->path);
+
+  /* CMD_PLAY flushes and resyncs both counters to 0 (V.1 step 3), so the
+     new track's position is g_frames_consumed alone. The origin survives
+     from IV.8.b step 5 otherwise, and a track started after a device loss
+     would display the previous track's elapsed time added to its own. */
+  p->pos_origin_ms = 0;
+
+  if (player_set_play_state(p, PLAY_PLAYING) != 0) {
+    /* The start failed and player_set_play_state has already entered the
+       IV.8.b ladder (amendment 05's new entry point 2). T2 keeps
+       decoding into pcm_ring and the ladder's step 6 restores
+       PLAY_PLAYING, so this is not an error to report over the top of
+       the ladder's own message. */
+    return -1;
+  }
+  tui_mark_dirty();
+  return 0;
+} /* player_play_entry */
+
+/*
+ * player_advance: DESIGN.md V.1 step 5 and V.4 -- move to whatever plays
+ * next and start it, or stop at the end of the queue.
+ *
+ * Queue policy lives on T1 and only on T1: the engine never decides what
+ * plays next, which is the reason queue.c has no dependency on audio/
+ * (DESIGN.md III.2). Takes the Player, returns nothing.
+ */
+static void
+player_advance(Player * p)
+{
+  const QueueEntry * next = (p->q != NULL) ? queue_advance(p->q) : NULL;
+  if (next == NULL) {
+    /* End of queue. V.4 as amended: stop the device rather than leaving
+       T3 writing silence at ~53 wakeups a second forever. */
+    player_stop(p);
+    player_report(p, "end of queue");
+    return;
+  }
+  (void) player_play_entry(p, next);
+} /* player_advance */
+
+/*
+ * player_track_failed: the shared arm of EV_OPEN_FAILED and
+ * EV_DECODE_ERROR (DESIGN.md XI.1, plan.md VII gap 7 as ruled
+ * 2026-08-13). Takes the Player, a short noun for the message, and the
+ * averror; returns nothing.
+ *
+ * The rule is reset on evidence of playback progress, not on evidence of
+ * opening. The plan originally proposed resetting on a successful
+ * EV_STREAM_INFO, and that was rejected: a valid container header with a
+ * corrupt first frame -- the shape of every truncated download -- opens
+ * fine, posts EV_STREAM_INFO, and dies on the first read, so that reset
+ * would spin forever in exactly the case this counter exists to stop.
+ *
+ * One second rather than "any frames at all" is deliberate too: a file
+ * that yields 100 frames (~2 ms) and dies would reset the counter and
+ * spin at very nearly full speed. The worst case is now bounded at five
+ * tracks times one second.
+ *
+ * Two invariants this leans on, both verified rather than assumed.
+ * g_frames_consumed is 0 when either event arrives for a track that
+ * played nothing, because do_play calls pcm_flush_and_resync(e, 0)
+ * before evt_push on both its paths (src/audio/engine.c:501) -- there is
+ * no stale count from the previous track to misread. And an underrun
+ * cannot inflate it, because IV.2 counts frames actually read out of
+ * pcm_ring and never the device's requested frameCount.
+ */
+static void
+player_track_failed(Player * p, const char * what, int averror)
+{
+  uint64_t consumed =
+      atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
+  int rate = (int) p->fmt.sample_rate;
+
+  if (rate > 0 && consumed >= (uint64_t) rate) {
+    p->fail_count = 1; /* this track played; it is the run's first failure */
+  } else {
+    p->fail_count++;
+  }
+
+  if (p->fail_count >= PLAYER_MAX_FAILURES) {
+    player_stop(p);
+    p->fail_count = 0;
+    player_report(p, "%d consecutive failures, stopped", PLAYER_MAX_FAILURES);
+    return;
+  }
+
+  player_report(p, "%s (error %d) -- skipping", what, averror);
+  player_advance(p);
+} /* player_track_failed */
+
+/*
+ * player_gain_push: hand T1's authoritative gain to the audio path.
+ *
+ * Through engine_set_gain rather than sink_set_gain directly, because
+ * DESIGN.md IV's T1->T2 table lists set_gain(float) as a command and the
+ * handler is a one-line sink_set_gain (src/audio/engine.c). Routing
+ * around T2 would work -- the store is a relaxed atomic -- and would put
+ * a second writer on a value the command table says belongs to one.
+ * Nothing is lost by going the documented way: the gain is applied in the
+ * callback rather than in the decoder (IV.2 step 7), so the change is
+ * audible within one device period either way, not after the ring
+ * drains. Takes the Player, returns nothing.
+ */
+static void
+player_gain_push(Player * p)
+{
+  if (p->e != NULL) {
+    engine_set_gain(p->e, p->gain);
+  }
+} /* player_gain_push */
+
+/*
+ * player_toggle_pause: ACT_PLAY_PAUSE, all three directions.
+ *
+ * The two live edges are ordered oppositely and player_set_play_state
+ * owns that; what belongs here is the redraw timer, which is the other
+ * half of the "paused costs nothing" claim. Disarming it is what takes T1
+ * to zero wakeups; the device stop inside player_set_play_state is what
+ * takes T3 there (VIII.3, amendment 05).
+ *
+ * Resuming arms the timer *before* the state moves, for VIII.3's
+ * arm-before-push reason: the device starts consuming the ring the
+ * instant it is uncorked, and arming afterwards leaves a window in which
+ * the position advances with nothing repainting it.
+ *
+ * Takes the Player, returns nothing.
+ */
+static void
+player_toggle_pause(Player * p)
+{
+  switch (p->play) {
+    case PLAY_PLAYING:
+      engine_pause(p->e);
+      (void) player_set_play_state(p, PLAY_PAUSED);
+      player_set_redraw(p, 0);
+      player_report(p, "paused");
+      break;
+
+    case PLAY_PAUSED:
+      if (p->dev != DEV_READY) {
+        player_report(p, "no audio device -- cannot resume");
+        return;
+      }
+      player_set_redraw(p, 1);
+      if (player_set_play_state(p, PLAY_PLAYING) != 0) {
+        /* The start failed; the ladder owns the device and has already
+           reported. Leaving the timer armed is deliberate -- IV.8.b step
+           6 restores PLAY_PLAYING and the tick is what drives the
+           watchdog that observes the recovery. */
+        return;
+      }
+      engine_resume(p->e);
+      player_report(p, "playing: %s", p->now_name);
+      break;
+
+    case PLAY_STOPPED: {
+      /* Nothing is loaded, so this is "start what the queue is pointing
+         at" rather than a transport toggle. */
+      const QueueEntry * cur =
+          (p->q != NULL && queue_count(p->q) > 0) ? queue_at(p->q, queue_cursor(p->q))
+                                                  : NULL;
+      if (cur == NULL) {
+        player_report(p, "nothing to play");
+        return;
+      }
+      p->fail_count = 0; /* an explicit user action starts a fresh streak */
+      (void) player_play_entry(p, cur);
+      break;
+    }
+  }
+  tui_mark_dirty();
+} /* player_toggle_pause */
+
+/*
+ * player_skip: ACT_NEXT and ACT_PREV. Takes the Player and +1 or -1,
+ * returns nothing.
+ *
+ * queue_skip_next/_prev, never queue_advance: advance applies repeat
+ * policy and belongs to the EOF path, where "what plays next on its own"
+ * is the question. This one asks "what did the user ask for", and repeat
+ * one would otherwise make ACT_NEXT replay the same track forever.
+ *
+ * Running off either end reports and changes nothing -- in particular it
+ * does not stop what is playing, because a mistyped skip should not
+ * silence the player.
+ */
+static void
+player_skip(Player * p, int dir)
+{
+  if (p->q == NULL || queue_count(p->q) == 0) {
+    player_report(p, "queue is empty");
+    return;
+  }
+
+  const QueueEntry * next = (dir > 0) ? queue_skip_next(p->q) : queue_skip_prev(p->q);
+  if (next == NULL) {
+    player_report(p, (dir > 0) ? "end of queue" : "start of queue");
+    return;
+  }
+
+  p->fail_count = 0;
+  (void) player_play_entry(p, next);
+} /* player_skip */
+
+/*
+ * player_seek_relative: ACT_SEEK_FWD and ACT_SEEK_BACK, whose binding arg
+ * is the step in milliseconds. Takes the Player and a signed delta,
+ * returns nothing.
+ *
+ * Seeking while paused is legal and is the interesting case: with the
+ * device stopped, IV.7.5's fence skip is what keeps the flush from
+ * burning the full 200 ms cap, and amendment 05 made that path the
+ * product path rather than a harness one.
+ */
+static void
+player_seek_relative(Player * p, int32_t delta_ms)
+{
+  if (p->dev != DEV_READY) {
+    player_report(p, "no audio device -- cannot seek");
+    return;
+  }
+  if (p->play == PLAY_STOPPED) {
+    player_report(p, "nothing playing");
+    return;
+  }
+
+  int64_t target = player_position_ms(p) + (int64_t) delta_ms;
+  if (target < 0) {
+    target = 0;
+  }
+  if (p->dur_ms > 0 && target > p->dur_ms) {
+    target = p->dur_ms;
+  }
+
+  engine_seek(p->e, target);
+
+  /* IV.7.6 sets both frame counters to target * R / 1000, so from here
+     g_frames_consumed is absolute track time and the reopen origin must
+     go with it. Without this, every seek after a device loss would show
+     the target plus however far the track had got when the device
+     vanished. */
+  p->pos_origin_ms = 0;
+
+  player_report(p, "seek to %lld:%02lld", (long long) (target / 60000),
+                (long long) ((target / 1000) % 60));
+  tui_mark_dirty();
+} /* player_seek_relative */
+
+/*
+ * player_volume_step: ACT_VOL_UP and ACT_VOL_DOWN, whose binding arg is
+ * the step in percent. Takes the Player and a signed step, returns
+ * nothing.
+ *
+ * Adjusting the volume while muted unmutes (gap 4, ruled 2026-08-13):
+ * changing a saved value behind a silent output makes the indicator lie
+ * about what the next unmute will sound like, and that is precisely the
+ * bug the ruling exists to forbid.
+ *
+ * Works with no device, deliberately. Volume is state, not playback, and
+ * it must be right when the reopen ladder brings the device back.
+ */
+static void
+player_volume_step(Player * p, int32_t step_pct)
+{
+  p->muted = 0;
+
+  long want = (long) p->vol_pct + (long) step_pct;
+  if (want < 0) {
+    want = 0;
+  }
+  if (want > 100) {
+    want = 100;
+  }
+  p->vol_pct = (int) want;
+  p->gain    = (float) p->vol_pct / 100.0f;
+
+  player_gain_push(p);
+  player_report(p, "volume %d%%", p->vol_pct);
+  tui_mark_dirty();
+} /* player_volume_step */
+
+/*
+ * player_toggle_mute: ACT_MUTE, and the rest of gap 4's ruling. Takes the
+ * Player, returns nothing.
+ *
+ * Unmuting restores `gain` by assignment from the saved float, not by
+ * recomputing it from `vol_pct` -- which is why mute never touches
+ * `vol_pct` at all. The two are kept apart on purpose: the percentage is
+ * what the status bar shows and the float is what the callback
+ * multiplies by, and only the second has to come back bit for bit.
+ */
+static void
+player_toggle_mute(Player * p)
+{
+  if (p->muted) {
+    p->gain  = p->mute_saved;
+    p->muted = 0;
+  } else {
+    p->mute_saved = p->gain;
+    p->gain       = 0.0f;
+    p->muted      = 1;
+  }
+
+  player_gain_push(p);
+  if (p->muted) {
+    player_report(p, "muted");
+  } else {
+    player_report(p, "unmuted (%d%%)", p->vol_pct);
+  }
+  tui_mark_dirty();
+} /* player_toggle_mute */
+
+/*
+ * player_clear_queue: ACT_CLEAR_QUEUE. Takes the Player, returns nothing.
+ *
+ * Stops first, then clears. Clearing under a live track would leave
+ * queue_advance returning NULL at the next EOF anyway, so the track would
+ * stop regardless -- just minutes later and for no reason the user could
+ * connect to the key they pressed. now_name and now_path are copies, so
+ * nothing dangles either way.
+ */
+static void
+player_clear_queue(Player * p)
+{
+  if (p->q == NULL) {
+    player_report(p, "no queue");
+    return;
+  }
+  if (p->play != PLAY_STOPPED) {
+    player_stop(p);
+  }
+  queue_clear(p->q);
+  p->fail_count = 0;
+  player_report(p, "queue cleared");
+  tui_mark_dirty();
+} /* player_clear_queue */
+
+/*
+ * player_jump_to_playing: ACT_JUMP_TO_PLAYING -- move the browser to the
+ * playing track. Takes the Player, returns nothing.
+ *
+ * main.c takes the dirname rather than browser.c, because the key
+ * decomposition is the caller's knowledge: M1's keys are filesystem
+ * paths, and phase 16's source hands back parents of its own.
+ */
+static void
+player_jump_to_playing(Player * p)
+{
+  if (p->br == NULL) {
+    player_report(p, "nothing to browse");
+    return;
+  }
+  if (p->now_path[0] == '\0') {
+    player_report(p, "nothing playing");
+    return;
+  }
+
+  char parent[PATH_MAX];
+  snprintf(parent, sizeof parent, "%s", p->now_path);
+  char * slash = strrchr(parent, '/');
+  if (slash == NULL) {
+    player_report(p, "cannot locate %s", p->now_name);
+    return;
+  }
+  /* A track directly under "/" keeps the separator as its parent; every
+     other one drops it. */
+  *(slash == parent ? slash + 1 : slash) = '\0';
+
+  if (browser_goto(p->br, parent, p->now_path) != 0) {
+    player_report(p, "cannot reach %s", p->now_name);
+    return;
+  }
+  tui_mark_dirty();
+} /* player_jump_to_playing */
+
+/*
+ * player_retry_device: ACT_RETRY_DEVICE -- the manual way out of
+ * browse-only (DESIGN.md XI.2). Takes the Player, returns nothing.
+ *
+ * player_ladder_begin is the wrong entry point here: it returns early
+ * unless the device is DEV_READY, which is exactly what browse-only is
+ * not, and its steps 1 and 2 park T2 and tear down a device that does
+ * not exist. This sets up the ladder's own state and enters at the
+ * attempt, so the retry, the backoff and the 60 s give-up are all the
+ * ones IV.8.b already specifies rather than a second implementation.
+ *
+ * The one correction it has to make afterwards: step 6 ends with
+ * `p->play = PLAY_PLAYING` unconditionally, which is right for both of
+ * the ladder's own entry points -- a loss is only ever declared from
+ * PLAY_PLAYING, and the other is a failed play transition -- and wrong
+ * for this third one, where nothing was ever loaded. Left alone it would
+ * claim to be playing and hold a started device against a silent ring,
+ * which is precisely the state amendment 05 exists to prevent. Correcting
+ * it here rather than making step 6 conditional keeps the change out of
+ * the verified ladder.
+ */
+static void
+player_retry_device(Player * p)
+{
+  if (p->dev == DEV_READY) {
+    player_report(p, "device: already open");
+    return;
+  }
+  if (p->dev == DEV_LOST) {
+    player_report(p, "device: reopen already in progress");
+    return;
+  }
+
+  int was_loaded = (p->now_path[0] != '\0');
+
+  p->dev               = DEV_LOST;
+  p->ladder_attempt    = 0;
+  p->ladder_elapsed_ms = 0;
+  p->notify_muted      = 0;
+  if (!was_loaded) {
+    p->pos_origin_ms = 0; /* nothing to resume, so nothing to resume *at* */
+  }
+  clock_gettime(CLOCK_MONOTONIC, &p->loss_at);
+
+  /* Step 1's park, kept even though this entry point skips the rest of
+     steps 1 and 2. The attempt's sink.open frees and reallocates
+     pcm_ring, and that is only legal with both touchers provably gone.
+     T2 is already parked on both roads into browse-only -- startup never
+     loaded a track, and ladder exhaustion parked it at step 1 and never
+     resumed -- so this is a positive guarantee replacing an inferred one,
+     and engine_park_sync is idempotent when T2 is already parked. */
+  engine_park_sync(p->e);
+
+  player_report(p, "device: retrying");
+  player_ladder_attempt(p);
+
+  if (p->dev == DEV_READY && !was_loaded) {
+    /* Undo step 6's resume for the no-track case: engine_stop, the timer
+       disarmed, and the state published before the device stops -- all of
+       which player_stop already does in the right order. */
+    player_stop(p);
+    player_report(p, "device: reopened -- nothing playing");
+  }
+} /* player_retry_device */
+
+/*
+ * player_action: every action that moves the player through a state --
+ * transport, the queue, device recovery. Declared above action_dispatch,
+ * which handles ACT_QUIT and navigation itself and delegates the rest
+ * here. Takes the Player, the action and its binding arg; returns
+ * nothing.
+ *
+ * An unimplemented action still reports itself, which is what keeps the
+ * binding table exercised end to end for the actions phases 13-17 own.
+ */
+static void
+player_action(Player * p, Action a, int32_t arg)
+{
+  switch (a) {
+    case ACT_PLAY_PAUSE:
+      player_toggle_pause(p);
+      return;
+
+    case ACT_STOP:
+      if (p->play == PLAY_STOPPED) {
+        player_report(p, "nothing playing");
+        return;
+      }
+      player_stop(p);
+      player_report(p, "stopped");
+      tui_mark_dirty();
+      return;
+
+    case ACT_NEXT:
+      player_skip(p, 1);
+      return;
+
+    case ACT_PREV:
+      player_skip(p, -1);
+      return;
+
+    /* The binding table carries the step as a positive magnitude in both
+       directions, so the sign is the action's, not the arg's. */
+    case ACT_SEEK_FWD:
+      player_seek_relative(p, arg);
+      return;
+
+    case ACT_SEEK_BACK:
+      player_seek_relative(p, -arg);
+      return;
+
+    case ACT_VOL_UP:
+      player_volume_step(p, arg);
+      return;
+
+    case ACT_VOL_DOWN:
+      player_volume_step(p, -arg);
+      return;
+
+    case ACT_MUTE:
+      player_toggle_mute(p);
+      return;
+
+    case ACT_TOGGLE_SHUFFLE:
+      if (p->q == NULL) {
+        player_report(p, "no queue");
+        return;
+      }
+      queue_set_shuffle(p->q, !queue_shuffle(p->q));
+      player_report(p, "shuffle %s", queue_shuffle(p->q) ? "on" : "off");
+      tui_mark_dirty();
+      return;
+
+    case ACT_CYCLE_REPEAT: {
+      if (p->q == NULL) {
+        player_report(p, "no queue");
+        return;
+      }
+      /* off -> all -> one -> off (phase-9-queue.md III.3). */
+      static const char * const name[] = { "off", "all", "one" };
+      RepeatMode next = (RepeatMode) ((queue_repeat(p->q) + 1) % 3);
+      queue_set_repeat(p->q, next);
+      player_report(p, "repeat %s", name[next]);
+      tui_mark_dirty();
+      return;
+    }
+
+    case ACT_CLEAR_QUEUE:
+      player_clear_queue(p);
+      return;
+
+    case ACT_JUMP_TO_PLAYING:
+      player_jump_to_playing(p);
+      return;
+
+    case ACT_RETRY_DEVICE:
+      player_retry_device(p);
+      return;
+
+    case ACT_ENQUEUE: {
+      if (p->br == NULL || p->q == NULL) {
+        player_report(p, "nothing to queue");
+        return;
+      }
+      const BrowserRow * sel = browser_selection(p->br);
+      if (sel == NULL) {
+        player_report(p, "nothing selected");
+        return;
+      }
+      if (sel->is_dir) {
+        /* Recursive enqueue of a directory is phase 16's, where the
+           library query can answer it without walking the tree on T1. */
+        player_report(p, "%s is a directory", sel->name);
+        return;
+      }
+      /* track_id 0: M1 plays straight off the filesystem and has no
+         library rows yet (DESIGN.md XIV.1). Phase 17's display-metadata
+         branch keys on track_id > 0, which is why the value is carried
+         through the queue from the start rather than added later. */
+      if (queue_append(p->q, 0, sel->key) != 0) {
+        player_report(p, "could not queue %s", sel->name);
+        return;
+      }
+      player_report(p, "queued: %s (%zu in queue)", sel->name,
+                    queue_count(p->q));
+      tui_mark_dirty();
+      return;
+    }
+
+    case ACT_PLAY_NOW: {
+      if (p->br == NULL || p->q == NULL) {
+        player_report(p, "nothing to play");
+        return;
+      }
+      const BrowserRow * sel = browser_selection(p->br);
+      if (sel == NULL) {
+        player_report(p, "nothing selected");
+        return;
+      }
+      if (sel->is_dir) {
+        player_report(p, "%s is a directory", sel->name);
+        return;
+      }
+
+      /* Two things this must not do, and the second is the one that
+         looks right and is not.
+         If the path is already queued, play that entry rather than
+         inserting a second copy: Enter on a row the user already added
+         is "go there", not "queue it twice". Deliberate duplicates are
+         still reachable through ACT_ENQUEUE, which never dedupes.
+         Otherwise insert directly after the current entry rather than
+         appending. Appending would put the new track last in play
+         order, so queue_advance would return NULL the moment it
+         finished and everything already queued behind it would never
+         play -- a queue that always stops after exactly one track. */
+      size_t at = 0;
+      if (!player_queue_find(p->q, sel->key, &at)) {
+        at = (queue_count(p->q) == 0) ? 0 : queue_cursor(p->q) + 1;
+        if (queue_insert(p->q, at, 0, sel->key) != 0) {
+          player_report(p, "could not queue %s", sel->name);
+          return;
+        }
+      }
+      /* Set the cursor explicitly: queue_insert adjusts it to keep
+         referring to whatever was current *before* the insert, which is
+         the opposite of what playing the new entry needs. */
+      if (queue_set_cursor(p->q, at) != 0) {
+        player_report(p, "could not select %s", sel->name);
+        return;
+      }
+      p->fail_count = 0; /* an explicit user action starts a fresh streak */
+      (void) player_play_entry(p, queue_at(p->q, at));
+      return;
+    }
+
+    default:
+      break;
+  }
+
+  player_report(p, "%s (arg %d) -- not implemented yet", action_name(a),
+                (int) arg);
+} /* player_action */
+
+/*
  * player_watchdog: DESIGN.md IV.8.a's authoritative detector. On every
  * redraw tick, if the engine is playing and the device is not started,
  * declare device loss. One atomic load per tick, and the tick is armed
@@ -1315,6 +2102,15 @@ player_handle_engine_event(Player * p, const Event * ev)
 {
   switch (ev->kind) {
     case EV_STREAM_INFO:
+      /* The first point at which the track is provably open and its
+         duration is known, which is what the progress bar needs. It is
+         deliberately NOT where the failure counter resets -- see
+         player_track_failed for why that would defeat the counter. */
+      p->dur_ms = ev->info.duration_ms;
+      if (p->ui) {
+        tui_mark_dirty();
+        break;
+      }
       player_report(p, "stream: codec=%s rate=%d channels=%d duration_ms=%lld",
                     ev->info.codec, ev->info.sample_rate, ev->info.channels,
                     (long long) ev->info.duration_ms);
@@ -1350,21 +2146,44 @@ player_handle_engine_event(Player * p, const Event * ev)
       }
       break;
 
+    /* The three terminal events split by the kind of run. A headless
+       --play is a one-shot harness: one file, then exit, and its status
+       is the verdict. The TUI is a player and has a queue to fall
+       through to, so the same event advances instead of ending the run.
+       Neither branch is the other's special case -- --play must keep
+       reporting a failed file through its exit status, because that is
+       what every sanitiser invocation in the verify tables reads. */
     case EV_OPEN_FAILED:
-      player_report(p, "open failed (error %d)", ev->averror);
-      p->status  = 1;
-      p->running = 0;
+      if (!p->ui) {
+        player_report(p, "open failed (error %d)", ev->averror);
+        p->status  = 1;
+        p->running = 0;
+        break;
+      }
+      player_track_failed(p, "open failed", ev->averror);
       break;
 
     case EV_DECODE_ERROR:
-      player_report(p, "decode error (error %d)", ev->averror);
-      p->status  = 1;
-      p->running = 0;
+      if (!p->ui) {
+        player_report(p, "decode error (error %d)", ev->averror);
+        p->status  = 1;
+        p->running = 0;
+        break;
+      }
+      player_track_failed(p, "decode error", ev->averror);
       break;
 
     case EV_EOF:
-      player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
-      p->running = 0;
+      if (!p->ui) {
+        player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
+        p->running = 0;
+        break;
+      }
+      /* A track that reached EOF played, whatever happened earlier in
+         the run, so the failure streak is broken here as well as by the
+         one-second rule in player_track_failed. */
+      p->fail_count = 0;
+      player_advance(p);
       break;
   }
 } /* player_handle_engine_event */
@@ -1439,14 +2258,21 @@ player_repaint(Player * p)
 {
   TuiModel m;
   memset(&m, 0, sizeof m);
-  m.now_playing = NULL;               /* the queue: later in phase 12 */
+  m.now_playing = (p->now_name[0] != '\0') ? p->now_name : NULL;
   m.message     = (p->message[0] != '\0') ? p->message : NULL;
-  m.pos_ms      = (p->dev == DEV_READY) ? player_position_ms(p) : -1;
-  m.dur_ms      = -1;
+  m.pos_ms      = (p->dev == DEV_READY && p->play != PLAY_STOPPED)
+                      ? player_position_ms(p)
+                      : -1;
+  m.dur_ms      = p->dur_ms;
   m.playing     = (p->play == PLAY_PLAYING);
   m.paused      = (p->play == PLAY_PAUSED);
-  m.volume_pct  = 100;
+  m.volume_pct  = p->vol_pct;
+  m.muted       = p->muted;
   m.browser     = p->br;
+  if (p->q != NULL) {
+    m.shuffle = queue_shuffle(p->q);
+    m.repeat  = (int) queue_repeat(p->q);
+  }
 
   /* Borrowed, never owned, and never used for arithmetic
      (DESIGN.md II.2's warning) -- the status bar is the only legal
@@ -1537,6 +2363,14 @@ shutdown_all(Player * p)
         exists to make unwriteable. */
   browser_destroy(p->br);
   p->br = NULL;
+
+  /* The queue owns copies of its paths and borrows nothing, so its
+     position here is free choice rather than a constraint -- it sits
+     with the browser because both are UI state and step 9 is where UI
+     state goes. It is reached after the engine is gone, so there is no
+     window in which T2 could be handed an entry that was just freed. */
+  queue_destroy(p->q);
+  p->q = NULL;
 
   config_free(&p->cfg);
   event_destroy(p->el);
@@ -1665,6 +2499,16 @@ player_loop(Player * p)
 static int
 player_start(Player * p, const char * who, int * have_device)
 {
+  /* Full volume, unmuted, on every run. Set here rather than in either
+     caller because a memset-zeroed Player would otherwise start silent,
+     and the engine's own default gain is 1.0 -- the two must agree from
+     the first frame, and nothing pushes a CMD_SET_GAIN until the user
+     touches the volume. */
+  p->gain       = 1.0f;
+  p->vol_pct    = 100;
+  p->mute_saved = 1.0f;
+  p->muted      = 0;
+
   /* Step 1: config_init. */
   if (config_init(&p->cfg) != 0) {
     kurono_die("failed to initialize configuration");
@@ -2022,6 +2866,17 @@ run_tui(void)
   if (p.br == NULL) {
     fprintf(stderr, "kurono: cannot list %s -- browsing disabled\n",
             p.cfg.roots[0].path);
+  }
+
+  /* The queue. Seeded from the clock rather than internally, because
+     queue.c takes the seed as a parameter specifically so that a fuzz
+     failure is replayable (phase 9). Like the browser, a failure here is
+     not fatal: queueing actions report themselves and everything else
+     still works. */
+  p.dur_ms = -1;
+  p.q      = queue_create((unsigned) time(NULL));
+  if (p.q == NULL) {
+    fprintf(stderr, "kurono: could not create the queue -- playback disabled\n");
   }
 
   /* Step 9: tb_init, then the remaining epoll registrations. Its
