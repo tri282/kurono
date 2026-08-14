@@ -49,6 +49,26 @@ void sink_get(AudioSink * out);
 int sink_is_started(const AudioSink * s);
 
 /*
+ * sink_underrun_count: how many times the data callback has found
+ * pcm_ring short and written silence, since the device was opened.
+ *
+ * DESIGN.md XI.6 makes this a user-visible number rather than a
+ * debugging aid: "a visible underrun counter in the status bar is
+ * worth more than any amount of reasoning about whether underruns are
+ * happening". T3 increments it memory_order_relaxed inside the
+ * callback; this is the matching relaxed load, and relaxed is right on
+ * both sides -- the value is for display, nothing orders against it,
+ * and a reader one repaint behind is not wrong in any way a user could
+ * notice.
+ *
+ * Note the floor amendment 05 gave it: PulseAudio's ma_device_start
+ * pre-fills by invoking the callback before uncorking, and pcm_ring
+ * may still be empty then, so expect at most one per play transition.
+ * Read it as "underruns beyond one per play". Takes nothing.
+ */
+unsigned sink_underrun_count(void);
+
+/*
  * sink_cb_alive: 1 iff the data callback is currently executing, from
  * the g_cb_alive flag phase 5 added as the residual-risk-2 mitigation
  * (phase-5-sink.md I.3). Phase 8's teardown reads it immediately after

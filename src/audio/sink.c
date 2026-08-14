@@ -377,18 +377,18 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
     return -1;
   }
 
-  /* M1 open item (plan.md phase-5-sink.md III.1): the real negotiated
-     internalPeriodSizeInFrames is not knowable without running. Legal
-     here -- it runs before tb_init ever claims the terminal, the
-     documented exception to the no-printf rule (CLAUDE.md), not a
-     violation of it. Remove or downgrade before phase 12. */
-  fprintf(stderr,
-          "device: rate=%u internalRate=%u internalChannels=%u "
-          "internalFormat=%d periodFrames=%u\n",
-          g_device.sampleRate, g_device.playback.internalSampleRate,
-          g_device.playback.internalChannels,
-          (int) g_device.playback.internalFormat,
-          g_device.playback.internalPeriodSizeInFrames);
+  /* The M1 open item this line existed for (plan.md phase-5-sink.md
+     III.1 -- the real negotiated internalPeriodSizeInFrames) was closed
+     in phase 5: 900 frames at 48000 Hz, an 18.75 ms callback deadline,
+     recorded in STATUS and in DESIGN.md. Phase 12 retires the print, as
+     phase 5 said it would.
+     It was legal where it stood -- before tb_init, the documented
+     exception to the no-printf rule -- but it printed on every single
+     run, leaving a line in the scrollback above the alternate screen
+     for a number nobody needs after the one time it was measured. The
+     values are all still reachable: they are in SessionFormat, and the
+     status bar renders internal_format and internal_channels
+     (DESIGN.md II.2 -- display only, never arithmetic). */
 
   uint32_t r = g_device.playback.internalSampleRate;
 
@@ -571,6 +571,15 @@ sink_is_started(const AudioSink * s)
   }
   return ma_device_get_state(&g_device) == ma_device_state_started;
 } /* sink_is_started */
+
+/* sink_underrun_count: see include/audio/sink.h. Relaxed on both sides
+   -- T3 increments relaxed inside the callback and this is for display
+   only. */
+unsigned
+sink_underrun_count(void)
+{
+  return atomic_load_explicit(&g_underrun_count, memory_order_relaxed);
+} /* sink_underrun_count */
 
 /* sink_pcm_ring: see include/audio/sink.h. */
 Ring *

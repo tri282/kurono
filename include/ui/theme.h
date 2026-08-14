@@ -46,6 +46,12 @@ typedef enum {
   STYLE_SPECTRUM_LOW, STYLE_SPECTRUM_HIGH, STYLE_SPECTRUM_PEAK,
   STYLE_PLAYING, STYLE_ERROR, STYLE_SEARCH_MATCH,
   STYLE_SCROLLBAR, STYLE_POPUP, STYLE_COVER_BORDER,
+  /* Appended by phase 12. The browser must distinguish a directory from
+     a track, and CLAUDE.md's rule is that a colour in draw code is a bug
+     even when it looks right -- so the distinction is a slot, not a
+     literal. Appended rather than inserted: amendment 04 makes this enum
+     append-only, because the config parser keys on the ordinal. */
+  STYLE_DIR,
   STYLE_COUNT
 } StyleSlot;
 

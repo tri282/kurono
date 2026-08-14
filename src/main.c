@@ -5,6 +5,7 @@
 #include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
+#include "../include/ui/browser.h"
 #include "../include/ui/keymap.h"
 #include "../include/ui/tui.h"
 
@@ -475,72 +476,6 @@ drive_seek_stress(Engine * e, const atomic_uint_least64_t * pos, int rate,
           drain_ms, converged ? "RESYNC OK" : "RESYNC FAIL");
 } /* drive_seek_stress */
 
-/*
- * drive_seek_paused: the phase-7 "seek while paused" verify row, which
- * exists to prove the DESIGN.md IV.7.5 fence skip. engine.c never
- * stops the device -- that is T1's job and does not exist as a policy
- * until phase 8/12 -- so this harness, which *is* T1, stops it
- * directly. That is the whole point: with the device stopped,
- * sink_is_started returns false and engine_flush_begin must reset
- * immediately instead of burning the 200 ms fence cap.
- *
- * Timing is the assertion. A skipped fence returns in microseconds; a
- * fence that ran polls at 1 ms up to 200 ms. Note this proves the skip
- * mechanism, not phase 8/12's pause policy. Takes the Engine, the
- * sink, the frame counter, the sample rate, and the seek target;
- * returns nothing (verdict goes to stderr).
- */
-static void
-drive_seek_paused(Engine * e, AudioSink * sink, const atomic_uint_least64_t * pos,
-                  int rate, int64_t seek_ms)
-{
-  engine_pause(e);
-  play_sleep_ms(SEEK_SETTLE_MS); /* let T2 reach its park before the device stops */
-
-  sink->stop(sink->self); /* T1 only, DESIGN.md IV.9.b; synchronous */
-  fprintf(stderr, "seek-paused: device stopped, sink_is_started=%d\n",
-          sink_is_started(sink));
-
-  struct timespec t0, t1;
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-  engine_seek(e, seek_ms);
-
-  /* engine_seek only queues; the flush happens on T2. Wait for the
-     resync to become visible in the counter rather than timing the
-     queue push, which would measure nothing. */
-  int64_t got = -1;
-  double  ms  = 0.0;
-  for (int i = 0; i < FLUSH_FENCE_WAIT_MS; i++) {
-    got = position_ms(pos, rate);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    ms = elapsed_ms(&t0, &t1);
-    if (got >= 0 && llabs((long long) (got - seek_ms)) <= SEEK_TOLERANCE_MS) {
-      break;
-    }
-    play_sleep_ms(1);
-  }
-
-  fprintf(stderr,
-          "seek-paused: resync visible after %.2f ms (position=%lld ms) -- %s\n",
-          ms, (long long) got,
-          (ms < (double) FENCE_SKIP_MAX_MS) ? "FENCE SKIPPED" : "FENCE RAN");
-
-  if (sink->start(sink->self) != 0) {
-    fprintf(stderr, "seek-paused: sink restart failed\n");
-  }
-  engine_resume(e);
-
-  /* Prove the resume actually produced audio: the counter must advance
-     past the seek target, which it cannot do unless T3 is running again
-     and T2 refilled the ring the flush emptied. */
-  int64_t before = position_ms(pos, rate);
-  play_sleep_ms(SEEK_SETTLE_MS);
-  int64_t after = position_ms(pos, rate);
-  fprintf(stderr, "seek-paused: after resume %lld -> %lld ms -- %s\n",
-          (long long) before, (long long) after,
-          (after > before) ? "PLAYBACK RESUMED" : "STALLED");
-} /* drive_seek_paused */
-
 /* ---------------------------------------------------------------------
  * Phase 8: startup and teardown ordering (DESIGN.md IV.9), the
  * device-loss watchdog (IV.8.a), the reopen ladder (IV.8.b), and
@@ -578,6 +513,32 @@ static const int g_ladder_backoff_ms[] = { 250, 500, 1000, 2000, 4000 };
 typedef enum { DEV_READY, DEV_LOST, DEV_BROWSE_ONLY } DeviceState;
 
 /*
+ * PlayState: T1's own authoritative view of whether the player is
+ * playing. Deliberately NOT engine.h's EngineState, and the distinction
+ * is load-bearing rather than pedantic.
+ *
+ * EngineState is T2's view of itself, stored and loaded
+ * memory_order_relaxed, and engine_pause/engine_resume only *queue* a
+ * command -- T2 adopts the new state whenever it next reaches a drain
+ * point, which may be after a slow AudioSource.read. Amendment 05's
+ * device lifecycle says "publish the state", and if the state published
+ * were T2's, the publish would not have happened yet when T1 stops the
+ * device one line later. IV.8.a's watchdog would then observe
+ * ENG_PLAYING together with !sink_is_started -- its device-loss
+ * predicate exactly -- and run the reopen ladder against a healthy
+ * device on every pause.
+ *
+ * So T1 owns this one, sets it synchronously, and every piece of device
+ * policy reads it. T2 keeps EngineState for its own purposes. The two
+ * agree eventually and are never required to agree instantaneously.
+ *
+ * (Correction to amendment 05, 2026-08-13, made while implementing
+ * phase 12 step 0. The amendment did not say whose state, and there are
+ * two.)
+ */
+typedef enum { PLAY_STOPPED, PLAY_PLAYING, PLAY_PAUSED } PlayState;
+
+/*
  * Player: everything one headless run of the audio spine owns, in
  * construction order (DESIGN.md IV.9.a) so that teardown can be read as
  * its exact reverse. Lives on run_player's stack for the whole run; the
@@ -591,7 +552,11 @@ typedef struct {
   Engine *      e;
   EventLoop *   el;
 
+  BrowserSource   brsrc;
+  Browser *       br;                /* NULL on every headless run */
+
   DeviceState     dev;
+  PlayState       play;              /* T1's own; amendment 05 IV.9.a.i */
   int             ladder_attempt;    /* index into g_ladder_backoff_ms */
   int             ladder_elapsed_ms; /* against LADDER_GIVE_UP_MS */
   struct timespec loss_at;           /* for the detection/recovery timings */
@@ -696,6 +661,70 @@ action_dispatch(Action a, int32_t arg)
        there is no second exit path (DESIGN.md IV.9.b). */
     p->running = 0;
     return;
+  }
+
+  /* Navigation. Every one of these is a pure cursor move inside
+     browser.c -- nothing here reaches the engine, and a browser that
+     failed to build leaves them all no-ops rather than special cases. */
+  if (p->br != NULL) {
+    /* A page is one screenful minus a row of overlap, so the line the
+       user was reading stays on screen across the jump. */
+    const TuiLayout * l = tui_layout();
+    int page = (l != NULL && l->body_h > 1) ? l->body_h - 1 : 1;
+
+    switch (a) {
+      case ACT_CURSOR_UP:
+        browser_cursor_move(p->br, -1);
+        tui_mark_dirty();
+        return;
+      case ACT_CURSOR_DOWN:
+        browser_cursor_move(p->br, 1);
+        tui_mark_dirty();
+        return;
+      case ACT_CURSOR_PAGE_UP:
+        browser_cursor_move(p->br, -page);
+        tui_mark_dirty();
+        return;
+      case ACT_CURSOR_PAGE_DOWN:
+        browser_cursor_move(p->br, page);
+        tui_mark_dirty();
+        return;
+      case ACT_CURSOR_HOME:
+        browser_cursor_home(p->br);
+        tui_mark_dirty();
+        return;
+      case ACT_CURSOR_END:
+        browser_cursor_end(p->br);
+        tui_mark_dirty();
+        return;
+
+      case ACT_COL_LEFT:
+        if (browser_ascend(p->br) < 0) {
+          player_report(p, "cannot read parent directory");
+        }
+        tui_mark_dirty();
+        return;
+
+      case ACT_COL_RIGHT: {
+        /* A file is not an error here -- right on a track simply does
+           nothing, and ACT_PLAY_NOW is what acts on one. */
+        if (browser_descend(p->br) < 0) {
+          /* Read the selection AFTER the failure, not before: a failed
+             descend leaves the rows untouched, so it is still valid,
+             and a successful one would have freed the array the pointer
+             is into. Naming browser_cwd here instead would report the
+             parent -- the directory that is readable. */
+          const BrowserRow * sel = browser_selection(p->br);
+          player_report(p, "cannot read %s",
+                        (sel != NULL) ? sel->name : "directory");
+        }
+        tui_mark_dirty();
+        return;
+      }
+
+      default:
+        break;
+    }
   }
 
   player_report(p, "%s (arg %d) -- not implemented yet", action_name(a),
@@ -819,6 +848,13 @@ player_browse_only(Player * p, const char * why)
 {
   p->dev          = DEV_BROWSE_ONLY;
   p->notify_muted = 0;
+
+  /* Nothing is playing and nothing can. Set directly rather than
+     through player_set_play_state: there is no device to stop (the
+     ladder's step 2 already uninit'ed it, or it never opened), and
+     routing through the lifecycle here would only re-derive that. */
+  p->play = PLAY_STOPPED;
+
   player_set_redraw(p, 0);
   (void) event_arm_reconnect(p->el, 0);
 
@@ -935,6 +971,18 @@ player_ladder_attempt(Player * p)
   }
   engine_resume(p->e);
   p->dev = DEV_READY;
+
+  /* IV.8.b step 6's "state PLAYING", and under amendment 05 it is also
+     what restores IV.9.a.i's invariant: the start above just happened,
+     so the publish belongs immediately after it (entering PLAY_PLAYING
+     is start-first, publish-second). It is unconditional because both
+     ladder entry points are roads on which the user wants audio -- a
+     loss is only ever declared from PLAY_PLAYING, and the other entry
+     point is a failed play transition. Without this the device would be
+     started while p->play still read PAUSED or STOPPED, which is the
+     1.33%-forever state the amendment exists to prevent. */
+  p->play = PLAY_PLAYING;
+
   (void) event_arm_reconnect(p->el, 0);
   player_set_redraw(p, 1);
 
@@ -1042,7 +1090,12 @@ player_on_notify(void * user, int notification_type)
       /* Rows 2 and 3. Ignored unless the engine believes it is playing,
          which is what makes PipeWire's idle-suspend a non-event while
          paused or stopped. */
-      if (p->dev == DEV_READY && engine_state(p->e) == ENG_PLAYING) {
+      /* p->play, not engine_state -- the same correction the watchdog
+         carries, and for the same reason: our own sink.stop on a pause
+         raises this notification, and T2 may not have adopted the pause
+         yet. Publishing the state before the stop is what puts this on
+         IV.8.a's row 2 rather than row 3. */
+      if (p->dev == DEV_READY && p->play == PLAY_PLAYING) {
         player_ladder_begin(p, "notification");
       }
       break;
@@ -1069,6 +1122,147 @@ player_on_notify(void * user, int notification_type)
 } /* player_on_notify */
 
 /*
+ * player_set_play_state: DESIGN.md IV.9.a.i (amendment 05), the device
+ * lifecycle, and the ONLY place outside teardown and the IV.8.b ladder
+ * that starts or stops the device. Everything else changes playback
+ * state by calling this.
+ *
+ * The invariant: the device is started iff the state is PLAY_PLAYING.
+ * The two edges are ordered OPPOSITELY and that is the whole of the
+ * risk in this function:
+ *
+ *   entering PLAY_PLAYING -- start the device FIRST, publish SECOND
+ *   leaving  PLAY_PLAYING -- publish FIRST, stop the device SECOND
+ *
+ * Both orders keep one combination unobservable: state PLAY_PLAYING
+ * while the device is not started. That pair is verbatim
+ * player_watchdog's device-loss predicate, so reversing either edge
+ * makes every ordinary pause declare a loss and run the reopen ladder
+ * against a device that is fine. It also puts the `stopped`
+ * notification our own sink.stop raises onto IV.8.a's row 2 (ignored
+ * while STOPPED or PAUSED) instead of row 3 (loss while playing) --
+ * the rows differ by exactly the state this ordering guarantees has
+ * already landed, which is why notify_muted is deliberately NOT used
+ * here. A mute that hides a misordering is worse than no mute.
+ *
+ * Takes the Player and the state to move to. Returns 0, or -1 when
+ * entering PLAY_PLAYING needed a device start that failed -- in which
+ * case the state is NOT published, the ladder has been entered, and the
+ * caller must not proceed with whatever it was starting.
+ */
+static int
+player_set_play_state(Player * p, PlayState want)
+{
+  if (p->play == want) {
+    return 0;
+  }
+
+  /* Browse-only and mid-ladder runs have no device to drive. The state
+     still tracks intent so the status bar and the queue behave, and
+     IV.8.b step 6 restores the device to match on the way back. */
+  int have_device = (p->dev == DEV_READY);
+
+  if (want == PLAY_PLAYING) {
+    if (have_device && !sink_is_started(&p->sink)) {
+      if (p->sink.start(p->sink.self) != 0) {
+        /* Amendment 05 decision 5: not a startup condition and not
+           browse-only. This is the most likely way a device that
+           vanished while nothing was playing announces itself, so it
+           goes to the ladder like any other loss. */
+        player_report(p, "device: start failed, reopening");
+        player_ladder_begin(p, "start failure");
+        return -1;
+      }
+    }
+    p->play = want;             /* publish SECOND */
+    return 0;
+  }
+
+  p->play = want;               /* publish FIRST */
+  if (have_device && sink_is_started(&p->sink)) {
+    p->sink.stop(p->sink.self); /* synchronous; T3 is done on return */
+  }
+  return 0;
+} /* player_set_play_state */
+
+/*
+ * drive_seek_paused: the phase-7 "seek while paused" verify row, which
+ * exists to prove the DESIGN.md IV.7.5 fence skip -- with the device
+ * stopped, sink_is_started returns false and engine_flush_begin must
+ * reset immediately instead of burning the 200 ms fence cap.
+ *
+ * Rewritten in phase 12 and moved down the file to sit below
+ * player_set_play_state, which it now goes through. It used to call
+ * engine_pause and sink->stop itself, on the stated grounds that T1 had
+ * no pause policy yet and the harness *was* T1. Amendment 05 gave T1
+ * that policy, and going around it here would now be actively wrong in
+ * two ways: p->play would stay PLAY_PLAYING with the device stopped,
+ * which is IV.8.a's device-loss predicate and would fire the reopen
+ * ladder mid-measurement; and the row would go on measuring a harness
+ * path rather than the product one. This closes the "verify the real
+ * pause policy, not just the fence skip" item that has been open since
+ * phase 7.
+ *
+ * Timing is the assertion. A skipped fence returns in microseconds; a
+ * fence that ran polls at 1 ms up to 200 ms.
+ *
+ * Takes the Player, the frame counter, the sample rate, and the seek
+ * target; returns nothing (the verdict goes to stderr, headless only).
+ */
+static void
+drive_seek_paused(Player * p, const atomic_uint_least64_t * pos,
+                  int rate, int64_t seek_ms)
+{
+  /* The real pause: publishes PLAY_PAUSED, then stops the device. T2
+     adopts the queued CMD_PAUSE on its own schedule, which is precisely
+     why the device policy reads p->play and not engine_state. */
+  engine_pause(p->e);
+  (void) player_set_play_state(p, PLAY_PAUSED);
+  fprintf(stderr, "seek-paused: device stopped, sink_is_started=%d\n",
+          sink_is_started(&p->sink));
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  engine_seek(p->e, seek_ms);
+
+  /* engine_seek only queues; the flush happens on T2. Wait for the
+     resync to become visible in the counter rather than timing the
+     queue push, which would measure nothing. */
+  int64_t got = -1;
+  double  ms  = 0.0;
+  for (int i = 0; i < FLUSH_FENCE_WAIT_MS; i++) {
+    got = position_ms(pos, rate);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = elapsed_ms(&t0, &t1);
+    if (got >= 0 && llabs((long long) (got - seek_ms)) <= SEEK_TOLERANCE_MS) {
+      break;
+    }
+    play_sleep_ms(1);
+  }
+
+  fprintf(stderr,
+          "seek-paused: resync visible after %.2f ms (position=%lld ms) -- %s\n",
+          ms, (long long) got,
+          (ms < (double) FENCE_SKIP_MAX_MS) ? "FENCE SKIPPED" : "FENCE RAN");
+
+  if (player_set_play_state(p, PLAY_PLAYING) != 0) {
+    fprintf(stderr, "seek-paused: sink restart failed\n");
+    return; /* the ladder owns the device now */
+  }
+  engine_resume(p->e);
+
+  /* Prove the resume actually produced audio: the counter must advance
+     past the seek target, which it cannot do unless T3 is running again
+     and T2 refilled the ring the flush emptied. */
+  int64_t before = position_ms(pos, rate);
+  play_sleep_ms(SEEK_SETTLE_MS);
+  int64_t after = position_ms(pos, rate);
+  fprintf(stderr, "seek-paused: after resume %lld -> %lld ms -- %s\n",
+          (long long) before, (long long) after,
+          (after > before) ? "PLAYBACK RESUMED" : "STALLED");
+} /* drive_seek_paused */
+
+/*
  * player_watchdog: DESIGN.md IV.8.a's authoritative detector. On every
  * redraw tick, if the engine is playing and the device is not started,
  * declare device loss. One atomic load per tick, and the tick is armed
@@ -1089,7 +1283,14 @@ player_watchdog(Player * p)
   if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
     return; /* teardown stops the device on purpose */
   }
-  if (p->dev != DEV_READY || engine_state(p->e) != ENG_PLAYING) {
+  /* T1's PlayState, not engine_state. Amendment 05's correction: T2
+     adopts a queued CMD_PAUSE whenever it next drains, so between T1's
+     pause and T2 noticing it, engine_state still reads ENG_PLAYING
+     while the device is legitimately stopped -- this predicate exactly,
+     and a false loss on every pause. T1 is the thread that stops the
+     device, so T1's own view is the one that can never disagree with
+     it. See PlayState's definition. */
+  if (p->dev != DEV_READY || p->play != PLAY_PLAYING) {
     return;
   }
   if (sink_is_started(&p->sink)) {
@@ -1140,7 +1341,7 @@ player_handle_engine_event(Player * p, const Event * ev)
           p->running = 0;
           break;
         case PLAY_SEEK_PAUSED:
-          drive_seek_paused(p->e, &p->sink, sink_frames_consumed(),
+          drive_seek_paused(p, sink_frames_consumed(),
                             (int) p->fmt.sample_rate, p->mode_arg);
           p->running = 0;
           break;
@@ -1238,12 +1439,23 @@ player_repaint(Player * p)
 {
   TuiModel m;
   memset(&m, 0, sizeof m);
-  m.now_playing = NULL;               /* the queue and the browser: phase 12 */
+  m.now_playing = NULL;               /* the queue: later in phase 12 */
   m.message     = (p->message[0] != '\0') ? p->message : NULL;
   m.pos_ms      = (p->dev == DEV_READY) ? player_position_ms(p) : -1;
   m.dur_ms      = -1;
-  m.playing     = 0;
+  m.playing     = (p->play == PLAY_PLAYING);
+  m.paused      = (p->play == PLAY_PAUSED);
   m.volume_pct  = 100;
+  m.browser     = p->br;
+
+  /* Borrowed, never owned, and never used for arithmetic
+     (DESIGN.md II.2's warning) -- the status bar is the only legal
+     consumer of the internal_* fields. */
+  m.underruns         = sink_underrun_count();
+  m.rate              = p->fmt.sample_rate;
+  m.internal_format   = p->fmt.internal_format;
+  m.internal_channels = p->fmt.internal_channels;
+
   tui_draw(&m);
 } /* player_repaint */
 
@@ -1315,11 +1527,17 @@ shutdown_all(Player * p)
                     "AudioSink.stop returned (DESIGN.md IV.9.b step 2)\n");
   }
 
-  /* 9. UI state and the queue land in later phases; the config strings
-        and the event loop -- which owns the epoll fd, the signalfd, both
-        timerfds, and both ends of the self-pipe -- are what exist now.
-        The pipe's write end closes here and nowhere earlier, which is
-        why event.c owns it and sink.c only cached it. */
+  /* 9. UI state, then the config strings and the event loop -- which
+        owns the epoll fd, the signalfd, both timerfds, and both ends of
+        the self-pipe. The pipe's write end closes here and nowhere
+        earlier, which is why event.c owns it and sink.c only cached it.
+        The browser goes before config_free: its rows are its own, but
+        the fs source borrows Config's ignore list, and freeing the list
+        under a live source is the kind of ordering error this table
+        exists to make unwriteable. */
+  browser_destroy(p->br);
+  p->br = NULL;
+
   config_free(&p->cfg);
   event_destroy(p->el);
   p->el = NULL;
@@ -1390,6 +1608,18 @@ player_loop(Player * p)
         case EVSRC_TTY:
         case EVSRC_RESIZE:
           tui_drain();
+          /* The browser keeps the cursor visible, so it needs the row
+             count the layout just recomputed. Done after the drain
+             rather than inside the resize branch because tb_peek_event
+             can deliver a resize on either fd (see above), and a
+             viewport that lags a resize scrolls the selection off
+             screen. */
+          if (p->br != NULL) {
+            const TuiLayout * l = tui_layout();
+            if (l != NULL) {
+              browser_set_viewport(p->br, l->body_h);
+            }
+          }
           break;
 
         /* EPOLLHUP|EPOLLERR on the tty. SIGHUP on the signalfd usually
@@ -1560,19 +1790,25 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
     return p.status;
   }
 
-  /* Step 8: ma_device_start. T3 begins and immediately underruns into
-     silence, which is correct -- the first invocation happens on this
-     thread, inside this call, from PulseAudio's pre-fill. */
-  if (p.sink.start(p.sink.self) != 0) {
-    fprintf(stderr, "kurono: --play: sink start failed\n");
-    player_browse_only(&p, "device start failed at startup");
-    shutdown_all(&p);
-    return p.status;
-  }
-
   /* VIII.3's warning: the tick is armed BEFORE the first CMD_PLAY, not
      after, or the first boundary is observed late. */
   player_set_redraw(&p, 1);
+
+  /* IV.9.a.i (amendment 05): there is no startup step 8 any more. The
+     device is started here, by the play transition, through the one
+     function that owns the edge ordering -- the same path the TUI
+     takes, so the headless harness exercises the real policy rather
+     than a second transcription of it. T3 begins and immediately
+     underruns into silence, which is correct: the first invocation
+     happens on this thread, inside the start, from PulseAudio's
+     pre-fill. */
+  if (player_set_play_state(&p, PLAY_PLAYING) != 0) {
+    /* The ladder has it now. Headless, that means the run ends when the
+       ladder gives up; there is nothing to browse. */
+    player_loop(&p);
+    shutdown_all(&p);
+    return p.status;
+  }
   engine_play(p.e, path, PLAY_HEADLESS_TRACK_ID);
 
   /* Step 10: enter the event loop. */
@@ -1581,6 +1817,151 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
   shutdown_all(&p);
   return p.status;
 } /* run_play */
+
+/*
+ * cmp_double: qsort(3) comparator over double, for the latency medians
+ * below. Takes two const double *, returns the usual -1/0/1.
+ */
+static int
+cmp_double(const void * a, const void * b)
+{
+  double x = *(const double *) a;
+  double y = *(const double *) b;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+} /* cmp_double */
+
+/*
+ * report_latency: print min/median/max over a sample array, in ms.
+ * Sorts in place. Takes a label, the samples, and the count; returns
+ * nothing. stderr only, and only from a diagnostic mode that returns
+ * before tui_init.
+ */
+static void
+report_latency(const char * label, double * v, int n)
+{
+  if (n <= 0) {
+    fprintf(stderr, "  %-22s no samples\n", label);
+    return;
+  }
+  qsort(v, (size_t) n, sizeof v[0], cmp_double);
+  double med = (n % 2 == 1) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
+  fprintf(stderr, "  %-22s min %7.3f  med %7.3f  max %7.3f  (n=%d)\n",
+          label, v[0], med, v[n - 1], n);
+} /* report_latency */
+
+/*
+ * run_dev_latency: measure what AudioSink.start and AudioSink.stop
+ * actually cost on this host. Evidence for the DESIGN.md IV.9.a step 8
+ * device-lifecycle amendment: DESIGN.md V.4 asserts that stopping the
+ * device on end-of-queue costs "hundreds of milliseconds of latency on
+ * the next play", and phase 11 measured that leaving it started costs
+ * 1.33% CPU forever. Exactly one of those numbers was ever measured.
+ *
+ * Builds the full startup (IV.9.a steps 1-7) so the device is the real
+ * one, with the real negotiated format and the real rings, then cycles
+ * start/stop n times with a gap between them. T2 exists and stays parked
+ * with no track, so engine_state is never ENG_PLAYING and the IV.8.a
+ * notification policy ignores every `stopped` this generates -- the
+ * ladder cannot fire here, which is why no event loop is needed.
+ *
+ * The gap matters and is the reason it is a parameter: PulseAudio's
+ * module-suspend-on-idle suspends a sink that has been idle (5 s by
+ * default), and a restart that has to resume a suspended sink is a
+ * different measurement from one that does not. A restart on end-of-
+ * queue is the suspended case; a restart on unpause is not.
+ *
+ * Takes the cycle count and the inter-cycle gap in ms; returns 0, or 1
+ * if startup or any start/stop failed.
+ */
+static int
+run_dev_latency(int n, long gap_ms)
+{
+  if (n < 1) {
+    n = 1;
+  }
+  if (n > 200) {
+    n = 200;
+  }
+
+  Player p;
+  memset(&p, 0, sizeof p);
+  p.mode    = PLAY_PLAIN;
+  p.dev     = DEV_READY;
+  p.running = 1;
+  p.ui      = 0;
+
+  int have_device = 0;
+  if (player_start(&p, "--dev-latency", &have_device) != 0) {
+    return 1;
+  }
+  if (!have_device) {
+    fprintf(stderr, "kurono: --dev-latency: no device, nothing to measure\n");
+    player_browse_only(&p, "device open failed at startup");
+    shutdown_all(&p);
+    return 1;
+  }
+
+  double * starts = calloc((size_t) n, sizeof *starts);
+  double * stops  = calloc((size_t) n, sizeof *stops);
+  if (starts == NULL || stops == NULL) {
+    free(starts);
+    free(stops);
+    shutdown_all(&p);
+    return 1;
+  }
+
+  fprintf(stderr, "dev-latency: rate %u, channels %u, period %u frames, "
+                  "cycles %d, gap %ld ms\n",
+          p.fmt.sample_rate, p.fmt.channels, p.fmt.period_frames, n, gap_ms);
+
+  int failed = 0;
+  int ns = 0, nt = 0;
+
+  for (int i = 0; i < n; i++) {
+    struct timespec t0, t1, t2;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = p.sink.start(p.sink.self);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (rc != 0) {
+      fprintf(stderr, "dev-latency: start failed at cycle %d\n", i);
+      failed = 1;
+      break;
+    }
+    starts[ns++] = elapsed_ms(&t0, &t1);
+
+    /* Let the device actually run for a period or two before stopping
+       it, so the stop is measured against a live stream rather than one
+       that never left the pre-fill. */
+    play_sleep_ms(50);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    p.sink.stop(p.sink.self);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    stops[nt++] = elapsed_ms(&t1, &t2);
+
+    /* The first cycle is the cold one -- it starts a device that has
+       never been started. Reported separately below because it is the
+       IV.9.a step 8 number, and the rest are the phase-12 number. */
+    if (i == 0) {
+      fprintf(stderr, "  cold start %.3f ms, first stop %.3f ms\n",
+              starts[0], stops[0]);
+    }
+
+    if (gap_ms > 0 && i + 1 < n) {
+      play_sleep_ms(gap_ms);
+    }
+  }
+
+  fprintf(stderr, "dev-latency: warm cycles (cold excluded)\n");
+  report_latency("AudioSink.start", starts + 1, ns - 1);
+  report_latency("AudioSink.stop",  stops  + 1, nt - 1);
+
+  free(starts);
+  free(stops);
+  shutdown_all(&p);
+  return failed ? 1 : p.status;
+} /* run_dev_latency */
 
 /*
  * run_tui: bare `kurono` -- the real player. The same ten startup steps
@@ -1610,30 +1991,43 @@ run_tui(void)
     return 1;
   }
 
-  /* Step 8: ma_device_start -- deliberately NOT called here, and this is
-     the one place this run departs from IV.9.a's order.
-     Measured on this host (2026-08-12, per-thread sampling of each
-     task's stat file under /proc over 12 s of idle): with the device
-     started
-     and nothing to play, T1 sat in epoll_wait at 0.00% and T2 in futex at
-     0.00% -- VIII.3's "zero wakeups, zero CPU" holding exactly -- while
+  /* No ma_device_start here, and as of amendment 05 that is the general
+     policy rather than this run's departure from it -- IV.9.a step 8 is
+     deleted and IV.9.a.i replaces it. The device is started by the play
+     transition in player_set_play_state and stopped on every transition
+     out of PLAY_PLAYING.
+     The measurement that produced the amendment, kept because it is the
+     reason (2026-08-12, per-thread sampling of each task's stat file
+     under /proc over 12 s of idle): with the device started and nothing
+     to play, T1 sat in epoll_wait at 0.00% and T2 in futex at 0.00% --
+     VIII.3's "zero wakeups, zero CPU" holding exactly -- while
      miniaudio's T3 burned 1.33% in ppoll, waking ~53 times a second at
-     periodFrames = 900 to memset silence and count an underrun. A player
-     with nothing loaded has no reason to hold a running device.
-     Phase 11 cannot play anything at all, so the device is simply left
-     open and stopped; the general policy -- start on the first CMD_PLAY,
-     stop when playback ends -- belongs with the transport wiring in phase
-     12, and needs an amendment to IV.9.a step 8 before it lands.
-     Nothing downstream assumes a started device: the IV.8.a watchdog acts
-     only when engine_state is ENG_PLAYING, and teardown step 2's
-     AudioSink.stop is a no-op on a device that never started. */
+     periodFrames = 900 to memset silence and count an underrun. Against
+     that, --dev-latency measured a start at under 0.7 ms worst case, so
+     the trade is 1.33% forever against ~0.4 ms per transition. */
   if (!have_device) {
     player_browse_only(&p, "no audio device at startup");
   }
 
-  /* Step 9: tb_init, then the remaining epoll registrations. It comes
-     after the device is started, per IV.9.a, and before anything can
-     write to stderr again -- from here to tui_shutdown, every diagnostic
+  /* The browser, built before tb_init so a failure here still reaches
+     stderr. M1 lists the first music root with the filesystem source
+     (DESIGN.md XIV.1, plan.md VII gap 8); phase 16 hands the same
+     widget a library/query.c source instead.
+     A root that does not exist is not fatal (DESIGN.md XI.5): the
+     browser simply fails to build, every navigation action becomes a
+     no-op, and the status bar names the path -- a first-run state, not
+     an error state. */
+  browser_fs_source(&p.brsrc, p.cfg.ignore, p.cfg.nignore);
+  p.br = browser_create(&p.brsrc, p.cfg.roots[0].path);
+  if (p.br == NULL) {
+    fprintf(stderr, "kurono: cannot list %s -- browsing disabled\n",
+            p.cfg.roots[0].path);
+  }
+
+  /* Step 9: tb_init, then the remaining epoll registrations. Its
+     position is unaffected by amendment 05 -- what used to precede it
+     was step 8, which no longer exists -- and it comes before anything
+     can write to stderr again -- from here to tui_shutdown, every diagnostic
      goes through player_report.
      g_ui_player is set first: tui_init can deliver a resize immediately,
      and a dispatch reaching a NULL player would be a dropped keystroke. */
@@ -1659,6 +2053,17 @@ run_tui(void)
     p.status = 1;
     shutdown_all(&p);
     return p.status;
+  }
+
+  /* The browser needs a viewport before the first paint, not only on
+     the first resize: without this the widget keeps its minimum of one
+     row and a listing taller than the terminal would draw one line and
+     scroll on every cursor move. */
+  if (p.br != NULL) {
+    const TuiLayout * l0 = tui_layout();
+    if (l0 != NULL) {
+      browser_set_viewport(p.br, l0->body_h);
+    }
   }
 
   /* First paint before the first wait, or the screen stays blank until
@@ -1763,6 +2168,13 @@ main(int argc, char * argv[])
       status = 1;
     }
 
+  } else if (argc >= 2 && strcmp(argv[1], "--dev-latency") == 0) {
+    /* Evidence for the IV.9.a step 8 device-lifecycle amendment. No
+       file, no decode, no event loop -- just the device. */
+    int  cycles = (argc >= 3) ? atoi(argv[2]) : 10;
+    long gap    = (argc >= 4) ? atol(argv[3]) : 0;
+    status = run_dev_latency(cycles, gap);
+
   } else if (argc == 1) {
     /* The player. Phase 4's --headless smoke loop is gone: its structure
        is what player_loop became, and keeping a second event loop around
@@ -1771,7 +2183,8 @@ main(int argc, char * argv[])
 
   } else {
     fprintf(stderr, "kurono: usage: kurono [--version | --paths | --tone | "
-                    "--decode FILE | --play FILE [...]]\n");
+                    "--decode FILE | --play FILE [...] | "
+                    "--dev-latency [N [GAP_MS]]]\n");
     status = 1;
   }
 

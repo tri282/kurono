@@ -58,6 +58,10 @@ const Theme g_theme_default = {
     [STYLE_SCROLLBAR]      = { 0x565f73, 0x11131a, 0 },
     [STYLE_POPUP]          = { 0xc8ccd4, 0x232733, 0 },
     [STYLE_COVER_BORDER]   = { 0x565f73, 0x11131a, 0 },
+    /* Blue and bold, the convention every file manager already trained
+       the user on. Distinct from STYLE_SELECTED's blue background so a
+       directory under the cursor still reads as the cursor. */
+    [STYLE_DIR]            = { 0x7aa2f7, 0x11131a, TB_BOLD },
   }
 };
 

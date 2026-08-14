@@ -48,9 +48,13 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # action_name, so keymap.o is already linked; theme.o has no caller until
 # ui/tui.c in phase 11 and is listed here anyway, same as every prior
 # phase's file, so it is not silently unanalysed in the meantime.
+# src/ui/browser.c (phase 12) is the browser widget plus the M1
+# filesystem BrowserSource. The widget and the source live in one file
+# on purpose: the source is the smaller half, and phase 16 adds a
+# library/query.c source beside it rather than replacing this one.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
-       src/ui/theme.c src/ui/keymap.c src/ui/tui.c
+       src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its

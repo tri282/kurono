@@ -29,8 +29,10 @@
    use our own headers. */
 #undef TB_IMPL
 
+#include <locale.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "../../include/ui/keymap.h"
 #include "../../include/ui/theme.h"
@@ -124,11 +126,27 @@ tui_compute_layout(void)
 } /* tui_compute_layout */
 
 /*
- * draw_text: write str at (x, y), clipped to w cells, in the given slot.
- * Decodes UTF-8 so a multibyte character costs one cell rather than
- * several, which is what keeps a clipped track title from splitting a
- * codepoint. Takes the position, the width budget, the slot and the
- * string (NULL draws nothing); returns nothing.
+ * draw_text: write str at (x, y), clipped to w columns, in the given
+ * slot. Decodes UTF-8 so a multibyte character is one character rather
+ * than several, which is what keeps a clipped track title from
+ * splitting a codepoint.
+ *
+ * Advances by the character's DISPLAY WIDTH, not by one per codepoint.
+ * termbox2 v2.5.0 has no wide-character cell model -- one cell holds
+ * one codepoint and it advances the terminal by whatever that codepoint
+ * actually renders as -- so a CJK title written one-cell-per-character
+ * runs to twice its budget on screen, overlapping the column separator
+ * and whatever is drawn to its right. A music library with Japanese
+ * titles hits this on the first frame.
+ *
+ * wcwidth needs LC_CTYPE, which tui_init sets for termbox's own
+ * iswprint filter; the two requirements are the same requirement. A
+ * width of -1 (non-printable) is treated as 0 and the character is
+ * skipped rather than drawn -- termbox would substitute U+FFFD for it
+ * anyway, and a replacement glyph in a filename is noise.
+ *
+ * Takes the position, the column budget, the slot and the string (NULL
+ * draws nothing); returns nothing.
  */
 static void
 draw_text(int x, int y, int w, StyleSlot slot, const char * str)
@@ -147,9 +165,22 @@ draw_text(int x, int y, int w, StyleSlot slot, const char * str)
     if (len <= 0) {
       break;
     }
-    tb_set_cell(x + col, y, uni, fg, bg);
     p += len;
-    col++;
+
+    int cw = wcwidth((wchar_t) uni);
+    if (cw <= 0) {
+      continue; /* combining marks, controls: consume, occupy nothing */
+    }
+
+    /* A wide character that would straddle the right edge is dropped,
+       not half-drawn. Half of a glyph is worse than a space, and the
+       cell it would spill into belongs to the separator. */
+    if (col + cw > w) {
+      break;
+    }
+
+    tb_set_cell(x + col, y, uni, fg, bg);
+    col += cw;
   }
 } /* draw_text */
 
@@ -201,7 +232,16 @@ static void
 draw_header(const TuiModel * m)
 {
   fill_row(0, 0, g_layout.w, STYLE_HEADER);
-  const char * what = (m->now_playing != NULL) ? m->now_playing : "kurono";
+  /* Idle, the header names where the browser is instead of repeating
+     the program name -- it is the only place the current directory
+     appears, and a single-column browser shows no parent (M1 draws one
+     column; DESIGN.md XIV.1). */
+  const char * what = "kurono";
+  if (m->now_playing != NULL) {
+    what = m->now_playing;
+  } else if (m->browser != NULL) {
+    what = browser_cwd(m->browser);
+  }
   draw_text(1, 0, g_layout.w - 2,
             (m->now_playing != NULL) ? STYLE_PLAYING : STYLE_HEADER, what);
 } /* draw_header */
@@ -212,20 +252,72 @@ draw_header(const TuiModel * m)
  * the rectangles it draws into are these. Takes nothing, returns nothing.
  */
 static void
-draw_body(void)
+draw_body(const TuiModel * m)
 {
-  static const char * const col_title[3] = { "artists", "albums", "tracks" };
+  /* M1 is a single-column directory listing (DESIGN.md XIV.1); the
+     three-column browser is M2, phase 16. The listing goes in column 1
+     because that is the ranger-style cursor column, and columns 0 and 2
+     keep the placeholder until phase 16 gives them sources. */
+  static const char * const col_title[3] = { "", "browser", "" };
+  const int active_col = 1;
 
   for (int c = 0; c < 3; c++) {
-    /* The active column is column 1 until the browser owns a cursor
-       (phase 12); the inactive slot is what the other two use, which is
-       what gives STYLE_COL_INACTIVE a call site now rather than a
-       retrofit later. */
-    StyleSlot slot = (c == 0) ? STYLE_NORMAL : STYLE_COL_INACTIVE;
-    draw_text(g_layout.col_x[c], g_layout.body_y, g_layout.col_w[c], slot,
-              col_title[c]);
+    if (c == active_col) {
+      continue; /* drawn below, from the model */
+    }
+    draw_text(g_layout.col_x[c], g_layout.body_y, g_layout.col_w[c],
+              STYLE_COL_INACTIVE, col_title[c]);
     draw_text(g_layout.col_x[c], g_layout.body_y + 2, g_layout.col_w[c],
-              STYLE_DIM, "(empty)");
+              STYLE_DIM, "(phase 16)");
+  }
+
+  int cx = g_layout.col_x[active_col];
+  int cw = g_layout.col_w[active_col];
+
+  /* Every branch below falls through to the separators and the cover
+     pane -- an early return here silently drops them, which is exactly
+     what an empty directory did before this was restructured. The frame
+     is not the listing's to skip. */
+  size_t n      = browser_count(m->browser);
+  size_t cursor = browser_cursor(m->browser);
+  size_t scroll = browser_scroll(m->browser);
+
+  if (m->browser == NULL) {
+    draw_text(cx, g_layout.body_y, cw, STYLE_DIM, "(no browser)");
+  } else if (n == 0) {
+    draw_text(cx, g_layout.body_y, cw, STYLE_DIM, "(empty)");
+  } else {
+    /* The widget was told the viewport, so scroll is already consistent
+       with the cursor -- this loop draws what it is given and does no
+       clamping of its own. Two places deciding what is visible is how
+       they come to disagree. */
+    for (int row = 0; row < g_layout.body_h; row++) {
+      size_t idx = scroll + (size_t) row;
+      if (idx >= n) {
+        break;
+      }
+      const BrowserRow * r = browser_row(m->browser, idx);
+      if (r == NULL) {
+        break;
+      }
+
+      StyleSlot slot;
+      if (idx == cursor) {
+        slot = STYLE_CURSOR;
+      } else if (r->is_dir) {
+        slot = STYLE_DIR;
+      } else {
+        slot = STYLE_NORMAL;
+      }
+
+      /* The cursor row reads as a bar across the whole column, not just
+         under its text, or a short name leaves the selection looking
+         ragged against a long one. */
+      if (idx == cursor) {
+        fill_row(cx, g_layout.body_y + row, cw, STYLE_CURSOR);
+      }
+      draw_text(cx, g_layout.body_y + row, cw, slot, r->name);
+    }
   }
 
   /* Vertical separators, between the columns only -- the outer edges are
@@ -282,11 +374,29 @@ draw_statusbar(const TuiModel * m)
   fmt_clock(m->playing || m->pos_ms > 0 ? m->pos_ms : -1, pos, sizeof pos);
   fmt_clock(m->dur_ms > 0 ? m->dur_ms : -1, dur, sizeof dur);
 
-  char right[128];
-  snprintf(right, sizeof right, "%s / %s  vol %d%%  %s  %s",
-           pos, dur, m->volume_pct,
+  /* Underruns are shown only when non-zero (DESIGN.md XI.6). A counter
+     that always reads "0 underruns" trains the eye to skip it, which
+     is the opposite of why it is on screen. */
+  char un[32];
+  un[0] = '\0';
+  if (m->underruns > 0) {
+    snprintf(un, sizeof un, "  %u underrun%s", m->underruns,
+             (m->underruns == 1) ? "" : "s");
+  }
+
+  char vol[24];
+  if (m->muted) {
+    snprintf(vol, sizeof vol, "vol muted");
+  } else {
+    snprintf(vol, sizeof vol, "vol %d%%", m->volume_pct);
+  }
+
+  char right[192];
+  snprintf(right, sizeof right, "%s / %s  %s  %s  %s%s",
+           pos, dur, vol,
            m->shuffle ? "shuffle" : "-",
-           (m->repeat == 2) ? "repeat one" : (m->repeat == 1) ? "repeat all" : "-");
+           (m->repeat == 2) ? "repeat one" : (m->repeat == 1) ? "repeat all" : "-",
+           un);
 
   int x = PROGRESS_W + 3;
   draw_text(x, y, g_layout.w - x, STYLE_STATUSBAR, right);
@@ -318,7 +428,7 @@ tui_draw(const TuiModel * m)
     draw_text(0, 0, g_layout.w, STYLE_ERROR, "terminal too small");
   } else {
     draw_header(m);
-    draw_body();
+    draw_body(m);
     draw_statusbar(m);
   }
 
@@ -400,6 +510,23 @@ tui_drain(void)
 int
 tui_init(void)
 {
+  /* Load-bearing, and the failure it prevents is silent and total.
+     termbox2 v2.5.0's cell_write (termbox2.h:3268) filters every
+     codepoint through iswprint(3) and substitutes U+FFFD for anything
+     that fails. iswprint is locale-dependent, and a C program starts in
+     the "C" locale, where nothing above U+007F is printable -- so
+     without this call every box-drawing separator, the progress bar,
+     and every non-ASCII character in a filename renders as the
+     replacement glyph. Measured before the fix: 78 U+FFFD and zero
+     U+2502 in one frame of a music tree with Japanese titles.
+     LC_CTYPE only: kurono formats no numbers or dates for the user, and
+     a full setlocale(LC_ALL, "") would put strcoll and printf's decimal
+     separator under the environment's control for no benefit.
+     It belongs here rather than in main because it is a termbox
+     requirement and tui.c is the file that owns termbox -- the headless
+     diagnostic modes draw nothing and need no locale. */
+  setlocale(LC_CTYPE, "");
+
   if (tb_init() != TB_OK) {
     return -1;
   }

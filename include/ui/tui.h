@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "browser.h"
+
 /*
  * ui/tui.c owns the terminal: it is the only translation unit that
  * defines TB_IMPL, and the only one that calls a tb_* function. Everything
@@ -37,9 +39,28 @@ typedef struct {
   int64_t      pos_ms;
   int64_t      dur_ms;        /* <= 0 when unknown */
   int          playing;
+  int          paused;
   int          shuffle;
   int          repeat;        /* 0 off, 1 all, 2 one */
   int          volume_pct;
+  int          muted;
+
+  /* Borrowed, may be NULL before the browser exists or in a run that
+     has none. tui.c reads it only through browser.h's const accessors:
+     ui/ calling ui/ is inside the dependency graph, and browser.c
+     itself depends on nothing but libc, so this does not weaken the
+     rule that tui.c reaches neither audio/ nor library/. */
+  const Browser * browser;
+
+  /* DESIGN.md XI.6: a visible underrun counter is worth more than any
+     amount of reasoning about whether underruns are happening. Shown
+     only when non-zero. */
+  unsigned      underruns;
+
+  /* Status bar only, never arithmetic (DESIGN.md II.2's warning). */
+  uint32_t      rate;
+  int           internal_format;
+  uint32_t      internal_channels;
 } TuiModel;
 
 int  tui_init(void);
