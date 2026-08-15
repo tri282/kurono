@@ -73,8 +73,14 @@ typedef enum {
 typedef struct {
   EventKind  kind;
   int64_t    track_id;
-  StreamInfo info;     /* valid only when kind == EV_STREAM_INFO */
-  int        averror;  /* valid only for EV_OPEN_FAILED / EV_DECODE_ERROR */
+  StreamInfo info;      /* valid only when kind == EV_STREAM_INFO */
+  int        averror;   /* valid only for EV_OPEN_FAILED / EV_DECODE_ERROR */
+  uint64_t   end_frame; /* valid only for EV_EOF: T2's monotonic write-frame
+                           counter at EOF, in the same frame domain as
+                           g_frames_consumed. T1 holds PLAY_PLAYING until the
+                           consumed counter reaches it (amendment 06) -- the
+                           decoder runs up to PCM_LEAD_SECONDS ahead, so EOF
+                           on T2 is not the end of the audio. */
 } Event;
 
 /*

@@ -310,6 +310,15 @@ run_decode(const char * path)
    1 Hz phase-7-engine.md I.9 asks for. */
 #define PLAYER_POSITION_TICKS PLAYER_REDRAW_HZ
 
+/* Amendment 06 rule 7: the EOF drain is bounded, because an unbounded
+   wait turns a wedged T3 into a hung player -- strictly worse than a
+   truncated track. PCM_LEAD_SECONDS (2, sink.c) plus a second of slack,
+   counted in ticks rather than read off a wall clock. It is a duplicate
+   of a sink.c-private constant on purpose: main.c has no business
+   including sink.c's internals for a bound whose exactness does not
+   matter. */
+#define PLAYER_DRAIN_MAX_TICKS (3 * PLAYER_REDRAW_HZ)
+
 /* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c; a local constant keeps
    main.c ignorant of that internal. */
 #define PLAYER_MAX_FIRED 8
@@ -587,6 +596,17 @@ typedef struct {
      successful open. See player_track_failed. */
   int             fail_count;
 
+  /* Amendment 06's EOF drain. `drain_until` is T2's write-frame count at
+     EOF and 0 means "not draining"; the state stays PLAY_PLAYING for the
+     whole drain, because it is true -- the device is started and audio is
+     still coming out of it. Cleared by completion, by the bound
+     (`drain_ticks`), and by every path that flushes pcm_ring, since the
+     value lives in the pre-flush frame domain and means nothing after a
+     resync. Pause is deliberately not one of those paths: the counter
+     stops with the device and the drain simply completes on resume. */
+  uint64_t        drain_until;
+  int             drain_ticks;
+
   DeviceState     dev;
   PlayState       play;              /* T1's own; amendment 05 IV.9.a.i */
   int             ladder_attempt;    /* index into g_ladder_backoff_ms */
@@ -634,6 +654,7 @@ typedef struct {
  */
 static Player * g_ui_player = NULL;
 
+static void player_drain_cancel(Player * p);
 static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
 static void player_on_notify(void * user, int notification_type);
@@ -1019,6 +1040,11 @@ player_ladder_attempt(Player * p)
     return;
   }
 
+  /* Amendment 06 rule 5, the second flush path: step 4 resyncs both
+     counters to 0, so a drain armed before the device vanished would
+     never be reached and would sit until the bound expired. */
+  player_drain_cancel(p);
+
   /* Step 5 is already done: the elapsed-time origin was captured in
      player_ladder_begin, before the flush zeroed the counter, and both
      frame counters were resynced inside pcm_flush_and_resync. Writing
@@ -1386,6 +1412,7 @@ static void
 player_stop(Player * p)
 {
   engine_stop(p->e);
+  player_drain_cancel(p);  /* amendment 06 rule 4 */
   player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
   (void) player_set_play_state(p, PLAY_STOPPED);
   p->now_name[0] = '\0';
@@ -1426,6 +1453,12 @@ player_play_entry(Player * p, const QueueEntry * ent)
     player_report(p, "no audio device -- cannot play %s", ent->path);
     return -1;
   }
+
+  /* Amendment 06 rules 4 and 5: CMD_PLAY flushes, so any drain still in
+     flight names frames that will not exist a moment from now. Cleared
+     before the command goes out, not after, so no tick can see the old
+     value against a rewound counter. */
+  player_drain_cancel(p);
 
   player_set_redraw(p, 1);
   engine_play(p->e, ent->path, ent->track_id);
@@ -1470,6 +1503,49 @@ player_advance(Player * p)
   }
   (void) player_play_entry(p, next);
 } /* player_advance */
+
+/*
+ * player_drain_cancel: forget an in-flight EOF drain. Takes the Player,
+ * returns nothing.
+ *
+ * Called from the three places that flush pcm_ring behind T1's back --
+ * player_play_entry (CMD_PLAY, V.1 step 3), player_seek_relative
+ * (CMD_SEEK, IV.7) and player_ladder_attempt (IV.8.b step 4) -- plus
+ * player_stop, which ends the track the drain belonged to. Those four
+ * cover every action in amendment 06 rule 4 without a clear in each
+ * action handler: ACT_NEXT and ACT_PREV reach player_play_entry,
+ * ACT_STOP and ACT_CLEAR_QUEUE reach player_stop.
+ */
+static void
+player_drain_cancel(Player * p)
+{
+  p->drain_until = 0;
+  p->drain_ticks = 0;
+} /* player_drain_cancel */
+
+/*
+ * player_drain_finish: the EOF drain is over -- run the queue policy that
+ * EV_EOF used to run directly. Takes the Player, returns nothing.
+ *
+ * Reached from the tick when g_frames_consumed catches up with
+ * drain_until, from the tick's bound when it does not, and immediately
+ * from the EV_EOF arm when there was nothing queued to drain. The split
+ * by run kind is the one EV_EOF always had: a headless --play is a
+ * one-shot harness whose run ends here, the TUI has a queue to fall
+ * through to.
+ */
+static void
+player_drain_finish(Player * p)
+{
+  player_drain_cancel(p);
+
+  if (!p->ui) {
+    player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
+    p->running = 0;
+    return;
+  }
+  player_advance(p);
+} /* player_drain_finish */
 
 /*
  * player_track_failed: the shared arm of EV_OPEN_FAILED and
@@ -1666,6 +1742,12 @@ player_seek_relative(Player * p, int32_t delta_ms)
   }
 
   engine_seek(p->e, target);
+
+  /* Amendment 06 rule 5: the flush this seek causes rewinds both frame
+     counters, so a drain armed against the pre-seek domain is
+     meaningless. The decoder resumes from the target and posts a fresh
+     EV_EOF with a new end_frame when it gets there. */
+  player_drain_cancel(p);
 
   /* IV.7.6 sets both frame counters to target * R / 1000, so from here
      g_frames_consumed is absolute track time and the reopen origin must
@@ -2173,18 +2255,32 @@ player_handle_engine_event(Player * p, const Event * ev)
       player_track_failed(p, "decode error", ev->averror);
       break;
 
-    case EV_EOF:
-      if (!p->ui) {
-        player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
-        p->running = 0;
-        break;
-      }
+    case EV_EOF: {
       /* A track that reached EOF played, whatever happened earlier in
          the run, so the failure streak is broken here as well as by the
-         one-second rule in player_track_failed. */
+         one-second rule in player_track_failed. Amendment 06 rule 3: at
+         EOF, not at drain completion -- what happens to the tail says
+         nothing about whether the file decoded. */
       p->fail_count = 0;
-      player_advance(p);
+
+      /* Amendment 06: EOF is T2's news, not T3's. Up to PCM_LEAD_SECONDS
+         of this track is still sitting in pcm_ring, and the old code ran
+         the queue policy on top of it -- player_stop stopped the device
+         over the tail, a fresh CMD_PLAY flushed it away. Hold
+         PLAY_PLAYING until the consumed counter reaches T2's final write
+         count. Nothing to wait for is the normal case for a file that
+         decoded nothing, and for the drain that finished while the event
+         sat in the queue. */
+      uint64_t consumed =
+          atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
+      if (consumed >= ev->end_frame) {
+        player_drain_finish(p);
+        break;
+      }
+      p->drain_until = ev->end_frame;
+      p->drain_ticks = 0;
       break;
+    }
   }
 } /* player_handle_engine_event */
 
@@ -2228,6 +2324,19 @@ player_tick(Player * p)
 {
   player_watchdog(p);
   trace_drain();
+
+  /* Amendment 06's drain completes here: the tick already runs at 30 Hz
+     while playing and already loads g_frames_consumed for the watchdog,
+     so this costs no new fd, no new timer and nothing in the callback.
+     The bound is rule 7 -- advance anyway rather than hang if T3 stops
+     consuming. */
+  if (p->drain_until != 0) {
+    uint64_t consumed =
+        atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
+    if (consumed >= p->drain_until || ++p->drain_ticks >= PLAYER_DRAIN_MAX_TICKS) {
+      player_drain_finish(p);
+    }
+  }
 
   /* The tick is the progress bar and the clock, so every tick repaints
      (DESIGN.md VIII.3). It only fires while playing -- idle, the timer is

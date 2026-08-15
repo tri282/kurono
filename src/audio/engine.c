@@ -747,6 +747,11 @@ engine_thread_main(void * arg)
       memset(&ev, 0, sizeof(ev));
       ev.kind     = EV_EOF;
       ev.track_id = e->cur_track_id;
+      /* Amendment 06: the counter boundary_ring entries are keyed on, read
+         here on T2 and crossing to T1 inside the mutex-protected event
+         queue, so it needs no synchronisation of its own. Sampled after
+         the write loop above, so it names the last frame of the file. */
+      ev.end_frame = e->write_frames;
       evt_push(e, &ev);
       park(e, ENG_STOPPED);
     }
