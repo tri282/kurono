@@ -52,6 +52,13 @@ typedef enum {
      literal. Appended rather than inserted: amendment 04 makes this enum
      append-only, because the config parser keys on the ordinal. */
   STYLE_DIR,
+  /* Appended by phase 12b for the status bar's mode indicator
+     (amendment 04 decision 7). The amendment named STYLE_COVER_BORDER as
+     the predecessor; phase 12 has since appended STYLE_DIR, and
+     append-only outranks the amendment's spelling of where "the end"
+     was. The overlays themselves need no new slot -- STYLE_POPUP was
+     reserved in phase 10 and gets its first consumer here. */
+  STYLE_MODE,
   STYLE_COUNT
 } StyleSlot;
 

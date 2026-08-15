@@ -39,12 +39,26 @@ import unicodedata
 import time
 
 KEYS = {
-    "up": b"\x1b[A", "down": b"\x1b[B",
-    "right": b"\x1b[C", "left": b"\x1b[D",
+    # SS3, not CSI. tb_init emits smkx, which puts the terminal into
+    # application cursor mode, and termbox2's xterm cap table registers
+    # the arrows and home/end as \033OA..\033OF accordingly. A bare
+    # \033[A is not a registered cap at all: termbox2 falls through to
+    # its modified-key parse and reports the arrow with TB_MOD_SHIFT,
+    # which silently drove the shift+arrow bindings from an unshifted
+    # key. Nothing caught it before phase 12b because mod went unused.
+    "up": b"\x1bOA", "down": b"\x1bOB",
+    "right": b"\x1bOC", "left": b"\x1bOD",
     "pgup": b"\x1b[5~", "pgdn": b"\x1b[6~",
-    "home": b"\x1b[H", "end": b"\x1b[F",
+    "home": b"\x1bOH", "end": b"\x1bOF",
     "enter": b"\r", "tab": b"\t", "esc": b"\x1b",
     "space": b" ", "ctrl-c": b"\x03", "ctrl-d": b"\x04",
+    # xterm's modifyOtherKeys form for a shifted arrow, which is the only
+    # shifted binding termbox2 v2.5.0 can express (amendment 04 decision
+    # 2). Named here rather than spelled as \xNN tokens because each
+    # token is written separately with its own delay -- six of those
+    # arrive as ESC followed by five literal characters, not as one key.
+    "shift-up": b"\x1b[1;2A", "shift-down": b"\x1b[1;2B",
+    "shift-right": b"\x1b[1;2C", "shift-left": b"\x1b[1;2D",
 }
 
 

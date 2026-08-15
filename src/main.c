@@ -740,9 +740,41 @@ action_dispatch(Action a, int32_t arg)
   }
 
   if (a == ACT_QUIT) {
+    /* Amendment 04 decision 5: quit closes what is on top of the mode
+       stack first, and only ends the run once nothing is left to close.
+       A dispatch rule rather than a binding, so q, Esc and Ctrl-C all
+       inherit it by being bound to ACT_QUIT in each overlay's table. */
+    if (ui_mode() != MODE_NORMAL) {
+      ui_mode_pop();
+      tui_mark_dirty();
+      return;
+    }
     /* Converges on the same shutdown_all as SIGINT/SIGTERM/SIGHUP;
        there is no second exit path (DESIGN.md IV.9.b). */
     p->running = 0;
+    return;
+  }
+
+  if (a == ACT_HELP_TOGGLE) {
+    if (ui_mode_toggle(MODE_HELP) < 0) {
+      player_report(p, "terminal too small for the help overlay");
+    }
+    tui_mark_dirty();
+    return;
+  }
+
+  if (a == ACT_MENU_TOGGLE) {
+    /* Phase 17b owns the menu. The key is bound now so the keymap
+       settles in one change; pushing MODE_MENU with nothing to draw
+       would give a blank box and no way to tell it from a bug. */
+    player_report(p, "settings menu: not implemented yet");
+    tui_mark_dirty();
+    return;
+  }
+
+  if (a == ACT_CONFIRM) {
+    player_report(p, "confirm: nothing to confirm yet");
+    tui_mark_dirty();
     return;
   }
 

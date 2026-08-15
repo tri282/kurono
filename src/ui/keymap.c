@@ -9,6 +9,7 @@
  */
 
 #include <stddef.h>
+#include <stdio.h>
 
 #include "../../include/ui/keymap.h"
 
@@ -32,12 +33,15 @@
  * because keymap_resolve strips that bit for control keys -- see the
  * comment there.
  */
-static const Binding g_bindings[] = {
-  /* navigation */
-  { 0, 'h',  0, ACT_COL_LEFT,        0 },
-  { 0, 'j',  0, ACT_CURSOR_DOWN,     0 },
-  { 0, 'k',  0, ACT_CURSOR_UP,       0 },
-  { 0, 'l',  0, ACT_COL_RIGHT,       0 },
+static const Binding g_bindings_normal[] = {
+  /* navigation. The arrows own it outright as of phase 12b
+     (amendment-04-input-modes.md decision 1): h/j/k/l are unbound and
+     reserved, because a keymap that answers to j, k and l but opens a
+     window on h fails silently on the most-practised motion in the set. */
+  { TB_KEY_ARROW_UP,    0, 0, ACT_CURSOR_UP,   0 },
+  { TB_KEY_ARROW_DOWN,  0, 0, ACT_CURSOR_DOWN, 0 },
+  { TB_KEY_ARROW_LEFT,  0, 0, ACT_COL_LEFT,    0 },
+  { TB_KEY_ARROW_RIGHT, 0, 0, ACT_COL_RIGHT,   0 },
 
   /* transport */
   { 0,           ' ', 0, ACT_PLAY_PAUSE, 0 },
@@ -46,8 +50,24 @@ static const Binding g_bindings[] = {
   { 0, 'p',  0, ACT_PREV,             0 },
   { 0, '+',  0, ACT_VOL_UP,           VOL_STEP_PCT },
   { 0, '-',  0, ACT_VOL_DOWN,         VOL_STEP_PCT },
-  { TB_KEY_ARROW_RIGHT, 0, 0, ACT_SEEK_FWD,  SEEK_SMALL_MS },
-  { TB_KEY_ARROW_LEFT,  0, 0, ACT_SEEK_BACK, SEEK_SMALL_MS },
+
+  /* Seek. shift+arrow is the whole set of shifted bindings termbox2
+     v2.5.0 can express -- its header states TB_MOD_CTRL and TB_MOD_SHIFT
+     are only ever set on TB_KEY_ARROW_*, so shift+p is unreachable no
+     matter how this table is written. shift+up is forward and shift+down
+     is backward, matching mpv.
+
+     The four unmodified rows below them are not legacy: a terminal that
+     emits bare CSI A..D instead of CSI 1;2A..D delivers an unmodified
+     arrow, and seek would silently read as a cursor move. They cost four
+     rows and keep seek reachable there. H and L do not collide with the
+     unbound h -- termbox2 delivers them as distinct codepoints. */
+  { TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_SMALL_MS },
+  { TB_KEY_ARROW_LEFT,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_SMALL_MS },
+  { TB_KEY_ARROW_UP,    0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_LARGE_MS },
+  { TB_KEY_ARROW_DOWN,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_LARGE_MS },
+  { 0, '.',  0, ACT_SEEK_FWD,         SEEK_SMALL_MS },
+  { 0, ',',  0, ACT_SEEK_BACK,        SEEK_SMALL_MS },
   { 0, 'L',  0, ACT_SEEK_FWD,         SEEK_LARGE_MS },
   { 0, 'H',  0, ACT_SEEK_BACK,        SEEK_LARGE_MS },
   { 0, 's',  0, ACT_TOGGLE_SHUFFLE,   0 },
@@ -57,6 +77,12 @@ static const Binding g_bindings[] = {
      (amendment-04-input-modes.md), and a binding that has to move one
      phase later is worse than the shifted key now. */
   { 0, 'M',  0, ACT_MUTE,             0 },
+
+  /* overlays. `h` is free because navigation moved to the arrows; `m` is
+     bound here so the keymap settles in one change rather than leaving
+     the key silently unbound between 12b and the settings menu. */
+  { 0, 'h',  0, ACT_HELP_TOGGLE,      0 },
+  { 0, 'm',  0, ACT_MENU_TOGGLE,      0 },
 
   /* queue */
   { 0, 'a',  0, ACT_ENQUEUE,          0 },
@@ -87,9 +113,86 @@ static const Binding g_bindings[] = {
      gesture a user actually performs reach the same shutdown_all. Without
      it Ctrl-C is silently unbound and the player looks hung. */
   { TB_KEY_CTRL_C, 0, 0, ACT_QUIT,    0 },
+
+  /* Esc is deliberately absent here (amendment 04 decision 5). It arrives
+     from stray escape sequences and from a terminal that half-parses a
+     key, and an Esc that can end the process is an infuriating bug. It is
+     bound in every non-normal table, where popping is all it can do. */
 };
 
-#define BINDING_COUNT (sizeof(g_bindings) / sizeof(g_bindings[0]))
+/*
+ * The overlay tables. Both are lists to move a cursor through and a way
+ * out, and the way out is three keys plus the toggle that opened it, so
+ * the same key closes what it opened.
+ */
+static const Binding g_bindings_help[] = {
+  { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,        0 },
+  { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,      0 },
+  { TB_KEY_PGUP,       0, 0, ACT_CURSOR_PAGE_UP,   0 },
+  { TB_KEY_PGDN,       0, 0, ACT_CURSOR_PAGE_DOWN, 0 },
+  { TB_KEY_HOME,       0, 0, ACT_CURSOR_HOME,      0 },
+  { TB_KEY_END,        0, 0, ACT_CURSOR_END,       0 },
+  { 0, 'h',  0, ACT_HELP_TOGGLE,   0 },
+  { 0, 'q',  0, ACT_QUIT,          0 },
+  { TB_KEY_ESC,    0, 0, ACT_QUIT, 0 },
+  { TB_KEY_CTRL_C, 0, 0, ACT_QUIT, 0 },
+};
+
+/*
+ * MODE_MENU is written now and pushed by nothing until phase 17b. The
+ * arrows adjust a value there as well as move the cursor, which is why
+ * per-mode tables exist at all: no ACT_MENU_UP family is needed for the
+ * same key to mean a different thing in a different list.
+ */
+static const Binding g_bindings_menu[] = {
+  { TB_KEY_ARROW_UP,    0, 0, ACT_CURSOR_UP,        0 },
+  { TB_KEY_ARROW_DOWN,  0, 0, ACT_CURSOR_DOWN,      0 },
+  { TB_KEY_ARROW_LEFT,  0, 0, ACT_VOL_DOWN,         VOL_STEP_PCT },
+  { TB_KEY_ARROW_RIGHT, 0, 0, ACT_VOL_UP,           VOL_STEP_PCT },
+  { TB_KEY_PGUP,        0, 0, ACT_CURSOR_PAGE_UP,   0 },
+  { TB_KEY_PGDN,        0, 0, ACT_CURSOR_PAGE_DOWN, 0 },
+  { TB_KEY_HOME,        0, 0, ACT_CURSOR_HOME,      0 },
+  { TB_KEY_END,         0, 0, ACT_CURSOR_END,       0 },
+  { TB_KEY_ENTER,       0, 0, ACT_CONFIRM,          0 },
+  { 0, 'm',  0, ACT_MENU_TOGGLE,  0 },
+  { 0, 'q',  0, ACT_QUIT,         0 },
+  { TB_KEY_ESC,    0, 0, ACT_QUIT, 0 },
+  { TB_KEY_CTRL_C, 0, 0, ACT_QUIT, 0 },
+};
+
+/*
+ * MODE_SEARCH binds four things and nothing else, and the omission is the
+ * design (amendment 04 decision 4): every other event resolves ACT_NONE,
+ * and tui.c reads ACT_NONE with a non-zero ev->ch as "insert this
+ * codepoint into the query". That is what keeps text entry inside the
+ * binding table instead of bypassing it. Esc cancels rather than pops --
+ * cancelling a search also has to restore column 3 (phase 16), which is
+ * more than a pop. Nothing pushes this mode until phase 16.
+ */
+static const Binding g_bindings_search[] = {
+  { TB_KEY_ESC,        0, 0, ACT_SEARCH_CANCEL, 0 },
+  { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,       0 },
+  { TB_KEY_BACKSPACE2, 0, 0, ACT_REMOVE,        0 },
+  { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,     0 },
+  { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,   0 },
+};
+
+#define TABLE_ROWS(t) (sizeof(t) / sizeof((t)[0]))
+
+/*
+ * The table-of-tables, indexed by UiMode. Sized by MODE_COUNT so a mode
+ * added without a table fails the build rather than resolving every key
+ * to ACT_NONE at runtime.
+ */
+static const struct {
+  const Binding * rows;
+  size_t          count;
+} g_mode_tables[MODE_COUNT] = {
+  [MODE_NORMAL] = { g_bindings_normal, TABLE_ROWS(g_bindings_normal) },
+  [MODE_HELP]   = { g_bindings_help,   TABLE_ROWS(g_bindings_help)   },
+  [MODE_MENU]   = { g_bindings_menu,   TABLE_ROWS(g_bindings_menu)   },
+  [MODE_SEARCH] = { g_bindings_search, TABLE_ROWS(g_bindings_search) },
+};
 
 /*
  * Action names, for diagnostics and for the config parser's name table
@@ -144,6 +247,9 @@ static const char * const g_action_name[] = {
   [ACT_EQ_TOGGLE]        = "eq_toggle",
   [ACT_EQ_SET_BAND]      = "eq_set_band",
   [ACT_EQ_LOAD_PRESET]   = "eq_load_preset",
+  [ACT_HELP_TOGGLE]      = "help_toggle",
+  [ACT_MENU_TOGGLE]      = "menu_toggle",
+  [ACT_CONFIRM]          = "confirm",
 };
 
 _Static_assert(sizeof(g_action_name) / sizeof(g_action_name[0]) == ACT_COUNT,
@@ -180,7 +286,7 @@ normalized_mod(const struct tb_event * ev)
  * unbound key. out_arg may not be NULL.
  */
 Action
-keymap_resolve(const struct tb_event * ev, int32_t * out_arg)
+keymap_resolve(UiMode mode, const struct tb_event * ev, int32_t * out_arg)
 {
   *out_arg = 0;
 
@@ -188,10 +294,12 @@ keymap_resolve(const struct tb_event * ev, int32_t * out_arg)
     return ACT_NONE;
   }
 
-  uint8_t mod = normalized_mod(ev);
+  size_t          count = 0;
+  const Binding * rows  = keymap_table(mode, &count);
+  uint8_t         mod   = normalized_mod(ev);
 
-  for (size_t i = 0; i < BINDING_COUNT; i++) {
-    const Binding * b = &g_bindings[i];
+  for (size_t i = 0; i < count; i++) {
+    const Binding * b = &rows[i];
     if (b->key == ev->key && b->ch == ev->ch && b->mod == mod) {
       *out_arg = b->arg;
       return b->action;
@@ -207,13 +315,91 @@ keymap_resolve(const struct tb_event * ev, int32_t * out_arg)
  * the row count (may be NULL), returns a pointer to the first row.
  */
 const Binding *
-keymap_table(size_t * out_count)
+keymap_table(UiMode mode, size_t * out_count)
 {
-  if (out_count != NULL) {
-    *out_count = BINDING_COUNT;
+  /* Unsigned for the same reason action_name compares unsigned: the enum
+     may itself be unsigned and `mode < 0` would be a dead comparison. An
+     out-of-range mode falls back to the normal table rather than
+     returning NULL -- every caller walks the result, and a NULL here
+     would turn a bad mode into a crash in draw code. */
+  unsigned idx = (unsigned) mode;
+  if (idx >= (unsigned) MODE_COUNT) {
+    idx = (unsigned) MODE_NORMAL;
   }
-  return g_bindings;
+  if (out_count != NULL) {
+    *out_count = g_mode_tables[idx].count;
+  }
+  return g_mode_tables[idx].rows;
 } /* keymap_table */
+
+/*
+ * Special-key names, as a table rather than a switch. The architectural
+ * rule bans a key switch in the *input* path and this is the output one,
+ * but a table is what a config parser will need to read names back into
+ * keys, and writing it twice in two shapes is the drift this file exists
+ * to avoid.
+ */
+static const struct {
+  uint16_t     key;
+  const char * name;
+} g_key_name[] = {
+  { TB_KEY_ARROW_UP,    "up"        },
+  { TB_KEY_ARROW_DOWN,  "down"      },
+  { TB_KEY_ARROW_LEFT,  "left"      },
+  { TB_KEY_ARROW_RIGHT, "right"     },
+  { TB_KEY_ENTER,       "enter"     },
+  { TB_KEY_TAB,         "tab"       },
+  { TB_KEY_ESC,         "esc"       },
+  { TB_KEY_PGUP,        "pgup"      },
+  { TB_KEY_PGDN,        "pgdn"      },
+  { TB_KEY_HOME,        "home"      },
+  { TB_KEY_END,         "end"       },
+  { TB_KEY_BACKSPACE2,  "backspace" },
+  { TB_KEY_CTRL_C,      "ctrl-c"    },
+};
+
+/* key_name: see include/ui/keymap.h. */
+const char *
+key_name(const Binding * b)
+{
+  /* One call at a time, printed immediately by the caller. A file-scope
+     buffer is what keeps this allocation-free; the help overlay draws one
+     row at a time and never holds two of these at once. */
+  static char buf[24];
+
+  if (b == NULL) {
+    return "?";
+  }
+
+  const char * pre = (b->mod & TB_MOD_SHIFT) ? "shift+" : "";
+
+  if (b->key != 0) {
+    for (size_t i = 0; i < sizeof g_key_name / sizeof g_key_name[0]; i++) {
+      if (g_key_name[i].key == b->key) {
+        snprintf(buf, sizeof buf, "%s%s", pre, g_key_name[i].name);
+        return buf;
+      }
+    }
+    snprintf(buf, sizeof buf, "%skey#%u", pre, (unsigned) b->key);
+    return buf;
+  }
+
+  if (b->ch == ' ') {
+    snprintf(buf, sizeof buf, "%sspace", pre);
+    return buf;
+  }
+  if (b->ch >= 0x21 && b->ch <= 0x7e) {
+    snprintf(buf, sizeof buf, "%s%c", pre, (char) b->ch);
+    return buf;
+  }
+
+  /* Nothing in v1's tables reaches here -- every row is either a special
+     key or printable ASCII. A config file could bind a non-ASCII
+     codepoint one day, and printing it as U+XXXX is better than drawing
+     a partial UTF-8 sequence into a fixed-width column. */
+  snprintf(buf, sizeof buf, "%sU+%04X", pre, (unsigned) b->ch);
+  return buf;
+} /* key_name */
 
 /*
  * Takes an Action, returns its stable config-file name, or "invalid" for

@@ -67,10 +67,44 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
 /* Progress bar width in the status bar, and the space its clock needs. */
 #define PROGRESS_W 24
 
+/* The mode indicator's fixed field at the left of the status bar
+   (amendment 04 decision 8). Always drawn, MODE_NORMAL included: a field
+   that disappears shifts every element right of it, and the status bar's
+   remaining width feeds the progress bar's cell count. Twelve columns
+   fits "-- SEARCH --" exactly. */
+#define MODE_FIELD_W 12
+
+/* The help overlay's box, and the margin it needs around itself. An
+   overlay that would not fit refuses to open rather than drawing a
+   clipped box (amendment 04 decision 9). */
+#define OVERLAY_MARGIN   2
+#define OVERLAY_MAX_W    56
+#define OVERLAY_KEY_W    14
+
 static Theme     g_theme;
 static TuiLayout g_layout;
 static int       g_active = 0;
 static int       g_dirty  = 1;
+
+/*
+ * The mode stack (amendment 04 decision 3). MODE_NORMAL sits at the
+ * bottom and the stack is never empty, so ui_mode() never reads out of
+ * bounds: a push at the ceiling is dropped and a pop at depth 1 is a
+ * no-op. v1 never exceeds depth 2, and a silently truncated stack is a
+ * better failure than an abort in a music player.
+ *
+ * Push and pop are static. Nothing outside this file writes the stack --
+ * main.c reads the top through ui_mode() and asks for a change through
+ * ui_mode_toggle()/ui_mode_pop(), which is what keeps input routing
+ * inside ui/.
+ */
+#define UI_MODE_STACK_MAX 4
+static UiMode g_mode_stack[UI_MODE_STACK_MAX] = { MODE_NORMAL };
+static int    g_mode_depth = 1;
+
+/* The overlay scroll offset, in rows. Reset whenever a mode is pushed or
+   popped so an overlay never opens halfway down. */
+static int g_overlay_scroll = 0;
 
 /*
  * tui_compute_layout: recompute every rectangle from the current
@@ -346,6 +380,125 @@ draw_body(const TuiModel * m)
 } /* draw_body */
 
 /*
+ * Mode labels for the status bar's indicator. Sized by MODE_COUNT and
+ * checked by the assert below, the same mechanism g_action_name uses: a
+ * mode added without a label fails the build rather than drawing an
+ * empty field.
+ */
+static const char * const g_mode_label[MODE_COUNT] = {
+  [MODE_NORMAL] = "-- NORMAL --",
+  [MODE_HELP]   = "-- HELP --",
+  [MODE_MENU]   = "-- MENU --",
+  [MODE_SEARCH] = "-- SEARCH --",
+};
+
+_Static_assert(sizeof(g_mode_label) / sizeof(g_mode_label[0]) == MODE_COUNT,
+               "every UiMode needs a label in g_mode_label");
+
+/*
+ * mode_label: takes a mode, returns its status-bar text. Never returns
+ * NULL -- an out-of-range mode reads as normal, because a blank field
+ * would shift the layout the fixed field exists to keep still.
+ */
+static const char *
+mode_label(UiMode m)
+{
+  unsigned idx = (unsigned) m;
+  if (idx >= (unsigned) MODE_COUNT || g_mode_label[idx] == NULL) {
+    idx = (unsigned) MODE_NORMAL;
+  }
+  return g_mode_label[idx];
+} /* mode_label */
+
+/*
+ * overlay_fits: 1 when an overlay has room to draw inside the current
+ * layout with its margin, 0 otherwise. Takes and returns nothing else.
+ *
+ * Checked before a push rather than during the draw: refusing to open and
+ * saying so is the behaviour amendment 04 decision 9 asks for, and a box
+ * clipped by the layout is exactly what it forbids.
+ */
+static int
+overlay_fits(void)
+{
+  return !g_layout.too_small
+         && g_layout.w >= TUI_MIN_W + 2 * OVERLAY_MARGIN
+         && g_layout.h >= TUI_MIN_H + 2 * OVERLAY_MARGIN;
+} /* overlay_fits */
+
+/*
+ * draw_overlay: the help box, centred, drawn over the columns and under
+ * nothing. Takes nothing, returns nothing.
+ *
+ * Its contents are a walk of the MODE_NORMAL binding table through
+ * key_name and action_name -- there is no hand-written key list anywhere,
+ * so a binding added later appears here with no second edit and cannot
+ * drift from what the keymap actually does (amendment 04 decision 10).
+ * Rows bound to ACT_NONE are skipped; nothing in v1's table has one, and
+ * a config file could produce one as an explicit unbind.
+ */
+static void
+draw_overlay(void)
+{
+  size_t          n    = 0;
+  const Binding * rows = keymap_table(MODE_NORMAL, &n);
+
+  int box_w = g_layout.w - 2 * OVERLAY_MARGIN;
+  if (box_w > OVERLAY_MAX_W) {
+    box_w = OVERLAY_MAX_W;
+  }
+  int box_h = g_layout.h - 2 * OVERLAY_MARGIN;
+  int box_x = (g_layout.w - box_w) / 2;
+  int box_y = (g_layout.h - box_h) / 2;
+
+  /* One row of title, one blank beneath it, one bottom pad. */
+  int list_y    = box_y + 2;
+  int list_rows = box_h - 3;
+  if (list_rows < 1) {
+    return;
+  }
+
+  /* Clamped here rather than where the scroll is changed: the dispatch
+     path does not know how many rows the table has or how tall the box
+     is, and both change with the terminal size. */
+  int max_scroll = (int) n - list_rows;
+  if (max_scroll < 0) {
+    max_scroll = 0;
+  }
+  if (g_overlay_scroll > max_scroll) {
+    g_overlay_scroll = max_scroll;
+  }
+  if (g_overlay_scroll < 0) {
+    g_overlay_scroll = 0;
+  }
+
+  for (int r = 0; r < box_h; r++) {
+    fill_row(box_x, box_y + r, box_w, STYLE_POPUP);
+  }
+
+  char title[64];
+  snprintf(title, sizeof title, "keys  (%d-%d of %zu)  h or esc closes",
+           (n == 0) ? 0 : g_overlay_scroll + 1,
+           (g_overlay_scroll + list_rows > (int) n) ? (int) n
+                                                    : g_overlay_scroll + list_rows,
+           n);
+  draw_text(box_x + 2, box_y, box_w - 4, STYLE_POPUP, title);
+
+  int drawn = 0;
+  for (size_t i = (size_t) g_overlay_scroll; i < n && drawn < list_rows; i++) {
+    if (rows[i].action == ACT_NONE) {
+      continue;
+    }
+    draw_text(box_x + 2, list_y + drawn, OVERLAY_KEY_W, STYLE_POPUP,
+              key_name(&rows[i]));
+    draw_text(box_x + 2 + OVERLAY_KEY_W, list_y + drawn,
+              box_w - 4 - OVERLAY_KEY_W, STYLE_POPUP,
+              action_name(rows[i].action));
+    drawn++;
+  }
+} /* draw_overlay */
+
+/*
  * draw_statusbar: the last row -- progress bar, clock, volume, shuffle
  * and repeat indicators, and the current message. Takes the model,
  * returns nothing.
@@ -356,6 +509,16 @@ draw_statusbar(const TuiModel * m)
   int y = g_layout.status_y;
   fill_row(0, y, g_layout.w, STYLE_STATUSBAR);
 
+  /* The mode indicator, a fixed field at the left. Dropped before the
+     progress bar when the row cannot hold both, which is the order
+     amendment 04 decision 8 sets: the bar is the element that has to
+     survive a narrow terminal. */
+  int bar_x = 1;
+  if (g_layout.w >= MODE_FIELD_W + PROGRESS_W + 4) {
+    draw_text(1, y, MODE_FIELD_W, STYLE_MODE, mode_label(ui_mode()));
+    bar_x = MODE_FIELD_W + 1;
+  }
+
   /* Progress bar. An unknown duration leaves it empty rather than full:
      a bar that reads 100% for an unseekable stream is worse than a bar
      that reads nothing. */
@@ -364,9 +527,9 @@ draw_statusbar(const TuiModel * m)
     int64_t f = (int64_t) PROGRESS_W * m->pos_ms / m->dur_ms;
     filled = (f < 0) ? 0 : (f > PROGRESS_W) ? PROGRESS_W : (int) f;
   }
-  for (int i = 0; i < PROGRESS_W && i + 1 < g_layout.w; i++) {
+  for (int i = 0; i < PROGRESS_W && bar_x + i < g_layout.w; i++) {
     StyleSlot slot = (i < filled) ? STYLE_PROGRESS_FILL : STYLE_PROGRESS_EMPTY;
-    tb_set_cell(1 + i, y, 0x2500 /* box drawings light horizontal */,
+    tb_set_cell(bar_x + i, y, 0x2500 /* box drawings light horizontal */,
                 style_fg(&g_theme, slot), style_bg(&g_theme, slot));
   }
 
@@ -398,7 +561,7 @@ draw_statusbar(const TuiModel * m)
            (m->repeat == 2) ? "repeat one" : (m->repeat == 1) ? "repeat all" : "-",
            un);
 
-  int x = PROGRESS_W + 3;
+  int x = bar_x + PROGRESS_W + 2;
   draw_text(x, y, g_layout.w - x, STYLE_STATUSBAR, right);
 
   /* The message takes the row above the status bar rather than competing
@@ -430,6 +593,12 @@ tui_draw(const TuiModel * m)
     draw_header(m);
     draw_body(m);
     draw_statusbar(m);
+    /* Last, and still before the single present -- the overlay covers the
+       columns and the browser underneath keeps its geometry, knowing
+       nothing about it (amendment 04 decision 9). */
+    if (ui_mode() == MODE_HELP) {
+      draw_overlay();
+    }
   }
 
   tb_present();
@@ -437,20 +606,49 @@ tui_draw(const TuiModel * m)
 } /* tui_draw */
 
 /*
+ * overlay_scroll_action: consume the cursor actions while an overlay owns
+ * the screen. Takes the action, returns 1 when it was consumed and 0 when
+ * the caller should dispatch it.
+ *
+ * The overlay tables bind ACT_CURSOR_* deliberately -- per-mode tables
+ * exist so the same action means "move down whichever list is focused"
+ * without an ACT_MENU_UP family. That only holds if the focused list is
+ * the one that moves, so these never reach main.c's browser while an
+ * overlay is up. The clamp lives in draw_overlay, which is the only place
+ * that knows the row count and the box height.
+ */
+static int
+overlay_scroll_action(Action a)
+{
+  switch (a) {
+    case ACT_CURSOR_UP:        g_overlay_scroll -= 1;  return 1;
+    case ACT_CURSOR_DOWN:      g_overlay_scroll += 1;  return 1;
+    case ACT_CURSOR_PAGE_UP:   g_overlay_scroll -= 10; return 1;
+    case ACT_CURSOR_PAGE_DOWN: g_overlay_scroll += 10; return 1;
+    case ACT_CURSOR_HOME:      g_overlay_scroll  = 0;  return 1;
+    /* Any value past the end; draw_overlay clamps it to the real last
+       page, which it computes from the current box height. */
+    case ACT_CURSOR_END:       g_overlay_scroll  = 1 << 20; return 1;
+    default:                   return 0;
+  }
+} /* overlay_scroll_action */
+
+/*
  * dispatch_event: route one termbox event by its type. Key events resolve
- * through the phase-10 binding table to an Action and go to
- * action_dispatch; resize recomputes the layout. Every path marks the
- * screen dirty -- the single present happens later, at the bottom of the
- * loop iteration. Takes the event, returns nothing.
+ * against the table for the current mode and go to action_dispatch;
+ * resize recomputes the layout. Every path marks the screen dirty -- the
+ * single present happens later, at the bottom of the loop iteration.
+ * Takes the event, returns nothing.
  */
 static void
 dispatch_event(const struct tb_event * ev)
 {
   switch (ev->type) {
     case TB_EVENT_KEY: {
-      int32_t arg = 0;
-      Action  a   = keymap_resolve(ev, &arg);
-      if (a != ACT_NONE) {
+      int32_t arg  = 0;
+      UiMode  mode = ui_mode();
+      Action  a    = keymap_resolve(mode, ev, &arg);
+      if (a != ACT_NONE && !(mode != MODE_NORMAL && overlay_scroll_action(a))) {
         action_dispatch(a, arg);
       }
       g_dirty = 1;
@@ -563,6 +761,47 @@ tui_shutdown(void)
   g_active = 0;
   tb_shutdown();
 } /* tui_shutdown */
+
+/* ui_mode: see include/ui/tui.h. */
+UiMode
+ui_mode(void)
+{
+  return g_mode_stack[g_mode_depth - 1];
+} /* ui_mode */
+
+/* ui_mode_pop: see include/ui/tui.h. */
+void
+ui_mode_pop(void)
+{
+  if (g_mode_depth > 1) {
+    g_mode_depth--;
+    g_overlay_scroll = 0;
+    g_dirty = 1;
+  }
+} /* ui_mode_pop */
+
+/* ui_mode_toggle: see include/ui/tui.h. */
+int
+ui_mode_toggle(UiMode m)
+{
+  if (m == MODE_NORMAL || (unsigned) m >= (unsigned) MODE_COUNT) {
+    return -1;
+  }
+
+  if (ui_mode() == m) {
+    ui_mode_pop();
+    return 0;
+  }
+
+  if (!overlay_fits() || g_mode_depth >= UI_MODE_STACK_MAX) {
+    return -1;
+  }
+
+  g_mode_stack[g_mode_depth++] = m;
+  g_overlay_scroll = 0;
+  g_dirty = 1;
+  return 1;
+} /* ui_mode_toggle */
 
 /*
  * tui_active: whether the terminal is currently claimed. Takes nothing,

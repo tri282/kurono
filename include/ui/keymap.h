@@ -45,8 +45,29 @@ typedef enum {
   ACT_TOGGLE_COVER, ACT_TOGGLE_VIZ, ACT_CYCLE_VIZ_MODE,
   ACT_PLAYLIST_SAVE, ACT_PLAYLIST_ADD, ACT_PLAYLIST_LOAD, ACT_PLAYLIST_DELETE,
   ACT_EQ_TOGGLE, ACT_EQ_SET_BAND, ACT_EQ_LOAD_PRESET,
+  /* Phase 12b (amendment-04-input-modes.md decision 6). Appended after
+     the reserved post-v1 block rather than grouped with the navigation
+     actions they resemble: the append-only rule exists so a config
+     file's action-name table never has to be renumbered, and grouping
+     is worth less than that. ACT_CONFIRM is generic on purpose -- it is
+     Enter in MODE_MENU and in every later overlay, and reusing
+     ACT_PLAY_NOW for it would make the generated help overlay print a
+     lie. */
+  ACT_HELP_TOGGLE, ACT_MENU_TOGGLE, ACT_CONFIRM,
   ACT_COUNT
 } Action;
+
+/*
+ * UiMode: which binding table an event resolves against (amendment 04
+ * decision 3). The stack that holds these lives in ui/tui.c and nothing
+ * outside that file writes it; main.c reads the top through ui_mode().
+ *
+ * MODE_COUNT is not a mode. It sizes the table-of-tables in keymap.c and
+ * the name array in tui.c.
+ */
+typedef enum {
+  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_COUNT
+} UiMode;
 
 /*
  * One row of the binding table.
@@ -69,11 +90,20 @@ typedef struct {
   int32_t  arg;        /* seek ms, volume step, view id, eq band, ... */
 } Binding;
 
-Action keymap_resolve(const struct tb_event * ev, int32_t * out_arg);
+Action keymap_resolve(UiMode mode, const struct tb_event * ev, int32_t * out_arg);
 
-const Binding * keymap_table(size_t * out_count);
+const Binding * keymap_table(UiMode mode, size_t * out_count);
 
 const char * action_name(Action a);
+
+/*
+ * Renders one Binding's key as text for the help overlay -- `up` for an
+ * arrow, `enter`, `ctrl-c`, `space`, a `shift+` prefix for TB_MOD_SHIFT,
+ * and a printable ch as itself. Returns a pointer to static storage that
+ * the next call overwrites, so the caller prints it immediately. Never
+ * returns NULL.
+ */
+const char * key_name(const Binding * b);
 
 /* Lives in main.c -- it needs every subsystem, and ui/ never calls back
    into the layers below it except through this one entry point. */

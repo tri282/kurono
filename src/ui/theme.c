@@ -62,6 +62,10 @@ const Theme g_theme_default = {
        the user on. Distinct from STYLE_SELECTED's blue background so a
        directory under the cursor still reads as the cursor. */
     [STYLE_DIR]            = { 0x7aa2f7, 0x11131a, TB_BOLD },
+    /* The mode indicator sits inside the status bar, so it keeps that
+       row's background and earns its separation from the fields beside
+       it with the accent foreground and bold. */
+    [STYLE_MODE]           = { 0xe0af68, 0x1a1d26, TB_BOLD },
   }
 };
 

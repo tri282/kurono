@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "browser.h"
+#include "keymap.h"   /* UiMode, for the mode-stack accessors below */
 
 /*
  * ui/tui.c owns the terminal: it is the only translation unit that
@@ -66,6 +67,29 @@ typedef struct {
 int  tui_init(void);
 void tui_shutdown(void);
 int  tui_active(void);
+
+/*
+ * The input mode stack (amendment-04-input-modes.md decision 3). The
+ * stack itself is file-scope in tui.c and nothing outside writes it --
+ * main.c reads the top and asks for a change through these two calls,
+ * which is what keeps input routing inside ui/.
+ *
+ * ui_mode returns the top of the stack; MODE_NORMAL when nothing is
+ * pushed, and never anything else at depth 1.
+ *
+ * ui_mode_toggle pushes `m` if it is not already on top and pops it if it
+ * is. Returns 1 when it pushed, 0 when it popped, and -1 when it refused:
+ * the terminal is too small for an overlay to draw without clipping, the
+ * stack is at its ceiling, or the mode is not one that can be pushed.
+ * The caller reports a refusal; it is never fatal.
+ *
+ * ui_mode_pop pops one level, and is a no-op at depth 1 -- that is what
+ * makes ACT_QUIT's "close the overlay, then quit" rule a dispatch rule
+ * rather than a per-overlay binding.
+ */
+UiMode ui_mode(void);
+int    ui_mode_toggle(UiMode m);
+void   ui_mode_pop(void);
 
 void tui_get_fds(int * ttyfd, int * resizefd);
 
