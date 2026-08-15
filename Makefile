@@ -52,9 +52,13 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # filesystem BrowserSource. The widget and the source live in one file
 # on purpose: the source is the smaller half, and phase 16 adds a
 # library/query.c source beside it rather than replacing this one.
+# src/library/db.c (phase 13): the SQLite handle. Linked from the start
+# so `make analyze` sees it, though nothing calls db_open until main.c is
+# wired in. All sqlite3_* calls are confined to this one file.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
-       src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c
+       src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c \
+       src/library/db.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
