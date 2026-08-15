@@ -509,6 +509,10 @@ static atomic_bool g_shutdown = false;
  */
 static const int g_ladder_backoff_ms[] = { 250, 500, 1000, 2000, 4000 };
 #define LADDER_TAIL_MS    4000
+/* Amendment 07: consecutive redraw ticks with no callback invocation
+   before device loss is declared. Five ticks is ~165 ms, nine missed
+   periods at the 900-frame period measured on this host. */
+#define CB_STALL_TICKS    5
 #define LADDER_GIVE_UP_MS 60000
 
 /*
@@ -613,6 +617,16 @@ typedef struct {
   int             ladder_elapsed_ms; /* against LADDER_GIVE_UP_MS */
   struct timespec loss_at;           /* for the detection/recovery timings */
   int64_t         pos_origin_ms;     /* IV.8.b step 5's elapsed-time origin */
+
+  /* Amendment 07: the authoritative device-loss detector. g_cb_seq is
+     T3's callback-invocation counter, and a device that has stopped
+     asking for audio is the only observable a dead sound server leaves
+     -- ma_device_get_state keeps reporting `started`, because miniaudio
+     writes it in ma_device_start/stop and nowhere else. Sampled only in
+     player_watchdog, which runs on the redraw tick and only while the
+     device is ready and PLAY_PLAYING. */
+  unsigned        cb_seq_last;
+  int             cb_stall_ticks;
 
   PlayMode     mode;
   int64_t      mode_arg;
@@ -1142,6 +1156,12 @@ player_ladder_begin(Player * p, const char * detector)
   p->dev               = DEV_LOST;
   p->ladder_attempt    = 0;
   p->ladder_elapsed_ms = 0;
+  /* Amendment 07 rule 4. Step 3 reopens with a fresh device whose
+     counter starts at 0, and step 6 restarts playback; carrying a stall
+     count across that would re-declare the loss on the first tick after
+     a successful recovery. */
+  p->cb_seq_last       = 0;
+  p->cb_stall_ticks    = 0;
   clock_gettime(CLOCK_MONOTONIC, &p->loss_at);
 
   /* Step 5's origin, captured here rather than after the reopen: the
@@ -1312,6 +1332,15 @@ player_set_play_state(Player * p, PlayState want)
         return -1;
       }
     }
+    /* Amendment 07. The watchdog is inert while not PLAY_PLAYING, so a
+       stall count from before the pause would otherwise survive it and
+       declare a loss after one tick instead of CB_STALL_TICKS. Sampled
+       rather than zeroed: the device may already have run callbacks
+       between the start above and this line. */
+    p->cb_seq_last    = atomic_load_explicit(sink_cb_seq(),
+                                             memory_order_acquire);
+    p->cb_stall_ticks = 0;
+
     p->play = want;             /* publish SECOND */
     return 0;
   }
@@ -2172,15 +2201,25 @@ player_action(Player * p, Action a, int32_t arg)
  * It exists because the notification cannot be trusted: miniaudio raises
  * `stopped` only when onDeviceStop returned MA_SUCCESS, and PulseAudio's
  * onDeviceStop is a cork that fails when the stream is already dead --
- * exactly the yanked-DAC case. The worker sets ma_device_state_stopped
- * unconditionally, which is what this poll reads. Worst-case latency is
- * one tick, 33 ms.
+ * exactly the yanked-DAC case.
+ *
+ * Amendment 07 (2026-08-15): the ma_device_get_state poll this function
+ * was built on is necessary and NOT sufficient, and calling it
+ * authoritative was wrong. Measured: killing the sound server under a
+ * running stream produces no notification AND no state change, so the
+ * loss went undetected until a keypress next tried to start the device.
+ * ma_device_get_state records what we last asked for, not whether the
+ * device lives. The authoritative detector is callback liveness --
+ * g_cb_seq, below. Either detector firing declares a loss. Worst-case
+ * latency is CB_STALL_TICKS ticks from the last callback invocation.
  *
  * Takes the Player, returns nothing.
  */
 static void
 player_watchdog(Player * p)
 {
+  unsigned seq;
+
   if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
     return; /* teardown stops the device on purpose */
   }
@@ -2194,15 +2233,38 @@ player_watchdog(Player * p)
   if (p->dev != DEV_READY || p->play != PLAY_PLAYING) {
     return;
   }
-  if (sink_is_started(&p->sink)) {
+  if (!sink_is_started(&p->sink)) {
+    /* Phase 8's original detector. Kept: it catches a loss we caused
+       ourselves getting the IV.9.a.i edge ordering wrong, which is what
+       amendment 05's note calls its second job. It does NOT catch a dead
+       sound server -- see the stall check below. */
+    player_ladder_begin(p, "poll");
     return;
   }
 
-  /* If PipeWire's idle-suspend ever trips this with no device actually
-     lost (plan phase-8 III.2 / residual risk 3), the chosen fix is to
-     require two consecutive disagreeing ticks before declaring loss, and
-     it belongs here and nowhere else. Not applied speculatively. */
-  player_ladder_begin(p, "poll");
+  /* Amendment 07. The device claims to be started; ask T3 whether it is
+     actually running. Five consecutive silent ticks is ~165 ms, or nine
+     missed periods at the 900-frame period measured on this host.
+     ponytail: fixed tick count rather than derived from
+     SessionFormat.period_frames, whose comment reserves it for the
+     status bar. The ceiling is a backend whose period exceeds ~165 ms;
+     derive it from period_frames if one ever appears. */
+  seq = atomic_load_explicit(sink_cb_seq(), memory_order_acquire);
+  if (seq != p->cb_seq_last) {
+    p->cb_seq_last    = seq;
+    p->cb_stall_ticks = 0;
+    return;
+  }
+  if (++p->cb_stall_ticks < CB_STALL_TICKS) {
+    return;
+  }
+
+  /* Deliberately not g_frames_consumed: IV.2 counts frames actually read
+     out of pcm_ring, so a legitimate underrun advances it by nothing and
+     decoder starvation would be indistinguishable from device death.
+     g_cb_seq advances through an underrun because the callback still ran
+     and still wrote its silence. */
+  player_ladder_begin(p, "cb-stall");
 } /* player_watchdog */
 
 /*

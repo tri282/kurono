@@ -186,6 +186,9 @@ def main():
                          "uses this colour with '<=='. The cursor "
                          "slot is 224,175,104 in the default theme.")
     ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("--stamp", action="store_true",
+                    help="print an elapsed-ms timeline of keys sent and "
+                         "text drawn, for timing assertions")
     ap.add_argument("-h", "--help", action="store_true")
     args, rest = ap.parse_known_args()
 
@@ -215,6 +218,14 @@ def main():
     out = bytearray()
     deadline = time.time() + args.timeout
 
+    # --stamp: (elapsed_ms, kind, text) per draw and per key sent. The
+    # harness could always say WHAT was drawn and never WHEN, which left
+    # every timing row (the seek-while-paused fence, amendment 07's
+    # cb-stall) unassertable. Wall time from a key to the draw it caused
+    # is the whole measurement.
+    t0 = time.time()
+    stamps = []
+
     def pump(ms):
         end = time.time() + ms / 1000.0
         while time.time() < end:
@@ -231,6 +242,9 @@ def main():
                 if not chunk:
                     return
                 out.extend(chunk)
+                if args.stamp:
+                    stamps.append(((time.time() - t0) * 1000.0, "draw",
+                                   strip(chunk).decode("utf-8", "replace")))
 
     # The stream is replayed to reconstruct the screen, so rendering all
     # of it shows the state after teardown -- termbox leaves the alt
@@ -246,6 +260,8 @@ def main():
             os.write(fd, data)
         except OSError:
             break
+        if args.stamp:
+            stamps.append(((time.time() - t0) * 1000.0, "KEY", spec))
         pump(ms)
         marks.append(len(out))
     pump(args.settle)
@@ -280,6 +296,15 @@ def main():
         cut = marks[max(0, len(args.send) - 1)]
     else:
         cut = marks[0]
+
+    if args.stamp:
+        for ms, kind, text in stamps:
+            flat = " ".join(text.split())
+            if kind == "KEY":
+                print(f"{ms:9.1f} ms  KEY  {flat}")
+            elif flat:
+                print(f"{ms:9.1f} ms  draw {flat[:110]}")
+        print()
 
     if args.raw:
         sys.stdout.write(repr(bytes(out)) + "\n")
