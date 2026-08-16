@@ -195,12 +195,18 @@ int db_tracks_sweep(Db * db, int64_t gen);
 /*
  * db_query_dirs: the Directory view's column 1 (DESIGN.md VIII.4).
  * Returns every distinct `parent_dir` value equal to `parent` or
- * nested under it (backed by idx_tracks_parent), as an owned array of
- * owned strings via out_names and out_n. This is one level deeper than
- * "immediate children" -- phase 15 collapses the returned paths into
- * single next-segment names and de-duplicates; db.c does not parse
- * paths (see phase-13.md's implementation log for why this split was
- * chosen over teaching db.c path segmentation). Always returns 0: a
+ * nested under it at ANY depth (backed by idx_tracks_parent), as an
+ * owned array of owned strings via out_names and out_n. Browsing
+ * "/m/plain" returns "/m/plain", "/m/plain/sub", and
+ * "/m/plain/sub/deeper" alike -- not just the immediate children.
+ * Phase 15 collapses the returned paths into single next-segment names
+ * and de-duplicates, so its work is O(descendants of `parent`), not
+ * O(children); db.c does not parse paths (see phase-13.md's
+ * implementation log for why this split was chosen over teaching db.c
+ * path segmentation). The matching is a prefix range rather than a
+ * GLOB pattern, so '[', '*' and '?' in a directory name are ordinary
+ * characters -- see the comment on the prepared statement in db.c for
+ * what the pattern form got wrong. Always returns 0: a
  * database error degrades to zero results rather than being reported,
  * the same never-fatal-query policy db_query_search documents below,
  * applied uniformly to every query in this file rather than only to

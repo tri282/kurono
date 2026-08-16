@@ -465,8 +465,21 @@ prepare_all_statements(Db * db)
        " year, track_no, disc_no, duration_ms, bitrate, sample_rate, channels, codec, scan_gen) "
        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)");
   PREP(tracks_sweep, "DELETE FROM tracks WHERE scan_gen < ?1");
+  /* A prefix RANGE, not a pattern. The obvious form here is a GLOB
+     against the parent joined with a slash and a star, and it is wrong:
+     GLOB reads '[', '*' and '?' in the bound value as metacharacters,
+     so a directory named
+     "[2019] Album" becomes a character class and none of its children
+     ever match -- whole subtrees vanish from the Directory view, and
+     bracketed album folders are common. The range form has no
+     metacharacters at all, and '0' is the byte immediately after '/',
+     so it selects exactly the paths under ?1. It still uses
+     idx_tracks_parent: SQLite plans this as a MULTI-INDEX OR over two
+     covering-index lookups. */
   PREP(query_dirs, "SELECT DISTINCT parent_dir FROM tracks "
-                    "WHERE parent_dir = ?1 OR parent_dir GLOB ?1 || '/*' ORDER BY parent_dir");
+                    "WHERE parent_dir = ?1 "
+                    "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
+                    "ORDER BY parent_dir");
   PREP(query_artists, "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL ORDER BY artist");
   PREP(query_album_artists,
        "SELECT DISTINCT album_artist FROM tracks WHERE album_artist IS NOT NULL ORDER BY album_artist");

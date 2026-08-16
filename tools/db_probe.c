@@ -10,7 +10,7 @@
  *   gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
  *       -o /tmp/db_probe tools/db_probe.c src/library/db.c -lsqlite3
  *
- * usage: db_probe <db_path> [--insert] [root ...]
+ * usage: db_probe <db_path> [--insert] [--dirs PARENT] [root ...]
  */
 #include "../include/library/db.h"
 #include "../include/main.h"
@@ -43,17 +43,22 @@ int
 main(int argc, char ** argv)
 {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <db_path> [--insert] [root ...]\n", argv[0]);
+    fprintf(stderr, "usage: %s <db_path> [--insert] [--dirs PARENT] [root ...]\n", argv[0]);
     return 2;
   }
 
   const char * db_path = argv[1];
+  const char * dirs_parent = NULL;
   int          do_insert = 0;
   int          argi = 2;
 
   if (argi < argc && strcmp(argv[argi], "--insert") == 0) {
     do_insert = 1;
     argi++;
+  }
+  if (argi + 1 < argc && strcmp(argv[argi], "--dirs") == 0) {
+    dirs_parent = argv[argi + 1];
+    argi += 2;
   }
 
   const char ** roots = (const char **)&argv[argi];
@@ -105,6 +110,20 @@ main(int argc, char ** argv)
   db_query_artists(db, &names, &nn);
   printf("artists -> %zu name(s), corrupt=%d\n", nn, db_is_corrupt(db));
   db_names_free(names, nn);
+
+  /* db_query_dirs against whatever parent the caller named, so the
+     Directory view's query can be exercised on paths containing GLOB
+     metacharacters without a TUI. */
+  if (dirs_parent != NULL) {
+    char ** dirs = NULL;
+    size_t  nd = 0;
+    db_query_dirs(db, dirs_parent, &dirs, &nd);
+    printf("dirs under \"%s\" -> %zu:\n", dirs_parent, nd);
+    for (size_t i = 0; i < nd; i++) {
+      printf("  %s\n", dirs[i]);
+    }
+    db_names_free(dirs, nd);
+  }
 
   db_close(db);
   return 0;
