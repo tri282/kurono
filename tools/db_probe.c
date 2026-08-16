@@ -108,7 +108,7 @@ main(int argc, char ** argv)
   char ** names = NULL;
   size_t  nn = 0;
   db_query_artists(db, &names, &nn);
-  printf("artists -> %zu name(s), corrupt=%d\n", nn, db_is_corrupt(db));
+  printf("artists -> %zu name(s), corrupt=%d, truncated=%d\n", nn, db_is_corrupt(db), db_result_truncated(db));
   db_names_free(names, nn);
 
   /* db_query_dirs against whatever parent the caller named, so the
@@ -118,7 +118,7 @@ main(int argc, char ** argv)
     char ** dirs = NULL;
     size_t  nd = 0;
     db_query_dirs(db, dirs_parent, &dirs, &nd);
-    printf("dirs under \"%s\" -> %zu:\n", dirs_parent, nd);
+    printf("dirs under \"%s\" -> %zu, truncated=%d\n", dirs_parent, nd, db_result_truncated(db));
     for (size_t i = 0; i < nd; i++) {
       printf("  %s\n", dirs[i]);
     }

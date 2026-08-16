@@ -98,6 +98,7 @@ struct Db {
   sqlite3_stmt * query_track_by_id;
   sqlite3_stmt * query_search;
   int            corrupt;
+  int            truncated;
 };
 
 typedef enum { DB_STATE_OK, DB_STATE_CORRUPT, DB_STATE_ERROR } DbOpenState;
@@ -124,6 +125,18 @@ db_reset(Db * db, sqlite3_stmt * stmt)
   if (rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB) {
     db->corrupt = 1;
   }
+
+  /* SQLITE_NOMEM is the other half of the truncation story. The drain
+     helpers latch their own realloc/strdup failures, but SQLite can run
+     out of memory inside the statement -- building the temp B-tree for
+     a DISTINCT, say -- and that surfaces only as a terminal code, with
+     the drain seeing a short row sequence and no error. Measured: a
+     query returning one row returns zero under a capped allocator. Both
+     halves mean the same thing to the caller, so both set the same
+     flag. */
+  if (rc == SQLITE_NOMEM) {
+    db->truncated = 1;
+  }
 } /* db_reset */
 
 /*
@@ -134,6 +147,15 @@ db_is_corrupt(Db * db)
 {
   return (db != NULL) ? db->corrupt : 0;
 } /* db_is_corrupt */
+
+/*
+ * db_result_truncated: see include/library/db.h.
+ */
+int
+db_result_truncated(Db * db)
+{
+  return (db != NULL) ? db->truncated : 0;
+} /* db_result_truncated */
 
 /*
  * strdup_or_null: strdup(s), or NULL if s is NULL. A failed strdup is
@@ -801,11 +823,14 @@ rows_from_stmt(Db * db, sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * ou
   size_t       n = 0, cap = 0;
   int          rc;
 
+  db->truncated = 0;
+
   while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     if (n == cap) {
       size_t       new_cap = (cap == 0) ? 16 : cap * 2;
       DbTrackRow * grown = realloc(rows, new_cap * sizeof(*rows));
       if (grown == NULL) {
+        db->truncated = 1;
         break;
       }
       rows = grown;
@@ -833,6 +858,8 @@ names_from_stmt(Db * db, sqlite3_stmt * stmt, char *** out_names, size_t * out_n
   char ** names = NULL;
   size_t  n = 0, cap = 0;
 
+  db->truncated = 0;
+
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     const char * txt = (const char *)sqlite3_column_text(stmt, 0);
     if (txt == NULL) {
@@ -842,6 +869,7 @@ names_from_stmt(Db * db, sqlite3_stmt * stmt, char *** out_names, size_t * out_n
       size_t new_cap = (cap == 0) ? 16 : cap * 2;
       char ** grown = realloc(names, new_cap * sizeof(*names));
       if (grown == NULL) {
+        db->truncated = 1;
         break;
       }
       names = grown;
@@ -849,6 +877,7 @@ names_from_stmt(Db * db, sqlite3_stmt * stmt, char *** out_names, size_t * out_n
     }
     char * copy = strdup(txt);
     if (copy == NULL) {
+      db->truncated = 1;
       break;
     }
     names[n++] = copy;
