@@ -578,6 +578,71 @@ decoder_create(const SessionFormat * fmt)
   return src;
 } /* decoder_create */
 
+/*
+ * decoder_probe: see include/audio/decoder.h.
+ */
+int
+decoder_probe(const char * path, StreamInfo * out_info)
+{
+  if (path == NULL || out_info == NULL) {
+    return AVERROR(EINVAL);
+  }
+  memset(out_info, 0, sizeof(*out_info));
+
+  /* Same reason decoder_create does it, and this path needs it
+     independently: the scan probes thousands of files without ever
+     constructing an AudioSource, and libav* writes to stderr unbidden
+     ("timescale not set" on m4a, among others). Harmless while the
+     startup scan owns stderr, fatal to the display on the ACT_RESCAN
+     path where the TUI already holds the terminal. Global ffmpeg state,
+     so setting it here as well is idempotent. */
+  av_log_set_level(AV_LOG_QUIET);
+
+  AVFormatContext * fmt_ctx = NULL;
+  int ret = avformat_open_input(&fmt_ctx, path, NULL, NULL);
+  if (ret < 0) {
+    return ret;
+  }
+
+  ret = avformat_find_stream_info(fmt_ctx, NULL);
+  if (ret < 0) {
+    goto done;
+  }
+
+  ret = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+  if (ret < 0) {
+    goto done;
+  }
+
+  AVStream *          stream = fmt_ctx->streams[ret];
+  AVCodecParameters * par = stream->codecpar;
+
+  if (fmt_ctx->duration != (int64_t) AV_NOPTS_VALUE) {
+    out_info->duration_ms = av_rescale_q(fmt_ctx->duration, AV_TIME_BASE_Q,
+                                          (AVRational) { 1, 1000 });
+  } else if (stream->duration != (int64_t) AV_NOPTS_VALUE) {
+    out_info->duration_ms = av_rescale_q(stream->duration, stream->time_base,
+                                          (AVRational) { 1, 1000 });
+  }
+
+  /* Same codec-then-container fallback decoder_open_impl uses: lossless
+     codecs commonly report no codec-level bit rate at all. */
+  out_info->bitrate = par->bit_rate;
+  if (out_info->bitrate <= 0) {
+    out_info->bitrate = fmt_ctx->bit_rate;
+  }
+  out_info->sample_rate = par->sample_rate;
+  out_info->channels    = par->ch_layout.nb_channels;
+  const char * name = avcodec_get_name(par->codec_id);
+  snprintf(out_info->codec, sizeof(out_info->codec), "%s", name != NULL ? name : "?");
+
+  ret = 0;
+
+done:
+  avformat_close_input(&fmt_ctx);
+  return ret;
+} /* decoder_probe */
+
 /* decoder_destroy: see include/audio/decoder.h. */
 void
 decoder_destroy(AudioSource * src)

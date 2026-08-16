@@ -43,6 +43,31 @@ typedef struct {
 AudioSource decoder_create(const SessionFormat * fmt);
 
 /*
+ * decoder_probe: read one file's stream properties without constructing
+ * an AudioSource, opening a codec, or building a resampler. This exists
+ * so library/scan.c can fill the duration_ms/bitrate/sample_rate/
+ * channels/codec half of a track row (DESIGN.md VII.2 -- taglib_c owns
+ * the tag half) without opening an AVFormatContext of its own, which
+ * would put ffmpeg outside audio/decoder.c and break the confinement
+ * rule (CLAUDE.md; DESIGN.md III.2).
+ *
+ * Cheaper than open() on purpose: the scan calls this once per new or
+ * changed file across a whole library, so it stops at the container and
+ * the stream's codec parameters and never calls avcodec_open2. The
+ * consequence is that a file whose header parses but whose codec cannot
+ * actually be opened still probes successfully and gets indexed --
+ * correct, since the browser should list a track it cannot play and
+ * report the failure at play time (DESIGN.md XI.1), not hide it.
+ *
+ * Takes the path and the StreamInfo to fill; returns 0 on success or a
+ * negative AVERROR on any per-file failure -- unreadable, not an audio
+ * file, no audio stream. Never fatal, never exits (DESIGN.md XI.1).
+ * *out_info is zeroed before anything else, so a failed probe leaves it
+ * well-defined rather than stale.
+ */
+int decoder_probe(const char * path, StreamInfo * out_info);
+
+/*
  * decoder_destroy: release everything decoder_create allocated,
  * including any file left open by a prior open() that was never
  * close()d. Idempotent-safe to call once; src->self is NULL afterward.

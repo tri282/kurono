@@ -5,6 +5,8 @@
 #include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
+#include "../include/library/db.h"
+#include "../include/library/scan.h"
 #include "../include/queue.h"
 #include "../include/ui/browser.h"
 #include "../include/ui/keymap.h"
@@ -656,6 +658,10 @@ typedef struct {
      allocation story for transient UI strings yet. */
   char message[128];
   int  ui;                   /* 1 when this run drives the TUI (phase 11) */
+
+  /* The library index. Opened at startup step 3 and closed at teardown
+     step 7, so it outlives every other subsystem that might query it. */
+  Db * db;
 } Player;
 
 /*
@@ -2543,7 +2549,11 @@ shutdown_all(Player * p)
   engine_destroy(p->e);
   p->e = NULL;
 
-  /* 7. sqlite3_finalize / sqlite3_close_v2 -- phase 13. */
+  /* 7. Every prepared statement finalised, then sqlite3_close_v2. After
+        step 5 T2 is joined, so nothing can still be querying the index
+        -- which is why this sits here and not earlier. */
+  db_close(p->db);
+  p->db = NULL;
 
   /* 8. tb_shutdown. After it, and only after it, may stderr be written
         again -- which is exactly why step 10's trace drain and summary
@@ -2687,6 +2697,25 @@ player_loop(Player * p)
 } /* player_loop */
 
 /*
+ * scan_progress_stderr: the startup scan's progress sink. Legal only
+ * because startup step 4 runs before tui_init claims the terminal
+ * (DESIGN.md IV.9.a) -- ACT_RESCAN supplies a status-bar repaint
+ * instead, which is the whole reason ScanProgressFn is a callback and
+ * not a hardcoded printf. Carriage return with no newline so a scan of
+ * five thousand files is one line, not five thousand; the final newline
+ * comes from the caller once the scan returns. Takes the unused ctx,
+ * the counts, and the path just handled; returns nothing.
+ */
+static void
+scan_progress_stderr(void * ctx, int done, int total, const char * path)
+{
+  (void) ctx;
+  (void) path;
+  fprintf(stderr, "\rkurono: scanning %d/%d", done, total);
+  fflush(stderr);
+} /* scan_progress_stderr */
+
+/*
  * player_start: DESIGN.md IV.9.a steps 1-7, shared by every kind of run.
  * Extracted in phase 11 because bare `kurono` and --play now both need
  * them and a second transcription of the startup order is exactly the
@@ -2730,10 +2759,53 @@ player_start(Player * p, const char * who, int * have_device)
     return -1;
   }
 
-  /* Step 3: db_open -- phase 13.
-     Step 4: scan_run -- phase 14. This is the last point at which stderr
-     may be written on a TUI run; tui_init is step 9, and everything after
-     it reports through player_report instead. */
+  /* Step 3: db_open. Never returns NULL -- every failure inside is
+     either self-healing (corruption unlinks and rebuilds) or fatal via
+     kurono_die (a database written by a newer kurono). A cleared index
+     is reported through rescanned, which step 4 treats exactly like a
+     missing database. */
+  const char ** root_paths = malloc(p->cfg.nroots * sizeof(*root_paths));
+  if (root_paths == NULL) {
+    kurono_die("out of memory resolving music roots");
+  }
+  for (size_t i = 0; i < p->cfg.nroots; i++) {
+    root_paths[i] = p->cfg.roots[i].path;
+  }
+
+  int rescanned = 0;
+  p->db = db_open(p->cfg.db_path, root_paths, p->cfg.nroots, &rescanned);
+
+  /* Step 4: scan_run. This is the last point at which stderr may be
+     written on a TUI run; tui_init is step 9, and everything after it
+     reports through player_report instead. KURONO_NO_SCAN skips the
+     walk and uses the index as-is (DESIGN.md X) -- including when
+     rescanned says the index was just cleared, since the flag means
+     "do not walk the tree", not "walk it unless it would be slow". */
+  if (!p->cfg.no_scan) {
+    ScanOpts so = {
+      .roots        = root_paths,
+      .nroots       = p->cfg.nroots,
+      .ignore_names = (const char * const *) p->cfg.ignore,
+      .nignore      = p->cfg.nignore,
+      .on_progress  = scan_progress_stderr,
+      .ctx          = NULL,
+    };
+    int skipped = scan_run(p->db, &so);
+    if (skipped < 0) {
+      /* A transaction-level failure leaves the index exactly as it was,
+         so this is a degraded start, not a fatal one (DESIGN.md XI.7). */
+      fprintf(stderr, "\rkurono: %s: scan failed, using the existing index\n", who);
+    } else {
+      /* Closes the carriage-returned progress line scan_progress_stderr
+         left open. */
+      fprintf(stderr, "\rkurono: scan complete");
+      if (skipped > 0) {
+        fprintf(stderr, ", %d file(s) skipped", skipped);
+      }
+      fputc('\n', stderr);
+    }
+  }
+  free(root_paths);
 
   /* Step 5: sink_open. ma_context_init and ma_device_init with the
      notification callback set, but NOT ma_device_start. The pipe's write
@@ -2747,6 +2819,8 @@ player_start(Player * p, const char * who, int * have_device)
     fprintf(stderr, "kurono: %s: sink open failed\n", who);
     if (sink_alloc_default_rings(&p->fmt) != 0) {
       fprintf(stderr, "kurono: %s: ring allocation failed\n", who);
+      db_close(p->db);
+      p->db = NULL;
       config_free(&p->cfg);
       event_destroy(p->el);
       p->el = NULL;
@@ -2770,6 +2844,8 @@ player_start(Player * p, const char * who, int * have_device)
     fprintf(stderr, "kurono: %s: engine_create failed\n", who);
     p->sink.close(p->sink.self);
     sink_free_rings();
+    db_close(p->db);
+    p->db = NULL;
     config_free(&p->cfg);
     event_destroy(p->el);
     p->el = NULL;
@@ -2782,6 +2858,8 @@ player_start(Player * p, const char * who, int * have_device)
     sink_free_rings(); /* T2 never started, so nothing can still reach them */
     engine_destroy(p->e);
     p->e = NULL;
+    db_close(p->db);
+    p->db = NULL;
     config_free(&p->cfg);
     event_destroy(p->el);
     p->el = NULL;
@@ -3139,6 +3217,62 @@ run_tui(void)
 } /* run_tui */
 
 /*
+ * run_scan: implements --scan. Opens the database, walks every root
+ * with the stderr progress printer, closes, and exits -- no device, no
+ * threads, no terminal. This is phase 14's primary verification surface
+ * and it drives exactly the code path startup steps 3 and 4 use, which
+ * is the point: a scan bug reproduces here without a TUI in the way.
+ * KURONO_NO_SCAN is deliberately ignored, since asking for --scan is
+ * asking for the walk. Takes nothing, returns the process exit status:
+ * 0 if the scan committed, 1 if it did not. Files skipped are reported
+ * but do not fail the run (DESIGN.md XI.1).
+ */
+static int
+run_scan(void)
+{
+  Config cfg;
+  if (config_init(&cfg) != 0) {
+    kurono_die("failed to initialize configuration");
+  }
+
+  const char ** root_paths = malloc(cfg.nroots * sizeof(*root_paths));
+  if (root_paths == NULL) {
+    kurono_die("out of memory resolving music roots");
+  }
+  for (size_t i = 0; i < cfg.nroots; i++) {
+    root_paths[i] = cfg.roots[i].path;
+  }
+
+  int  rescanned = 0;
+  Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
+
+  ScanOpts so = {
+    .roots        = root_paths,
+    .nroots       = cfg.nroots,
+    .ignore_names = (const char * const *) cfg.ignore,
+    .nignore      = cfg.nignore,
+    .on_progress  = scan_progress_stderr,
+    .ctx          = NULL,
+  };
+  int skipped = scan_run(db, &so);
+
+  if (skipped < 0) {
+    fprintf(stderr, "\rkurono: --scan: scan failed, index unchanged\n");
+  } else {
+    fprintf(stderr, "\rkurono: scan complete");
+    if (skipped > 0) {
+      fprintf(stderr, ", %d file(s) skipped", skipped);
+    }
+    fputc('\n', stderr);
+  }
+
+  db_close(db);
+  free(root_paths);
+  config_free(&cfg);
+  return (skipped < 0) ? 1 : 0;
+} /* run_scan */
+
+/*
  * Entry point. Handles --version by printing "kurono <version>" to
  * stdout and returning 0 immediately -- no trace lifecycle, nothing
  * runs. Every other invocation is wrapped in the trace ring's lifetime
@@ -3193,6 +3327,9 @@ main(int argc, char * argv[])
     print_paths(&cfg);
     config_free(&cfg);
     status = 0;
+
+  } else if (argc == 2 && strcmp(argv[1], "--scan") == 0) {
+    status = run_scan();
 
   } else if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
     /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
