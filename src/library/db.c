@@ -97,9 +97,43 @@ struct Db {
   sqlite3_stmt * query_tracks_in_dir;
   sqlite3_stmt * query_track_by_id;
   sqlite3_stmt * query_search;
+  int            corrupt;
 };
 
 typedef enum { DB_STATE_OK, DB_STATE_CORRUPT, DB_STATE_ERROR } DbOpenState;
+
+/*
+ * db_reset: reset `stmt` and latch corruption. sqlite3_reset returns the
+ * error code of the statement's most recent sqlite3_step, which is the
+ * only place the query paths in this file can observe SQLITE_CORRUPT --
+ * they all drain with `while (step == SQLITE_ROW)` and report a
+ * non-ROW terminal code as zero rows (DESIGN.md XI.7, deliberately: a
+ * query degrades, it does not abort). Without this latch the degrade is
+ * silent and a database that corrupts after open presents as a
+ * permanently empty library, leaving DESIGN.md XI.4's unlink-and-rebuild
+ * unreachable. The flag is sticky: once set it is never cleared, since
+ * the handle it describes is not recoverable in place. Every query and
+ * write path in this file routes its reset through here, so there is no
+ * statement whose corruption goes unseen.
+ */
+static void
+db_reset(Db * db, sqlite3_stmt * stmt)
+{
+  int rc = sqlite3_reset(stmt);
+
+  if (rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB) {
+    db->corrupt = 1;
+  }
+} /* db_reset */
+
+/*
+ * db_is_corrupt: see include/library/db.h.
+ */
+int
+db_is_corrupt(Db * db)
+{
+  return (db != NULL) ? db->corrupt : 0;
+} /* db_is_corrupt */
 
 /*
  * strdup_or_null: strdup(s), or NULL if s is NULL. A failed strdup is
@@ -273,8 +307,20 @@ init_schema(sqlite3 * conn)
     }
 
     const unsigned char * txt = sqlite3_column_text(stmt, 0);
-    long version = (txt != NULL) ? strtol((const char *)txt, NULL, 10) : 0;
+    char *                end = NULL;
+    long                  version = (txt != NULL) ? strtol((const char *)txt, &end, 10) : 0;
+    int                   parsed = (txt != NULL) && (end != (const char *)txt) && (*end == '\0');
     sqlite3_finalize(stmt);
+
+    /* A schema_version that is absent, unparsable, or below the first
+       version this file ever wrote is not a version this build can
+       migrate from -- it is a value apply_schema cannot have produced.
+       Same class as the missing-row case above, so it routes to the
+       same unlink-and-rebuild rather than dying with "cannot migrate"
+       on a derived cache that self-heals (DESIGN.md XI.4). */
+    if (!parsed || version < 1) {
+      return DB_STATE_CORRUPT;
+    }
 
     if (version > KURONO_SCHEMA_VERSION) {
       kurono_die("database written by a newer kurono (schema_version %ld, this build understands %d)",
@@ -550,7 +596,7 @@ char *
 db_meta_get(Db * db, const char * key)
 {
   sqlite3_stmt * stmt = db->meta_get;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
 
@@ -558,7 +604,7 @@ db_meta_get(Db * db, const char * key)
   if (sqlite3_step(stmt) == SQLITE_ROW) {
     out = strdup_or_null((const char *)sqlite3_column_text(stmt, 0));
   }
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return out;
 } /* db_meta_get */
 
@@ -569,13 +615,13 @@ int
 db_meta_set(Db * db, const char * key, const char * value)
 {
   sqlite3_stmt * stmt = db->meta_set;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
 
   int rc = sqlite3_step(stmt);
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return (rc == SQLITE_DONE) ? 0 : -1;
 } /* db_meta_set */
 
@@ -586,14 +632,14 @@ int
 db_track_unchanged(Db * db, const char * path, int64_t mtime, int64_t size)
 {
   sqlite3_stmt * stmt = db->track_unchanged;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, mtime);
   sqlite3_bind_int64(stmt, 3, size);
 
   int rc = sqlite3_step(stmt);
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   if (rc == SQLITE_ROW) {
     return 1;
   }
@@ -610,13 +656,13 @@ int
 db_track_touch(Db * db, const char * path, int64_t gen)
 {
   sqlite3_stmt * stmt = db->track_touch;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_int64(stmt, 1, gen);
   sqlite3_bind_text(stmt, 2, path, -1, SQLITE_TRANSIENT);
 
   int rc = sqlite3_step(stmt);
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return (rc == SQLITE_DONE) ? 0 : -1;
 } /* db_track_touch */
 
@@ -627,7 +673,7 @@ int
 db_track_upsert(Db * db, const DbTrackWrite * t)
 {
   sqlite3_stmt * stmt = db->track_upsert;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
 
   sqlite3_bind_text(stmt, 1, t->path, -1, SQLITE_TRANSIENT);
@@ -650,7 +696,7 @@ db_track_upsert(Db * db, const DbTrackWrite * t)
   sqlite3_bind_int64(stmt, 18, t->scan_gen);
 
   int rc = sqlite3_step(stmt);
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return (rc == SQLITE_DONE) ? 0 : -1;
 } /* db_track_upsert */
 
@@ -661,12 +707,12 @@ int
 db_tracks_sweep(Db * db, int64_t gen)
 {
   sqlite3_stmt * stmt = db->tracks_sweep;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_int64(stmt, 1, gen);
 
   int rc = sqlite3_step(stmt);
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return (rc == SQLITE_DONE) ? 0 : -1;
 } /* db_tracks_sweep */
 
@@ -736,7 +782,7 @@ row_from_stmt(sqlite3_stmt * stmt, DbTrackRow * row)
  * Always resets `stmt` before returning. Always returns 0.
  */
 static int
-rows_from_stmt(sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * out_n)
+rows_from_stmt(Db * db, sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * out_n)
 {
   DbTrackRow * rows = NULL;
   size_t       n = 0, cap = 0;
@@ -757,7 +803,7 @@ rows_from_stmt(sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * out_n)
   }
   (void)rc;
 
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   *out_rows = rows;
   *out_n = n;
   return 0;
@@ -769,7 +815,7 @@ rows_from_stmt(sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * out_n)
  * policy as rows_from_stmt. Always returns 0.
  */
 static int
-names_from_stmt(sqlite3_stmt * stmt, char *** out_names, size_t * out_n)
+names_from_stmt(Db * db, sqlite3_stmt * stmt, char *** out_names, size_t * out_n)
 {
   char ** names = NULL;
   size_t  n = 0, cap = 0;
@@ -795,7 +841,7 @@ names_from_stmt(sqlite3_stmt * stmt, char *** out_names, size_t * out_n)
     names[n++] = copy;
   }
 
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   *out_names = names;
   *out_n = n;
   return 0;
@@ -808,10 +854,10 @@ int
 db_query_dirs(Db * db, const char * parent, char *** out_names, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_dirs;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, parent, -1, SQLITE_TRANSIENT);
-  return names_from_stmt(stmt, out_names, out_n);
+  return names_from_stmt(db, stmt, out_names, out_n);
 } /* db_query_dirs */
 
 /*
@@ -821,8 +867,8 @@ int
 db_query_artists(Db * db, char *** out_names, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_artists;
-  sqlite3_reset(stmt);
-  return names_from_stmt(stmt, out_names, out_n);
+  db_reset(db, stmt);
+  return names_from_stmt(db, stmt, out_names, out_n);
 } /* db_query_artists */
 
 /*
@@ -832,8 +878,8 @@ int
 db_query_album_artists(Db * db, char *** out_names, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_album_artists;
-  sqlite3_reset(stmt);
-  return names_from_stmt(stmt, out_names, out_n);
+  db_reset(db, stmt);
+  return names_from_stmt(db, stmt, out_names, out_n);
 } /* db_query_album_artists */
 
 /*
@@ -843,10 +889,10 @@ int
 db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_albums_for;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
-  return names_from_stmt(stmt, out_names, out_n);
+  return names_from_stmt(db, stmt, out_names, out_n);
 } /* db_query_albums_for */
 
 /*
@@ -857,11 +903,11 @@ db_query_tracks_for_album(Db * db, const char * album_artist, const char * album
                            DbTrackRow ** out_rows, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_tracks_for_album;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, album_artist, -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 2, album, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_tracks_for_album */
 
 /*
@@ -871,10 +917,10 @@ int
 db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_tracks_in_dir;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_tracks_in_dir */
 
 /*
@@ -884,7 +930,7 @@ int
 db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row)
 {
   sqlite3_stmt * stmt = db->query_track_by_id;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_int64(stmt, 1, id);
 
@@ -894,7 +940,7 @@ db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row)
     row_from_stmt(stmt, out_row);
     found = 1;
   }
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   return found;
 } /* db_query_track_by_id */
 
@@ -905,10 +951,10 @@ int
 db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size_t * out_n)
 {
   sqlite3_stmt * stmt = db->query_search;
-  sqlite3_reset(stmt);
+  db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, match_string, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_search */
 
 /*

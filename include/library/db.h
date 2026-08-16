@@ -122,6 +122,21 @@ Db * db_open(const char * db_path, const char * const * roots, size_t nroots, in
  */
 void db_close(Db * db);
 
+/*
+ * db_is_corrupt: 1 once any statement on this handle has terminated
+ * with SQLITE_CORRUPT or SQLITE_NOTADB, 0 otherwise. Every query in
+ * this file degrades a database error to zero results rather than
+ * reporting it (DESIGN.md XI.7), which is right for the caller's
+ * control flow but would otherwise make post-open corruption invisible
+ * -- the library would simply appear empty forever. This flag is how
+ * T1 sees it: queries keep returning empty so the UI stays alive, and
+ * the caller decides when to close, unlink, and rebuild (DESIGN.md
+ * XI.4). Sticky -- never cleared, since the handle is not recoverable
+ * in place. Corruption found at open is handled inside db_open and
+ * never reaches this flag.
+ */
+int db_is_corrupt(Db * db);
+
 /* db_begin / db_commit / db_rollback: wrap BEGIN / COMMIT / ROLLBACK. Return 0 on success, -1 on error. */
 int db_begin(Db * db);
 int db_commit(Db * db);
