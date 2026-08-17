@@ -56,10 +56,15 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # are confined to this one file. main.c calls db_open at startup step 3
 # and db_close at teardown step 7 as of phase 14.
 # src/library/scan.c (phase 14): the filesystem walk.
+# src/library/query.c (phase 15): the two transforms between db.c's rows
+# and what a view can show -- the directory collapse and the FTS5 MATCH
+# string builder. Pure: no database handle, no SQLite header, so it also
+# links standalone into tools/fts_query_test. main.c's --search and
+# --dirs are its callers until ui/browser.c in phase 16.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
        src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c \
-       src/library/db.c src/library/scan.c
+       src/library/db.c src/library/scan.c src/library/query.c
 
 # Sources that exist and must be statically analysed, but are not yet
 # linked into the kurono binary. Move each entry into SRCS when its
@@ -73,8 +78,8 @@ OBJS_ASAN    = $(SRCS:src/%.c=build/asan/%.o)
 OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
-        check-theme check-deps ring-stress queue-test keymap-test install \
-        uninstall clean
+        check-theme check-deps ring-stress queue-test keymap-test \
+        fts-query-test install uninstall clean
 
 all: kurono
 
@@ -263,6 +268,25 @@ tools/keymap_test: build/default/tools/keymap_test.o build/default/ui/keymap.o \
                    build/default/ui/theme.o
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
+# phase-15-query.md I.5. src/library/query.c is pure and takes no
+# database handle, so the transforms link against libc alone -- but this
+# test binary deliberately does link sqlite3, because its second mode
+# feeds every generated MATCH string to a real FTS5 parser and asserts
+# it does not error. That property is the entire reason the transform
+# exists and nothing but FTS5 itself can check it. The database is
+# :memory:, so the mode needs no scratch path and leaves nothing behind;
+# `./tools/fts_query_test --pure` skips it. The object gets its own rule
+# rather than the tools/%.o pattern above because it is the only one
+# here that includes a pkg-config-provided header.
+fts-query-test: tools/fts_query_test
+
+tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library/query.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(shell pkg-config --libs sqlite3)
+
+build/default/tools/fts_query_test.o: tools/fts_query_test.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
+
 install: release
 	install -d $(BINDIR)
 	install -m 755 kurono $(BINDIR)/kurono
@@ -272,4 +296,4 @@ uninstall:
 
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
-	       tools/queue_test tools/keymap_test
+	       tools/queue_test tools/keymap_test tools/fts_query_test

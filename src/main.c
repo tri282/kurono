@@ -6,6 +6,7 @@
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
 #include "../include/library/db.h"
+#include "../include/library/query.h"
 #include "../include/library/scan.h"
 #include "../include/queue.h"
 #include "../include/ui/browser.h"
@@ -3273,6 +3274,139 @@ run_scan(void)
 } /* run_scan */
 
 /*
+ * run_search: implements --search STR. Opens the database read-only in
+ * effect (it runs no scan), transforms the raw argument through
+ * query_build_match, runs db_query_search, and prints one line per row.
+ * Takes the user's raw search text, returns the process exit status: 0
+ * unless the database could not be opened. Zero rows is a successful
+ * run, and so is a match string FTS5 rejects -- DESIGN.md V.6 warns a
+ * residual query error must be shown as "no results", never as a
+ * failure, and db_query_search already applies that policy.
+ *
+ * This is phase 15's verification surface for the transform and the
+ * prepared statement together: the unit tests in tools/fts_query_test.c
+ * prove the string parses, and this proves the string that parses is
+ * also the string that finds the track.
+ */
+static int
+run_search(const char * raw)
+{
+  Config cfg;
+  if (config_init(&cfg) != 0) {
+    kurono_die("failed to initialize configuration");
+  }
+
+  const char ** root_paths = malloc(cfg.nroots * sizeof(*root_paths));
+  if (root_paths == NULL) {
+    kurono_die("out of memory resolving music roots");
+  }
+  for (size_t i = 0; i < cfg.nroots; i++) {
+    root_paths[i] = cfg.roots[i].path;
+  }
+
+  int  rescanned = 0;
+  Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
+  if (db == NULL) {
+    fprintf(stderr, "kurono: --search: could not open %s\n", cfg.db_path);
+    free(root_paths);
+    config_free(&cfg);
+    return 1;
+  }
+
+  char * match = query_build_match(raw);
+  if (match == NULL) {
+    kurono_die("out of memory building the search string");
+  }
+  fprintf(stderr, "kurono: MATCH %s\n", match);
+
+  if (match[0] == '\0') {
+    /* No tokens at all. query.h's contract: this is "no search", not a
+       query FTS5 has a spelling for. */
+    fprintf(stderr, "kurono: empty search, 0 result(s)\n");
+  } else {
+    DbTrackRow * rows = NULL;
+    size_t       n    = 0;
+
+    db_query_search(db, match, &rows, &n);
+    for (size_t i = 0; i < n; i++) {
+      printf("%s  --  %s / %s / %s\n",
+             rows[i].path,
+             rows[i].artist ? rows[i].artist : "(no artist)",
+             rows[i].album ? rows[i].album : "(no album)",
+             rows[i].title ? rows[i].title : "(no title)");
+    }
+    fprintf(stderr, "kurono: %zu result(s)%s\n", n,
+            db_result_truncated(db) ? " (truncated: out of memory)" : "");
+    db_track_rows_free(rows, n);
+  }
+
+  free(match);
+  db_close(db);
+  free(root_paths);
+  config_free(&cfg);
+  return 0;
+} /* run_search */
+
+/*
+ * run_dirs: implements --dirs PARENT. Runs db_query_dirs and prints
+ * what query_dirs_collapse makes of it, one immediate child name per
+ * line. Takes the parent directory, returns the process exit status.
+ *
+ * The two halves of the phase 13 split -- db.c matching a prefix range,
+ * query.c parsing the segments -- have no other place where they meet
+ * before the browser does in phase 16. tools/fts_query_test.c covers
+ * the collapse against synthetic paths; this covers it against the
+ * paths db.c actually produces, which is where a disagreement about
+ * trailing slashes or root-level parents would show up.
+ */
+static int
+run_dirs(const char * parent)
+{
+  Config cfg;
+  if (config_init(&cfg) != 0) {
+    kurono_die("failed to initialize configuration");
+  }
+
+  const char ** root_paths = malloc(cfg.nroots * sizeof(*root_paths));
+  if (root_paths == NULL) {
+    kurono_die("out of memory resolving music roots");
+  }
+  for (size_t i = 0; i < cfg.nroots; i++) {
+    root_paths[i] = cfg.roots[i].path;
+  }
+
+  int  rescanned = 0;
+  Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
+  if (db == NULL) {
+    fprintf(stderr, "kurono: --dirs: could not open %s\n", cfg.db_path);
+    free(root_paths);
+    config_free(&cfg);
+    return 1;
+  }
+
+  char ** paths = NULL;
+  size_t  npaths = 0;
+  db_query_dirs(db, parent, &paths, &npaths);
+
+  char ** names = NULL;
+  size_t  nnames = 0;
+  int     truncated = query_dirs_collapse(parent, paths, npaths, &names, &nnames);
+
+  for (size_t i = 0; i < nnames; i++) {
+    printf("%s\n", names[i]);
+  }
+  fprintf(stderr, "kurono: %zu descendant path(s) collapsed to %zu child name(s)%s\n",
+          npaths, nnames, truncated ? " (truncated: out of memory)" : "");
+
+  db_names_free(names, nnames);
+  db_names_free(paths, npaths);
+  db_close(db);
+  free(root_paths);
+  config_free(&cfg);
+  return 0;
+} /* run_dirs */
+
+/*
  * Entry point. Handles --version by printing "kurono <version>" to
  * stdout and returning 0 immediately -- no trace lifecycle, nothing
  * runs. Every other invocation is wrapped in the trace ring's lifetime
@@ -3331,6 +3465,12 @@ main(int argc, char * argv[])
   } else if (argc == 2 && strcmp(argv[1], "--scan") == 0) {
     status = run_scan();
 
+  } else if (argc == 3 && strcmp(argv[1], "--search") == 0) {
+    status = run_search(argv[2]);
+
+  } else if (argc == 3 && strcmp(argv[1], "--dirs") == 0) {
+    status = run_dirs(argv[2]);
+
   } else if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
     /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
        device, ring, and callback with no ffmpeg and no audio file.
@@ -3377,7 +3517,8 @@ main(int argc, char * argv[])
     status = run_tui();
 
   } else {
-    fprintf(stderr, "kurono: usage: kurono [--version | --paths | --tone | "
+    fprintf(stderr, "kurono: usage: kurono [--version | --paths | --scan | "
+                    "--search STR | --dirs PARENT | --tone | "
                     "--decode FILE | --play FILE [...] | "
                     "--dev-latency [N [GAP_MS]]]\n");
     status = 1;
