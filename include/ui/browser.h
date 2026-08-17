@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "../library/db.h"
+
 /*
  * The browser widget and the indirection that keeps it from ever
  * knowing where its rows came from (DESIGN.md XIV.1, phase-12 I.1,
@@ -15,6 +17,24 @@
  * is built now, one phase before the second source exists, rather than
  * retrofitted around a widget that hardcoded opendir in three places.
  */
+
+/*
+ * Which column a load is for. The layout is miller (DESIGN.md VIII.4,
+ * plans/kurono/05-impl/phase-16.md 0.A): one cursor on a path, with the
+ * column to its left showing what contains it and the column to its
+ * right showing what is inside the selection. Only BROWSER_COL_MAIN has
+ * a cursor; the other two are functions of it.
+ *
+ * A source may serve all three identically -- the filesystem source
+ * does -- or answer differently per column. BROWSER_COL_PREVIEW is the
+ * one that usually differs, because its key names a row rather than a
+ * container: the library source answers a track key there with its tag
+ * detail. These live in the header rather than beside their user
+ * because they are part of the source contract, not an internal.
+ */
+#define BROWSER_COL_PARENT  0
+#define BROWSER_COL_MAIN    1
+#define BROWSER_COL_PREVIEW 2
 
 /*
  * BrowserRow: one line in a column. `name` is what is drawn, `key` is
@@ -45,11 +65,26 @@ typedef struct {
  *
  * free_rows() releases what load() produced, including every string.
  * Calling it with n == 0 or rows == NULL is a no-op.
+ *
+ * parent_key() returns a freshly allocated key naming what contains
+ * `key`, or NULL when `key` has no parent -- which is how a source says
+ * "this is the ceiling". The caller frees the result.
+ *
+ * It exists because only the source knows how a key decomposes, the same
+ * argument browser_goto below is built on. Until phase 16 the widget
+ * derived the parent itself with strrchr(key, '/'), which silently
+ * assumed every key is a filesystem path: correct for the one source
+ * that existed, wrong for the library source, and wrong in a way that
+ * produces a listing of the wrong parent rather than an error. It is
+ * also wrong for a path containing a name with a slash in it, which is
+ * why the library source does not encode its keys as synthetic paths --
+ * "AC/DC" is not a hypothetical (plans/kurono/05-impl/phase-16.md 0.C).
  */
 typedef struct {
   int  (* load)(void * self, int column, const char * parent_key,
                 BrowserRow ** out, size_t * n);
   void (* free_rows)(void * self, BrowserRow * rows, size_t n);
+  char * (* parent_key)(void * self, const char * key);
   void * self;
 } BrowserSource;
 
@@ -66,6 +101,41 @@ typedef struct Browser Browser;
  * outlive the source -- it is Config's, which outlives every widget.
  */
 void browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore);
+
+/*
+ * The three views (DESIGN.md VIII.4). They are not screens and not
+ * modes: each is a BrowserSource plus a label, and the widget never
+ * learns which one it is showing. Adding Genres post-v1 is a fourth
+ * entry here, a query, and one Binding row.
+ */
+#define BROWSER_VIEW_DIRECTORY     0
+#define BROWSER_VIEW_ARTISTS       1
+#define BROWSER_VIEW_ALBUM_ARTISTS 2
+#define BROWSER_VIEW_COUNT         3
+
+/*
+ * browser_library_source: the source over library/db.c for one view.
+ * Takes an out-param for the source, the view, the database, and
+ * Config's root array (borrowed, and only consulted at the Directory
+ * view's synthetic top level). One instance per view is kept
+ * internally, so calling this twice for the same view reconfigures that
+ * instance rather than making a second.
+ *
+ * browser_library_root: the key browser_create should be given as its
+ * root for this view -- the synthetic level, except in the Directory
+ * view with exactly one music root, where the root itself is the
+ * ceiling and the level never appears (amendment 01). Returns an owned
+ * key; the caller frees it after browser_create has copied it.
+ *
+ * browser_library_truncated: reads and clears the DESIGN.md XI.7
+ * out-of-memory flag latched by whatever queries have run since the
+ * last call, for the status bar to report. Reading it clears it, so
+ * exactly one caller may drain it.
+ */
+void  browser_library_source(BrowserSource * out, int view, Db * db,
+                             const char * const * roots, size_t nroots);
+char * browser_library_root(int view, const char * const * roots, size_t nroots);
+int    browser_library_truncated(const BrowserSource * src);
 
 /*
  * browser_create / browser_destroy: the widget. `root` is the key the
@@ -130,14 +200,39 @@ int browser_goto(Browser * b, const char * parent_key, const char * row_key);
  */
 void browser_set_viewport(Browser * b, int rows);
 
+/*
+ * browser_refresh_derived: rebuild columns 0 and 2 if the cursor or the
+ * listing moved since the last call. Cheap and idempotent when nothing
+ * changed, so the caller runs it unconditionally once per redraw.
+ *
+ * It is a separate call, and not something the cursor movers do, for
+ * one reason: a held-down arrow key delivers many moves per frame, and
+ * doing the loads inside the move would run a query per keypress
+ * instead of a query per frame (phase-16-browser.md III, "Column
+ * reload"). It is also why the draw accessors below can stay const.
+ */
+void browser_refresh_derived(Browser * b);
+
 /* Read-only accessors for the draw code. browser_row returns NULL for
    an out-of-range index; browser_selection returns NULL on an empty
-   listing. browser_cwd is never NULL. */
+   listing. browser_cwd is never NULL.
+
+   The parent_/preview_ accessors read what browser_refresh_derived
+   last built: both are empty until it has run, and a derived column
+   that failed to load is empty rather than an error. browser_parent_
+   cursor is the index within column 0 of the row the user is inside,
+   which is what the draw code highlights there. */
 size_t             browser_count(const Browser * b);
 size_t             browser_cursor(const Browser * b);
 size_t             browser_scroll(const Browser * b);
 const BrowserRow * browser_row(const Browser * b, size_t i);
 const BrowserRow * browser_selection(const Browser * b);
 const char *       browser_cwd(const Browser * b);
+
+size_t             browser_parent_count(const Browser * b);
+size_t             browser_parent_cursor(const Browser * b);
+const BrowserRow * browser_parent_row(const Browser * b, size_t i);
+size_t             browser_preview_count(const Browser * b);
+const BrowserRow * browser_preview_row(const Browser * b, size_t i);
 
 #endif // KURONO_UI_BROWSER_H

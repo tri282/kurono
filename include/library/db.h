@@ -249,6 +249,16 @@ int db_query_album_artists(Db * db, char *** out_names, size_t * out_n);
 int db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t * out_n);
 
 /*
+ * db_query_albums_for_album_artist: the album_artist twin of the above,
+ * for the Album Artists view. Same shape, different column, and it must
+ * be a different statement: filtering on `artist` returns nothing for a
+ * compilation, whose album_artist ("Various Artists") is usually not any
+ * track's artist. Backed by idx_tracks_album_artist's leading column.
+ */
+int db_query_albums_for_album_artist(Db * db, const char * album_artist,
+                                      char *** out_names, size_t * out_n);
+
+/*
  * db_query_tracks_for_album: every track with this album_artist/album,
  * ordered by disc_no, track_no -- idx_tracks_album_artist(album_artist,
  * album, disc_no, track_no) covers the sort, so no separate ORDER BY
@@ -258,6 +268,16 @@ int db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t
  */
 int db_query_tracks_for_album(Db * db, const char * album_artist, const char * album,
                                DbTrackRow ** out_rows, size_t * out_n);
+
+/*
+ * db_query_tracks_for_artist_album: the `artist` twin of the above, for
+ * the Artists view, which reaches an album through a track's artist
+ * rather than the album's album_artist. Ordered the same way, but
+ * idx_tracks_artist covers only the lookup, so this one sorts -- an
+ * album's worth of rows.
+ */
+int db_query_tracks_for_artist_album(Db * db, const char * artist, const char * album,
+                                      DbTrackRow ** out_rows, size_t * out_n);
 
 /* db_query_tracks_in_dir: every track whose parent_dir equals dir, ordered by path. */
 int db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n);

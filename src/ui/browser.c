@@ -1,7 +1,12 @@
 #include "../../include/ui/browser.h"
 
+#include "../../include/library/db.h"
+#include "../../include/library/query.h"
+
 #include <dirent.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -273,6 +278,39 @@ fs_free_rows(void * self, BrowserRow * rows, size_t n)
 } /* fs_free_rows */
 
 /*
+ * fs_parent_key: the filesystem source's key decomposition -- the
+ * dirname of a path. Takes the key, returns an owned parent key, or NULL
+ * at "/" and for a key with no separator at all.
+ *
+ * This is the logic browser_ascend used to hold inline. Moving it here
+ * changes nothing for this source and is what lets a source whose keys
+ * are not paths exist at all (browser.h, BrowserSource.parent_key).
+ */
+static char *
+fs_parent_key(void * self, const char * key)
+{
+  (void) self;
+
+  if (key == NULL) {
+    return NULL;
+  }
+
+  const char * slash = strrchr(key, '/');
+  if (slash == NULL || slash == key) {
+    return NULL; /* already at "/" or a key with no separator */
+  }
+
+  size_t plen   = (size_t) (slash - key);
+  char * parent = malloc(plen + 1);
+  if (parent == NULL) {
+    return NULL;
+  }
+  memcpy(parent, key, plen);
+  parent[plen] = '\0';
+  return parent;
+} /* fs_parent_key */
+
+/*
  * browser_fs_source: see include/ui/browser.h.
  */
 void
@@ -281,10 +319,597 @@ browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore)
   g_fs_source.ignore  = ignore;
   g_fs_source.nignore = nignore;
 
-  out->load      = fs_load;
-  out->free_rows = fs_free_rows;
-  out->self      = &g_fs_source;
+  out->load       = fs_load;
+  out->free_rows  = fs_free_rows;
+  out->parent_key = fs_parent_key;
+  out->self       = &g_fs_source;
 } /* browser_fs_source */
+
+
+/* ---------------------------------------------------------------------
+ * The library source (phase 16).
+ *
+ * One source serving three views over library/db.c. Everything specific
+ * to a view is chosen at construction and read from LibSource; nothing
+ * in the widget, the draw code, or lib_load's control flow branches on
+ * "which view is this" -- lib_load branches on what a key *is*, which is
+ * a property of the row the user is pointing at, not of the screen.
+ *
+ * Keys are self-describing and length-prefixed, never slash-joined:
+ *
+ *   R                     the top of this view
+ *   D<path>               a directory (Directory view)
+ *   A<len>:<name>         an artist, or an album artist
+ *   B<len>:<a><len>:<alb> an album, qualified by the name above it
+ *   I<id>                 one track, by primary key
+ *
+ * The length prefix is the point. A slash-joined key cannot survive
+ * "AC/DC" or an album called "Live 1/2", and the failure is a listing of
+ * the wrong thing rather than an error -- see
+ * plans/kurono/05-impl/phase-16.md 0.C. Segment text is copied verbatim,
+ * so no character in a tag is special here.
+ * ------------------------------------------------------------------- */
+
+#define LIB_KEY_ROOT   'R'
+#define LIB_KEY_DIR    'D'
+#define LIB_KEY_NAME   'A'
+#define LIB_KEY_ALBUM  'B'
+#define LIB_KEY_TRACK  'I'
+
+/*
+ * LibSource: one per view. `roots` is Config's array, borrowed, and is
+ * only consulted at the synthetic top level of the Directory view
+ * (amendment 01). `truncated` latches XI.7's out-of-memory signal from
+ * whichever query last ran, for the status bar to drain.
+ */
+typedef struct {
+  Db *   db;
+  int    view;
+  const char * const * roots;
+  size_t nroots;
+  int    truncated;
+} LibSource;
+
+static LibSource g_lib_source[BROWSER_VIEW_COUNT];
+
+/*
+ * seg_len: how many bytes "<len>:<text>" needs for a segment of `n`
+ * bytes. Takes the segment length, returns the encoded length.
+ */
+static size_t
+seg_len(size_t n)
+{
+  char tmp[32];
+  return (size_t) snprintf(tmp, sizeof tmp, "%zu:", n) + n;
+} /* seg_len */
+
+/*
+ * seg_put: write one length-prefixed segment. Takes the write cursor and
+ * the segment, returns the cursor past what it wrote.
+ */
+static char *
+seg_put(char * p, const char * s)
+{
+  size_t n = strlen(s);
+  int    w = snprintf(p, seg_len(n) + 1, "%zu:", n);
+  memcpy(p + w, s, n);
+  return p + w + n;
+} /* seg_put */
+
+/*
+ * seg_get: read one length-prefixed segment. Takes the read cursor and
+ * an out-param for a freshly allocated copy of the segment; returns the
+ * cursor past it, or NULL if the encoding is malformed -- which can only
+ * happen if a key was built by something other than lib_key, so it is
+ * treated as "no such row" rather than diagnosed.
+ */
+static const char *
+seg_get(const char * p, char ** out)
+{
+  char * end = NULL;
+  unsigned long n;
+
+  if (p == NULL || *p == '\0') {
+    return NULL;
+  }
+  n = strtoul(p, &end, 10);
+  if (end == p || end == NULL || *end != ':') {
+    return NULL;
+  }
+  end++;
+  if (strlen(end) < n) {
+    return NULL;
+  }
+
+  *out = malloc(n + 1);
+  if (*out == NULL) {
+    return NULL;
+  }
+  memcpy(*out, end, n);
+  (*out)[n] = '\0';
+  return end + n;
+} /* seg_get */
+
+/*
+ * lib_key: build a key of the given kind. Takes the kind and up to two
+ * segments (NULL for unused ones); returns an owned key or NULL on
+ * allocation failure. LIB_KEY_DIR and LIB_KEY_TRACK carry their payload
+ * raw in `a` because neither is composite and neither needs to be split
+ * back apart by anything but strlen.
+ */
+static char *
+lib_key(char kind, const char * a, const char * b)
+{
+  size_t need = 2; /* kind + NUL */
+  char * key;
+  char * p;
+
+  if (kind == LIB_KEY_DIR || kind == LIB_KEY_TRACK) {
+    need += (a != NULL) ? strlen(a) : 0;
+    key = malloc(need);
+    if (key == NULL) {
+      return NULL;
+    }
+    key[0] = kind;
+    strcpy(key + 1, (a != NULL) ? a : "");
+    return key;
+  }
+
+  if (a != NULL) {
+    need += seg_len(strlen(a));
+  }
+  if (b != NULL) {
+    need += seg_len(strlen(b));
+  }
+
+  key = malloc(need);
+  if (key == NULL) {
+    return NULL;
+  }
+  key[0] = kind;
+  p = key + 1;
+  if (a != NULL) {
+    p = seg_put(p, a);
+  }
+  if (b != NULL) {
+    p = seg_put(p, b);
+  }
+  *p = '\0';
+  return key;
+} /* lib_key */
+
+/*
+ * rows_push: append one row, growing the array. Takes the array, its
+ * count and capacity by reference plus the row's three fields (name and
+ * key are taken over on success); returns 0, or -1 having freed the two
+ * strings it was handed, since a caller that cannot append also cannot
+ * keep them.
+ */
+static int
+rows_push(BrowserRow ** rows, size_t * count, size_t * cap,
+          char * name, char * key, int is_dir)
+{
+  if (name == NULL || key == NULL) {
+    free(name);
+    free(key);
+    return -1;
+  }
+  if (*count == *cap) {
+    size_t ncap = (*cap == 0) ? 16 : *cap * 2;
+    BrowserRow * grown = realloc(*rows, ncap * sizeof **rows);
+    if (grown == NULL) {
+      free(name);
+      free(key);
+      return -1;
+    }
+    *rows = grown;
+    *cap  = ncap;
+  }
+  (*rows)[*count].name   = name;
+  (*rows)[*count].key    = key;
+  (*rows)[*count].is_dir = is_dir;
+  (*count)++;
+  return 0;
+} /* rows_push */
+
+/*
+ * track_label: the display name for a track row -- "05  Hunter", or the
+ * title alone when there is no track number, or the path's basename when
+ * there is no title (DESIGN.md XI.1: a missing tag is NULL, and the file
+ * still has to be listed). Takes the row, returns an owned string.
+ */
+static char *
+track_label(const DbTrackRow * t)
+{
+  const char * title = t->title;
+  char         buf[512];
+
+  if (title == NULL) {
+    const char * slash = (t->path != NULL) ? strrchr(t->path, '/') : NULL;
+    title = (slash != NULL) ? slash + 1 : ((t->path != NULL) ? t->path : "(untitled)");
+  }
+
+  if (t->has_track_no) {
+    snprintf(buf, sizeof buf, "%2" PRId64 "  %s", t->track_no, title);
+    return strdup(buf);
+  }
+  return strdup(title);
+} /* track_label */
+
+/*
+ * push_tracks: turn a DbTrackRow array into track rows. Takes the
+ * out-array and its bookkeeping plus the query result; returns 0 or -1.
+ * The DbTrackRow array is the caller's to free either way.
+ */
+static int
+push_tracks(BrowserRow ** rows, size_t * count, size_t * cap,
+            const DbTrackRow * tracks, size_t n)
+{
+  char idbuf[32];
+
+  for (size_t i = 0; i < n; i++) {
+    snprintf(idbuf, sizeof idbuf, "%" PRId64, tracks[i].id);
+    if (rows_push(rows, count, cap, track_label(&tracks[i]),
+                  lib_key(LIB_KEY_TRACK, idbuf, NULL), 0) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+} /* push_tracks */
+
+/*
+ * detail_line: one "label  value" row of the tag detail preview. Takes
+ * the out-array bookkeeping, the label and the value (NULL prints as a
+ * dash, since a missing tag is information); returns 0 or -1.
+ */
+static int
+detail_line(BrowserRow ** rows, size_t * count, size_t * cap,
+            const char * label, const char * value)
+{
+  char buf[600];
+
+  snprintf(buf, sizeof buf, "%-9s %s", label, (value != NULL) ? value : "--");
+  return rows_push(rows, count, cap, strdup(buf), strdup(""), 0);
+} /* detail_line */
+
+/*
+ * lib_preview_track: the tag detail of one track, as rows. This is
+ * gap 10's ruling (plans/kurono/05-impl/phase-16.md 0.B): a container
+ * previews as its contents, and a track -- which has none -- previews as
+ * what is known about it. Takes the source, the track id and the
+ * out-array bookkeeping; returns 0 or -1.
+ */
+static int
+lib_preview_track(LibSource * s, int64_t id,
+                  BrowserRow ** rows, size_t * count, size_t * cap)
+{
+  DbTrackRow t;
+  char       buf[128];
+  int        rc = 0;
+
+  if (db_query_track_by_id(s->db, id, &t) != 1) {
+    return 0; /* gone since the listing was built: an empty preview */
+  }
+
+  rc |= detail_line(rows, count, cap, "title", t.title);
+  rc |= detail_line(rows, count, cap, "artist", t.artist);
+  rc |= detail_line(rows, count, cap, "album", t.album);
+  rc |= detail_line(rows, count, cap, "albumart", t.album_artist);
+  rc |= detail_line(rows, count, cap, "genre", t.genre);
+
+  if (t.has_year) {
+    snprintf(buf, sizeof buf, "%" PRId64, t.year);
+    rc |= detail_line(rows, count, cap, "year", buf);
+  }
+  if (t.has_duration_ms) {
+    int64_t sec = t.duration_ms / 1000;
+    snprintf(buf, sizeof buf, "%" PRId64 ":%02" PRId64, sec / 60, sec % 60);
+    rc |= detail_line(rows, count, cap, "length", buf);
+  }
+  if (t.has_sample_rate || t.has_channels || t.codec != NULL) {
+    snprintf(buf, sizeof buf, "%s %" PRId64 " Hz %" PRId64 "ch",
+             (t.codec != NULL) ? t.codec : "?",
+             t.has_sample_rate ? t.sample_rate : 0,
+             t.has_channels ? t.channels : 0);
+    rc |= detail_line(rows, count, cap, "format", buf);
+  }
+  if (t.has_bitrate) {
+    snprintf(buf, sizeof buf, "%" PRId64 " kbps", t.bitrate / 1000);
+    rc |= detail_line(rows, count, cap, "bitrate", buf);
+  }
+  rc |= detail_line(rows, count, cap, "path", t.path);
+
+  db_track_row_free_fields(&t);
+  return rc;
+} /* lib_preview_track */
+
+/*
+ * lib_load_dir: the Directory view's listing for one directory -- the
+ * immediate child directories, then the tracks in it. The children come
+ * from db_query_dirs, which returns descendants at every depth, through
+ * query_dirs_collapse, which is the half of that split ui/ owns.
+ * Takes the source, the directory and the out-array bookkeeping;
+ * returns 0 or -1.
+ */
+static int
+lib_load_dir(LibSource * s, const char * dir,
+             BrowserRow ** rows, size_t * count, size_t * cap)
+{
+  char **      paths = NULL;
+  size_t       npaths = 0;
+  char **      names = NULL;
+  size_t       nnames = 0;
+  DbTrackRow * tracks = NULL;
+  size_t       ntracks = 0;
+  int          rc = 0;
+
+  db_query_dirs(s->db, dir, &paths, &npaths);
+  s->truncated |= db_result_truncated(s->db);
+  s->truncated |= query_dirs_collapse(dir, paths, npaths, &names, &nnames);
+  db_names_free(paths, npaths);
+
+  for (size_t i = 0; i < nnames && rc == 0; i++) {
+    char   child[PATH_MAX];
+    size_t dl = strlen(dir);
+
+    snprintf(child, sizeof child, "%s%s%s", dir,
+             (dl > 0 && dir[dl - 1] == '/') ? "" : "/", names[i]);
+    rc = rows_push(rows, count, cap, strdup(names[i]),
+                   lib_key(LIB_KEY_DIR, child, NULL), 1);
+  }
+  db_names_free(names, nnames);
+  if (rc != 0) {
+    return -1;
+  }
+
+  db_query_tracks_in_dir(s->db, dir, &tracks, &ntracks);
+  s->truncated |= db_result_truncated(s->db);
+  rc = push_tracks(rows, count, cap, tracks, ntracks);
+  db_track_rows_free(tracks, ntracks);
+  return rc;
+} /* lib_load_dir */
+
+/*
+ * lib_load: see BrowserSource.load. Branches on what the key names, not
+ * on which column asked and not on which view it belongs to -- the view
+ * only ever decides *which* query answers "the albums of this name",
+ * which is a two-line difference and not a shape difference.
+ */
+static int
+lib_load(void * self, int column, const char * parent_key,
+         BrowserRow ** out, size_t * n)
+{
+  (void) column;
+
+  LibSource *  s = (LibSource *) self;
+  BrowserRow * rows = NULL;
+  size_t       count = 0, cap = 0;
+  int          rc = 0;
+
+  if (s == NULL || s->db == NULL || parent_key == NULL || out == NULL || n == NULL) {
+    return -1;
+  }
+
+  switch (parent_key[0]) {
+    case LIB_KEY_ROOT: {
+      if (s->view == BROWSER_VIEW_DIRECTORY) {
+        /* Amendment 01's synthetic level. A root that did not resolve is
+           listed and marked, never hidden: a missing mount must be
+           visible. */
+        for (size_t i = 0; i < s->nroots && rc == 0; i++) {
+          rc = rows_push(&rows, &count, &cap, strdup(s->roots[i]),
+                         lib_key(LIB_KEY_DIR, s->roots[i], NULL), 1);
+        }
+      } else {
+        char ** names = NULL;
+        size_t  nn = 0;
+
+        if (s->view == BROWSER_VIEW_ARTISTS) {
+          db_query_artists(s->db, &names, &nn);
+        } else {
+          db_query_album_artists(s->db, &names, &nn);
+        }
+        s->truncated |= db_result_truncated(s->db);
+
+        for (size_t i = 0; i < nn && rc == 0; i++) {
+          rc = rows_push(&rows, &count, &cap, strdup(names[i]),
+                         lib_key(LIB_KEY_NAME, names[i], NULL), 1);
+        }
+        db_names_free(names, nn);
+      }
+      break;
+    }
+
+    case LIB_KEY_DIR:
+      rc = lib_load_dir(s, parent_key + 1, &rows, &count, &cap);
+      break;
+
+    case LIB_KEY_NAME: {
+      char *  name = NULL;
+      char ** albums = NULL;
+      size_t  na = 0;
+
+      if (seg_get(parent_key + 1, &name) == NULL) {
+        return -1;
+      }
+      if (s->view == BROWSER_VIEW_ARTISTS) {
+        db_query_albums_for(s->db, name, &albums, &na);
+      } else {
+        db_query_albums_for_album_artist(s->db, name, &albums, &na);
+      }
+      s->truncated |= db_result_truncated(s->db);
+
+      for (size_t i = 0; i < na && rc == 0; i++) {
+        rc = rows_push(&rows, &count, &cap, strdup(albums[i]),
+                       lib_key(LIB_KEY_ALBUM, name, albums[i]), 1);
+      }
+      db_names_free(albums, na);
+      free(name);
+      break;
+    }
+
+    case LIB_KEY_ALBUM: {
+      char *       name = NULL;
+      char *       album = NULL;
+      const char * p = seg_get(parent_key + 1, &name);
+      DbTrackRow * tracks = NULL;
+      size_t       nt = 0;
+
+      if (p == NULL || seg_get(p, &album) == NULL) {
+        free(name);
+        return -1;
+      }
+      if (s->view == BROWSER_VIEW_ARTISTS) {
+        db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
+      } else {
+        db_query_tracks_for_album(s->db, name, album, &tracks, &nt);
+      }
+      s->truncated |= db_result_truncated(s->db);
+
+      rc = push_tracks(&rows, &count, &cap, tracks, nt);
+      db_track_rows_free(tracks, nt);
+      free(name);
+      free(album);
+      break;
+    }
+
+    case LIB_KEY_TRACK:
+      rc = lib_preview_track(s, (int64_t) strtoll(parent_key + 1, NULL, 10),
+                             &rows, &count, &cap);
+      break;
+
+    default:
+      return -1;
+  }
+
+  if (rc != 0) {
+    rows_free(rows, count);
+    return -1;
+  }
+
+  *out = rows;
+  *n   = count;
+  return 0;
+} /* lib_load */
+
+/*
+ * lib_parent_key: see BrowserSource.parent_key. A track has no parent
+ * that can be browsed into, so it answers NULL and the widget stays put.
+ */
+static char *
+lib_parent_key(void * self, const char * key)
+{
+  LibSource * s = (LibSource *) self;
+
+  if (s == NULL || key == NULL) {
+    return NULL;
+  }
+
+  switch (key[0]) {
+    case LIB_KEY_DIR: {
+      const char * path = key + 1;
+
+      /* A root's parent is the synthetic level, and only when there is
+         one -- with a single root the root is the ceiling and the level
+         does not exist (amendment 01). */
+      for (size_t i = 0; i < s->nroots; i++) {
+        if (strcmp(path, s->roots[i]) == 0) {
+          return (s->nroots > 1) ? lib_key(LIB_KEY_ROOT, NULL, NULL) : NULL;
+        }
+      }
+
+      const char * slash = strrchr(path, '/');
+      if (slash == NULL || slash == path) {
+        return NULL;
+      }
+      {
+        size_t plen   = (size_t) (slash - path);
+        char * parent = malloc(plen + 2);
+        if (parent == NULL) {
+          return NULL;
+        }
+        parent[0] = LIB_KEY_DIR;
+        memcpy(parent + 1, path, plen);
+        parent[plen + 1] = '\0';
+        return parent;
+      }
+    }
+
+    case LIB_KEY_NAME:
+      return lib_key(LIB_KEY_ROOT, NULL, NULL);
+
+    case LIB_KEY_ALBUM: {
+      char * name = NULL;
+      char * parent;
+
+      if (seg_get(key + 1, &name) == NULL) {
+        return NULL;
+      }
+      parent = lib_key(LIB_KEY_NAME, name, NULL);
+      free(name);
+      return parent;
+    }
+
+    default:
+      return NULL; /* the root, a track, or a key we did not write */
+  }
+} /* lib_parent_key */
+
+/*
+ * lib_free_rows: see BrowserSource.free_rows.
+ */
+static void
+lib_free_rows(void * self, BrowserRow * rows, size_t n)
+{
+  (void) self;
+  rows_free(rows, n);
+} /* lib_free_rows */
+
+/*
+ * browser_library_source / browser_library_root / browser_library_truncated:
+ * see include/ui/browser.h.
+ */
+void
+browser_library_source(BrowserSource * out, int view, Db * db,
+                       const char * const * roots, size_t nroots)
+{
+  LibSource * s = &g_lib_source[(view >= 0 && view < BROWSER_VIEW_COUNT) ? view : 0];
+
+  s->db     = db;
+  s->view   = view;
+  s->roots  = roots;
+  s->nroots = nroots;
+
+  out->load       = lib_load;
+  out->free_rows  = lib_free_rows;
+  out->parent_key = lib_parent_key;
+  out->self       = s;
+} /* browser_library_source */
+
+char *
+browser_library_root(int view, const char * const * roots, size_t nroots)
+{
+  if (view == BROWSER_VIEW_DIRECTORY && nroots == 1) {
+    return lib_key(LIB_KEY_DIR, roots[0], NULL);
+  }
+  return lib_key(LIB_KEY_ROOT, NULL, NULL);
+} /* browser_library_root */
+
+int
+browser_library_truncated(const BrowserSource * src)
+{
+  LibSource * s;
+
+  if (src == NULL || src->self == NULL) {
+    return 0;
+  }
+  s = (LibSource *) src->self;
+  if (s->truncated) {
+    s->truncated = 0;
+    return 1;
+  }
+  return 0;
+} /* browser_library_truncated */
 
 /* ---------------------------------------------------------------------
  * The widget.
@@ -321,6 +946,20 @@ struct Browser {
   size_t       cursor;
   size_t       scroll;
   int          viewport;
+
+  /* The two derived columns (DESIGN.md VIII.4's miller layout). Column 1
+     is `rows` above and is the only listing with a cursor; column 0 is
+     what contains it and column 2 is what is inside the selection, so
+     both are functions of (cwd, cursor) and neither is navigable.
+     Rebuilt by browser_refresh_derived, never here: a cursor move sets
+     the flag and the redraw pays for it, so holding a key down costs one
+     pair of loads per frame instead of one per repeat. */
+  BrowserRow * prows;         /* column 0: the parent's listing */
+  size_t       pn;
+  size_t       pcursor;       /* index of cwd within prows, for the highlight */
+  BrowserRow * vrows;         /* column 2: preview of the selection */
+  size_t       vn;
+  int          derived_dirty;
 };
 
 /*
@@ -333,6 +972,12 @@ clamp(Browser * b)
 {
   int vp = (b->viewport < BROWSER_MIN_VIEWPORT) ? BROWSER_MIN_VIEWPORT
                                                 : b->viewport;
+
+  /* Every mutator ends here, which makes this the one place that cannot
+     forget to invalidate the derived columns. A resize also lands here
+     and marks them dirty without needing to -- one wasted pair of loads
+     per resize, against a whole class of stale-column bug. */
+  b->derived_dirty = 1;
 
   if (b->n == 0) {
     b->cursor = 0;
@@ -379,15 +1024,75 @@ load_into(Browser * b, const char * key)
   BrowserRow * rows = NULL;
   size_t       n    = 0;
 
-  if (b->src.load(b->src.self, 0, key, &rows, &n) != 0) {
+  if (b->src.load(b->src.self, BROWSER_COL_MAIN, key, &rows, &n) != 0) {
     return -1;
   }
 
   b->src.free_rows(b->src.self, b->rows, b->n);
   b->rows = rows;
   b->n    = n;
+  b->derived_dirty = 1;
   return 0;
 } /* load_into */
+
+/*
+ * browser_refresh_derived: see include/ui/browser.h. Rebuilds columns 0
+ * and 2 if anything they depend on moved. Takes the Browser, returns
+ * nothing -- a derived column that fails to load is simply empty, which
+ * is the correct rendering of "nothing to show here" and never an error
+ * the user has to dismiss.
+ */
+void
+browser_refresh_derived(Browser * b)
+{
+  if (b == NULL || !b->derived_dirty) {
+    return;
+  }
+  b->derived_dirty = 0;
+
+  /* Column 0: the listing that contains cwd. Absent at the root, which
+     is not a failure -- the column simply draws empty. */
+  b->src.free_rows(b->src.self, b->prows, b->pn);
+  b->prows   = NULL;
+  b->pn      = 0;
+  b->pcursor = 0;
+
+  if (strcmp(b->cwd, b->root) != 0 && b->src.parent_key != NULL) {
+    char * parent = b->src.parent_key(b->src.self, b->cwd);
+    if (parent != NULL) {
+      BrowserRow * rows = NULL;
+      size_t       n    = 0;
+      if (b->src.load(b->src.self, BROWSER_COL_PARENT, parent, &rows, &n) == 0) {
+        b->prows = rows;
+        b->pn    = n;
+        for (size_t i = 0; i < n; i++) {
+          if (strcmp(rows[i].key, b->cwd) == 0) {
+            b->pcursor = i;
+            break;
+          }
+        }
+      }
+      free(parent);
+    }
+  }
+
+  /* Column 2: what is inside the selection. The source decides what
+     that means for a row that is not a container -- the library source
+     answers with tag detail, the filesystem source with nothing. */
+  b->src.free_rows(b->src.self, b->vrows, b->vn);
+  b->vrows = NULL;
+  b->vn    = 0;
+
+  if (b->n > 0 && b->cursor < b->n) {
+    BrowserRow * rows = NULL;
+    size_t       n    = 0;
+    if (b->src.load(b->src.self, BROWSER_COL_PREVIEW, b->rows[b->cursor].key,
+                    &rows, &n) == 0) {
+      b->vrows = rows;
+      b->vn    = n;
+    }
+  }
+} /* browser_refresh_derived */
 
 /*
  * browser_create: see include/ui/browser.h.
@@ -436,6 +1141,8 @@ browser_destroy(Browser * b)
     return;
   }
   b->src.free_rows(b->src.self, b->rows, b->n);
+  b->src.free_rows(b->src.self, b->prows, b->pn);
+  b->src.free_rows(b->src.self, b->vrows, b->vn);
   free(b->root);
   free(b->cwd);
   free(b);
@@ -561,21 +1268,23 @@ browser_ascend(Browser * b)
     return 0; /* the root is the ceiling */
   }
 
-  char * slash = strrchr(b->cwd, '/');
-  if (slash == NULL || slash == b->cwd) {
-    return 0; /* already at "/" or a key with no separator */
-  }
-
-  size_t plen = (size_t) (slash - b->cwd);
-  char * parent = malloc(plen + 1);
+  /* Only the source knows how its keys decompose (browser.h). A NULL
+     here means "no parent", which is also what an allocation failure
+     inside the source looks like -- the two are deliberately not
+     distinguished, because both mean the same thing to the user and the
+     safe direction for either is to stay put. */
+  char * parent = (b->src.parent_key != NULL)
+                    ? b->src.parent_key(b->src.self, b->cwd)
+                    : NULL;
   if (parent == NULL) {
-    return -1;
+    return 0;
   }
-  memcpy(parent, b->cwd, plen);
-  parent[plen] = '\0';
 
-  /* Remember what we are leaving before the rows it lives in go away. */
-  char * leaving = strdup(slash + 1);
+  /* Remember what we are leaving before the rows it lives in go away.
+     The key, not the name: a key identifies a row to its source by
+     construction, while two rows in one listing can share a name (a
+     directory and a symlink to it elsewhere in the tree). */
+  char * leaving = strdup(b->cwd);
   if (leaving == NULL) {
     free(parent);
     return -1;
@@ -593,7 +1302,7 @@ browser_ascend(Browser * b)
   b->scroll = 0;
 
   for (size_t i = 0; i < b->n; i++) {
-    if (strcmp(b->rows[i].name, leaving) == 0) {
+    if (strcmp(b->rows[i].key, leaving) == 0) {
       b->cursor = i;
       break;
     }
@@ -755,3 +1464,45 @@ browser_cwd(const Browser * b)
 {
   return (b == NULL) ? "" : b->cwd;
 } /* browser_cwd */
+
+/*
+ * browser_parent_count / browser_parent_cursor / browser_parent_row /
+ * browser_preview_count / browser_preview_row: see include/ui/browser.h.
+ * The derived columns, as last built by browser_refresh_derived.
+ */
+size_t
+browser_parent_count(const Browser * b)
+{
+  return (b == NULL) ? 0 : b->pn;
+} /* browser_parent_count */
+
+size_t
+browser_parent_cursor(const Browser * b)
+{
+  return (b == NULL) ? 0 : b->pcursor;
+} /* browser_parent_cursor */
+
+const BrowserRow *
+browser_parent_row(const Browser * b, size_t i)
+{
+  if (b == NULL || i >= b->pn) {
+    return NULL;
+  }
+  return &b->prows[i];
+} /* browser_parent_row */
+
+size_t
+browser_preview_count(const Browser * b)
+{
+  return (b == NULL) ? 0 : b->vn;
+} /* browser_preview_count */
+
+const BrowserRow *
+browser_preview_row(const Browser * b, size_t i)
+{
+  if (b == NULL || i >= b->vn) {
+    return NULL;
+  }
+  return &b->vrows[i];
+} /* browser_preview_row */
+

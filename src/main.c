@@ -569,8 +569,21 @@ typedef struct {
   Engine *      e;
   EventLoop *   el;
 
-  BrowserSource   brsrc;
-  Browser *       br;                /* NULL on every headless run */
+  /* One source and one Browser per view (DESIGN.md VIII.4). `br` is the
+     active view's widget and is what every navigation action and the
+     draw code touch, so nothing below the view switch knows views
+     exist. Each view keeps its own cursor by construction: switching
+     away and back restores position because the widget was never torn
+     down (phase-16-browser.md I.2). */
+  /* Borrowed by every library source for the lifetime of the run: the
+     source keeps the pointer rather than copying (browser.h), so this
+     array must outlive the browsers, not the construction block that
+     builds it. */
+  const char **   rootv;
+  BrowserSource   brsrc[BROWSER_VIEW_COUNT];
+  Browser *       brv[BROWSER_VIEW_COUNT];
+  int             view;              /* index into brv, the active view */
+  Browser *       br;                /* == brv[view]; NULL on every headless run */
   Queue *         q;                 /* NULL on every headless run */
 
   /* The playing track, for the status bar. A copy of the basename
@@ -797,6 +810,38 @@ action_dispatch(Action a, int32_t arg)
     player_report(p, "confirm: nothing to confirm yet");
     tui_mark_dirty();
     return;
+  }
+
+  /* View switching sits above the browser guard on purpose: if one
+     view failed to build, the others are still reachable, and being
+     stranded in a dead view with no way out is worse than the failure
+     that caused it. */
+  switch (a) {
+    case ACT_VIEW_NEXT:
+    case ACT_VIEW_PREV:
+    case ACT_VIEW_SET: {
+      /* A view switch is an index change and nothing else: each view's
+         widget keeps running, so its cursor, scroll and depth are
+         exactly where they were left (phase-16-browser.md I.2). */
+      int next;
+      if (a == ACT_VIEW_SET) {
+        next = arg;
+      } else {
+        int step = (a == ACT_VIEW_NEXT) ? 1 : BROWSER_VIEW_COUNT - 1;
+        next = (p->view + step) % BROWSER_VIEW_COUNT;
+      }
+
+      if (next < 0 || next >= BROWSER_VIEW_COUNT || p->brv[next] == NULL) {
+        player_report(p, "view unavailable");
+      } else {
+        p->view = next;
+        p->br   = p->brv[next];
+      }
+      tui_mark_dirty();
+      return;
+    }
+    default:
+      break;
   }
 
   /* Navigation. Every one of these is a pure cursor move inside
@@ -2478,7 +2523,22 @@ player_repaint(Player * p)
   m.paused      = (p->play == PLAY_PAUSED);
   m.volume_pct  = p->vol_pct;
   m.muted       = p->muted;
+  /* The one place the derived columns are rebuilt: once per repaint,
+     never in a cursor action. Holding a movement key therefore costs one
+     pair of loads per frame rather than one per repeat
+     (phase-16-browser.md III, "Column reload"). */
+  browser_refresh_derived(p->br);
   m.browser     = p->br;
+  m.view        = p->view;
+  m.music_dir   = (p->cfg.nroots > 0) ? p->cfg.roots[0].path : NULL;
+
+  /* DESIGN.md XI.7: a result set that ran out of memory is reported and
+     rendered, never aborted. Drained here because the repaint is the
+     one place that runs after every query. */
+  if (p->br != NULL && browser_library_truncated(&p->brsrc[p->view])) {
+    player_report(p, "out of memory, result truncated");
+    m.message = (p->message[0] != '\0') ? p->message : NULL;
+  }
   if (p->q != NULL) {
     m.shuffle = queue_shuffle(p->q);
     m.repeat  = (int) queue_repeat(p->q);
@@ -2575,7 +2635,15 @@ shutdown_all(Player * p)
         the fs source borrows Config's ignore list, and freeing the list
         under a live source is the kind of ordering error this table
         exists to make unwriteable. */
-  browser_destroy(p->br);
+  for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+    browser_destroy(p->brv[v]);
+    p->brv[v] = NULL;
+  }
+  p->br = NULL;
+  /* After the browsers, never before: every library source holds this
+     array and a destroy can still touch it. */
+  free(p->rootv);
+  p->rootv = NULL;
   p->br = NULL;
 
   /* The queue owns copies of its paths and borrows nothing, so its
@@ -3143,11 +3211,30 @@ run_tui(void)
      browser simply fails to build, every navigation action becomes a
      no-op, and the status bar names the path -- a first-run state, not
      an error state. */
-  browser_fs_source(&p.brsrc, p.cfg.ignore, p.cfg.nignore);
-  p.br = browser_create(&p.brsrc, p.cfg.roots[0].path);
-  if (p.br == NULL) {
-    fprintf(stderr, "kurono: cannot list %s -- browsing disabled\n",
-            p.cfg.roots[0].path);
+  {
+    p.rootv = malloc(p.cfg.nroots * sizeof *p.rootv);
+    if (p.rootv == NULL) {
+      kurono_die("out of memory resolving music roots");
+    }
+    for (size_t i = 0; i < p.cfg.nroots; i++) {
+      p.rootv[i] = p.cfg.roots[i].path;
+    }
+    const char ** rootv = p.rootv;
+
+    for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+      browser_library_source(&p.brsrc[v], v, p.db, rootv, p.cfg.nroots);
+
+      char * rootkey = browser_library_root(v, rootv, p.cfg.nroots);
+      if (rootkey != NULL) {
+        p.brv[v] = browser_create(&p.brsrc[v], rootkey);
+        free(rootkey);
+      }
+      if (p.brv[v] == NULL) {
+        fprintf(stderr, "kurono: view %d unavailable -- browsing disabled\n", v);
+      }
+    }
+    p.view = BROWSER_VIEW_DIRECTORY;
+    p.br   = p.brv[p.view];
   }
 
   /* The queue. Seeded from the clock rather than internally, because

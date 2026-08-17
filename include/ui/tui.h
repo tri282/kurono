@@ -53,6 +53,17 @@ typedef struct {
      rule that tui.c reaches neither audio/ nor library/. */
   const Browser * browser;
 
+  /* Which view `browser` belongs to, for the column labels only. The
+     draw code must not branch on it for anything else: a view is a
+     source plus a label, and a switch here is the leak DESIGN.md VIII.4
+     forbids (phase-16-browser.md I.1). */
+  int             view;
+
+  /* The resolved music directory, for DESIGN.md XI.5's first-run state:
+     an empty index shows the path and the variable that changes it.
+     Borrowed from Config; NULL on a run with no browser. */
+  const char *    music_dir;
+
   /* DESIGN.md XI.6: a visible underrun counter is worth more than any
      amount of reasoning about whether underruns are happening. Shown
      only when non-zero. */

@@ -93,7 +93,9 @@ struct Db {
   sqlite3_stmt * query_artists;
   sqlite3_stmt * query_album_artists;
   sqlite3_stmt * query_albums_for;
+sqlite3_stmt * query_albums_for_album_artist;
   sqlite3_stmt * query_tracks_for_album;
+sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_tracks_in_dir;
   sqlite3_stmt * query_track_by_id;
   sqlite3_stmt * query_search;
@@ -506,8 +508,26 @@ prepare_all_statements(Db * db)
   PREP(query_album_artists,
        "SELECT DISTINCT album_artist FROM tracks WHERE album_artist IS NOT NULL ORDER BY album_artist");
   PREP(query_albums_for, "SELECT DISTINCT album FROM tracks WHERE artist = ?1 AND album IS NOT NULL ORDER BY album");
+  /* The album_artist twin of the line above. Both views ask "which
+     albums belong to this name", but they mean different columns, and
+     one statement cannot serve both: an Album Artists view filtered on
+     `artist` misses every compilation, where album_artist is "Various
+     Artists" and no track carries that as its artist. Covered by
+     idx_tracks_album_artist's leading column, so DISTINCT needs no
+     sort. */
+  PREP(query_albums_for_album_artist,
+       "SELECT DISTINCT album FROM tracks WHERE album_artist = ?1 AND album IS NOT NULL ORDER BY album");
   PREP(query_tracks_for_album,
        "SELECT * FROM tracks WHERE album_artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
+  /* The artist twin, for the Artists view, which reaches an album
+     through a track's `artist` rather than the album's `album_artist`.
+     Filtering on album_artist there returns nothing for a compilation
+     -- a silent empty column 3, which is why this exists as its own
+     statement. idx_tracks_artist covers the lookup but not the order,
+     so this one does pay a sort; at v1 scale that is an album's worth
+     of rows. */
+  PREP(query_tracks_for_artist_album,
+       "SELECT * FROM tracks WHERE artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
   PREP(query_tracks_in_dir, "SELECT * FROM tracks WHERE parent_dir = ?1 ORDER BY path");
   PREP(query_track_by_id, "SELECT * FROM tracks WHERE id = ?1");
   PREP(query_search,
@@ -594,7 +614,9 @@ db_close(Db * db)
   sqlite3_finalize(db->query_artists);
   sqlite3_finalize(db->query_album_artists);
   sqlite3_finalize(db->query_albums_for);
+  sqlite3_finalize(db->query_albums_for_album_artist);
   sqlite3_finalize(db->query_tracks_for_album);
+  sqlite3_finalize(db->query_tracks_for_artist_album);
   sqlite3_finalize(db->query_tracks_in_dir);
   sqlite3_finalize(db->query_track_by_id);
   sqlite3_finalize(db->query_search);
@@ -938,6 +960,20 @@ db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t * o
 } /* db_query_albums_for */
 
 /*
+ * db_query_albums_for_album_artist: see include/library/db.h.
+ */
+int
+db_query_albums_for_album_artist(Db * db, const char * album_artist,
+                                  char *** out_names, size_t * out_n)
+{
+  sqlite3_stmt * stmt = db->query_albums_for_album_artist;
+  db_reset(db, stmt);
+  sqlite3_clear_bindings(stmt);
+  sqlite3_bind_text(stmt, 1, album_artist, -1, SQLITE_TRANSIENT);
+  return names_from_stmt(db, stmt, out_names, out_n);
+} /* db_query_albums_for_album_artist */
+
+/*
  * db_query_tracks_for_album: see include/library/db.h.
  */
 int
@@ -951,6 +987,21 @@ db_query_tracks_for_album(Db * db, const char * album_artist, const char * album
   sqlite3_bind_text(stmt, 2, album, -1, SQLITE_TRANSIENT);
   return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_tracks_for_album */
+
+/*
+ * db_query_tracks_for_artist_album: see include/library/db.h.
+ */
+int
+db_query_tracks_for_artist_album(Db * db, const char * artist, const char * album,
+                                  DbTrackRow ** out_rows, size_t * out_n)
+{
+  sqlite3_stmt * stmt = db->query_tracks_for_artist_album;
+  db_reset(db, stmt);
+  sqlite3_clear_bindings(stmt);
+  sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, album, -1, SQLITE_TRANSIENT);
+  return rows_from_stmt(db, stmt, out_rows, out_n);
+} /* db_query_tracks_for_artist_album */
 
 /*
  * db_query_tracks_in_dir: see include/library/db.h.

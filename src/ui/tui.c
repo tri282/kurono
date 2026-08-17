@@ -258,6 +258,23 @@ fmt_clock(int64_t ms, char * buf, size_t bufsz)
   }
 } /* fmt_clock */
 
+
+/*
+ * View labels, drawn over column 1. Sized by BROWSER_VIEW_COUNT and
+ * checked below, the same mechanism g_mode_label and g_action_name use:
+ * a view added without a label fails the build rather than drawing an
+ * empty heading. This table is the whole of what the draw code knows
+ * about views -- there is no branch on the id anywhere below.
+ */
+static const char * const g_view_label[BROWSER_VIEW_COUNT] = {
+  [BROWSER_VIEW_DIRECTORY]     = "directory",
+  [BROWSER_VIEW_ARTISTS]       = "artists",
+  [BROWSER_VIEW_ALBUM_ARTISTS] = "album artists",
+};
+
+_Static_assert(sizeof(g_view_label) / sizeof(g_view_label[0]) == BROWSER_VIEW_COUNT,
+               "g_view_label must have one entry per browser view");
+
 /*
  * draw_header: row 0 -- what is playing, or the program name while idle.
  * Takes the model, returns nothing.
@@ -266,92 +283,160 @@ static void
 draw_header(const TuiModel * m)
 {
   fill_row(0, 0, g_layout.w, STYLE_HEADER);
-  /* Idle, the header names where the browser is instead of repeating
-     the program name -- it is the only place the current directory
-     appears, and a single-column browser shows no parent (M1 draws one
-     column; DESIGN.md XIV.1). */
+  /* Idle, the header names where the browser is and which view it is,
+     instead of repeating the program name.
+     Deliberately NOT browser_cwd: since phase 16 a key is the source's
+     private encoding ("D/music/x", "2:5:Bjork"), and printing one puts
+     an implementation detail on row 0. The name of the row the user is
+     inside says the same thing in the source's own words, and is
+     already on hand from column 0. At the top level there is no such
+     row, and the view label alone is the honest answer. */
   const char * what = "kurono";
+  char         crumb[256];
+
   if (m->now_playing != NULL) {
     what = m->now_playing;
   } else if (m->browser != NULL) {
-    what = browser_cwd(m->browser);
+    const char * view = (m->view >= 0 && m->view < BROWSER_VIEW_COUNT)
+                          ? g_view_label[m->view]
+                          : "";
+    const BrowserRow * here =
+      browser_parent_row(m->browser, browser_parent_cursor(m->browser));
+
+    if (here != NULL) {
+      snprintf(crumb, sizeof crumb, "%s: %s", view, here->name);
+    } else {
+      snprintf(crumb, sizeof crumb, "%s", view);
+    }
+    what = crumb;
   }
   draw_text(1, 0, g_layout.w - 2,
             (m->now_playing != NULL) ? STYLE_PLAYING : STYLE_HEADER, what);
 } /* draw_header */
 
 /*
- * draw_body: the three empty columns, their separators, and the reserved
- * cover pane. Phase 12 replaces the placeholder text with the browser;
- * the rectangles it draws into are these. Takes nothing, returns nothing.
+ * draw_column: draw one column's worth of rows. Takes the column index,
+ * the row accessor's count, a callback-free pair of (row, index) reads
+ * through the model, the cursor index, the scroll offset, and whether
+ * this column owns the cursor. Returns nothing.
+ *
+ * Columns 0 and 2 are derived (browser.h's miller layout): they are
+ * drawn dim, with no cursor bar, because they are not navigable. Column
+ * 0 still marks the row the user is inside, which is what makes the
+ * layout readable as a path rather than three unrelated lists.
+ */
+static void
+draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
+            const Browser * b, size_t n, size_t cursor, size_t scroll,
+            int is_active, int mark_only)
+{
+  int cx = g_layout.col_x[c];
+  int cw = g_layout.col_w[c];
+
+  for (int r = 0; r < g_layout.body_h; r++) {
+    size_t idx = scroll + (size_t) r;
+    if (idx >= n) {
+      break;
+    }
+
+    const BrowserRow * br = row(b, idx);
+    if (br == NULL) {
+      break;
+    }
+
+    StyleSlot slot;
+    if (is_active && idx == cursor) {
+      slot = STYLE_CURSOR;
+    } else if (mark_only && idx == cursor) {
+      slot = STYLE_SELECTED;
+    } else if (!is_active && !mark_only) {
+      slot = STYLE_COL_INACTIVE;
+    } else if (br->is_dir) {
+      slot = STYLE_DIR;
+    } else {
+      slot = STYLE_NORMAL;
+    }
+
+    /* The cursor row reads as a bar across the whole column, not just
+       under its text, or a short name leaves the selection looking
+       ragged against a long one. */
+    if ((is_active || mark_only) && idx == cursor) {
+      fill_row(cx, g_layout.body_y + r, cw, slot);
+    }
+    draw_text(cx, g_layout.body_y + r, cw, slot, br->name);
+  }
+} /* draw_column */
+
+/*
+ * scroll_for: the scroll offset that keeps `cursor` visible in a column
+ * of `n` rows. Takes both plus the viewport height, returns the offset.
+ *
+ * Only the derived columns need this: the main column's offset is the
+ * widget's, which is already consistent with its cursor and must not be
+ * recomputed here -- two places deciding what is visible is how they
+ * come to disagree.
+ */
+static size_t
+scroll_for(size_t cursor, size_t n, int height)
+{
+  size_t h = (height > 0) ? (size_t) height : 1;
+
+  if (n <= h || cursor < h / 2) {
+    return 0;
+  }
+  if (cursor > n - 1 - h / 2) {
+    return (n > h) ? n - h : 0;
+  }
+  return cursor - h / 2;
+} /* scroll_for */
+
+/*
+ * draw_body: the three columns, the separators between them, and the
+ * reserved cover pane. Takes the model, returns nothing.
+ *
+ * The three columns are one widget viewed at three depths (DESIGN.md
+ * VIII.4): column 1 is the listing with the cursor, column 0 is what
+ * contains it, column 2 is what is inside the selection. Only column 1
+ * is navigable, which is why only it is drawn at full contrast.
  */
 static void
 draw_body(const TuiModel * m)
 {
-  /* M1 is a single-column directory listing (DESIGN.md XIV.1); the
-     three-column browser is M2, phase 16. The listing goes in column 1
-     because that is the ranger-style cursor column, and columns 0 and 2
-     keep the placeholder until phase 16 gives them sources. */
-  static const char * const col_title[3] = { "", "browser", "" };
-  const int active_col = 1;
-
-  for (int c = 0; c < 3; c++) {
-    if (c == active_col) {
-      continue; /* drawn below, from the model */
-    }
-    draw_text(g_layout.col_x[c], g_layout.body_y, g_layout.col_w[c],
-              STYLE_COL_INACTIVE, col_title[c]);
-    draw_text(g_layout.col_x[c], g_layout.body_y + 2, g_layout.col_w[c],
-              STYLE_DIM, "(phase 16)");
-  }
-
-  int cx = g_layout.col_x[active_col];
-  int cw = g_layout.col_w[active_col];
-
   /* Every branch below falls through to the separators and the cover
      pane -- an early return here silently drops them, which is exactly
      what an empty directory did before this was restructured. The frame
      is not the listing's to skip. */
-  size_t n      = browser_count(m->browser);
-  size_t cursor = browser_cursor(m->browser);
-  size_t scroll = browser_scroll(m->browser);
-
   if (m->browser == NULL) {
-    draw_text(cx, g_layout.body_y, cw, STYLE_DIM, "(no browser)");
-  } else if (n == 0) {
-    draw_text(cx, g_layout.body_y, cw, STYLE_DIM, "(empty)");
+    draw_text(g_layout.col_x[1], g_layout.body_y, g_layout.col_w[1],
+              STYLE_DIM, "(no browser)");
   } else {
-    /* The widget was told the viewport, so scroll is already consistent
-       with the cursor -- this loop draws what it is given and does no
-       clamping of its own. Two places deciding what is visible is how
-       they come to disagree. */
-    for (int row = 0; row < g_layout.body_h; row++) {
-      size_t idx = scroll + (size_t) row;
-      if (idx >= n) {
-        break;
-      }
-      const BrowserRow * r = browser_row(m->browser, idx);
-      if (r == NULL) {
-        break;
-      }
+    size_t n      = browser_count(m->browser);
+    size_t cursor = browser_cursor(m->browser);
+    size_t pn     = browser_parent_count(m->browser);
+    size_t pcur   = browser_parent_cursor(m->browser);
+    size_t vn     = browser_preview_count(m->browser);
 
-      StyleSlot slot;
-      if (idx == cursor) {
-        slot = STYLE_CURSOR;
-      } else if (r->is_dir) {
-        slot = STYLE_DIR;
-      } else {
-        slot = STYLE_NORMAL;
-      }
+    draw_column(0, browser_parent_row, m->browser, pn, pcur,
+                scroll_for(pcur, pn, g_layout.body_h), 0, 1);
 
-      /* The cursor row reads as a bar across the whole column, not just
-         under its text, or a short name leaves the selection looking
-         ragged against a long one. */
-      if (idx == cursor) {
-        fill_row(cx, g_layout.body_y + row, cw, STYLE_CURSOR);
+    if (n == 0) {
+      /* DESIGN.md XI.5: an empty index is a first-run state, not an
+         error state, and the thing the user needs is the path and the
+         variable that changes it. */
+      draw_text(g_layout.col_x[1], g_layout.body_y, g_layout.col_w[1],
+                STYLE_DIM, "(empty)");
+      if (m->music_dir != NULL) {
+        draw_text(g_layout.col_x[1], g_layout.body_y + 2, g_layout.col_w[1],
+                  STYLE_DIM, m->music_dir);
+        draw_text(g_layout.col_x[1], g_layout.body_y + 3, g_layout.col_w[1],
+                  STYLE_DIM, "set KURONO_MUSIC_DIR to change");
       }
-      draw_text(cx, g_layout.body_y + row, cw, slot, r->name);
+    } else {
+      draw_column(1, browser_row, m->browser, n, cursor,
+                  browser_scroll(m->browser), 1, 0);
     }
+
+    draw_column(2, browser_preview_row, m->browser, vn, vn, 0, 0, 0);
   }
 
   /* Vertical separators, between the columns only -- the outer edges are
