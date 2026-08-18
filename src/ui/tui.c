@@ -107,6 +107,50 @@ static int    g_mode_depth = 1;
 static int g_overlay_scroll = 0;
 
 /*
+ * The search query, as typed. It lives here rather than in main.c
+ * because it is terminal text state -- built one codepoint at a time out
+ * of key events this file already owns, and drawn by the prompt below.
+ * main.c never sees it except as the argument to search_dispatch.
+ *
+ * Bounded and truncating rather than growing: a query longer than this
+ * has no useful FTS5 meaning, and a fixed buffer keeps text entry out of
+ * the allocator entirely.
+ */
+#define SEARCH_MAX 256
+static char   g_search[SEARCH_MAX];
+static size_t g_search_len = 0;
+
+/*
+ * The rows main.c handed back for the current query, parked here for the
+ * length of one draw. draw_column reads rows through a (Browser *,
+ * index) accessor, and search results have no Browser -- this is the
+ * adapter, and the pointer is written and read inside draw_body with no
+ * suspension point between.
+ */
+static const BrowserRow * g_search_draw = NULL;
+
+/*
+ * search_row_at: draw_column's accessor over g_search_draw. Takes the
+ * (ignored) browser and an index, returns the row.
+ */
+static const BrowserRow *
+search_row_at(const Browser * b, size_t i)
+{
+  (void) b;
+  return &g_search_draw[i];
+} /* search_row_at */
+
+/*
+ * search_reset: empty the query. Takes and returns nothing.
+ */
+static void
+search_reset(void)
+{
+  g_search_len = 0;
+  g_search[0]  = '\0';
+} /* search_reset */
+
+/*
  * tui_compute_layout: recompute every rectangle from the current
  * terminal size. Called at init and on every TB_EVENT_RESIZE, and by
  * nothing else -- no widget reads tb_width/tb_height itself. Takes and
@@ -324,11 +368,17 @@ draw_header(const TuiModel * m)
  * drawn dim, with no cursor bar, because they are not navigable. Column
  * 0 still marks the row the user is inside, which is what makes the
  * layout readable as a path rather than three unrelated lists.
+ *
+ * `dim` is the slot a non-cursor row gets in a derived column. It is a
+ * parameter rather than a constant because column 2 draws search results
+ * in STYLE_SEARCH_MATCH and its own preview in STYLE_COL_INACTIVE, and
+ * that is the whole difference between the two -- not a second drawing
+ * routine.
  */
 static void
 draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
             const Browser * b, size_t n, size_t cursor, size_t scroll,
-            int is_active, int mark_only)
+            int is_active, int mark_only, StyleSlot dim)
 {
   int cx = g_layout.col_x[c];
   int cw = g_layout.col_w[c];
@@ -350,7 +400,7 @@ draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
     } else if (mark_only && idx == cursor) {
       slot = STYLE_SELECTED;
     } else if (!is_active && !mark_only) {
-      slot = STYLE_COL_INACTIVE;
+      slot = dim;
     } else if (br->is_dir) {
       slot = STYLE_DIR;
     } else {
@@ -417,7 +467,8 @@ draw_body(const TuiModel * m)
     size_t vn     = browser_preview_count(m->browser);
 
     draw_column(0, browser_parent_row, m->browser, pn, pcur,
-                scroll_for(pcur, pn, g_layout.body_h), 0, 1);
+                scroll_for(pcur, pn, g_layout.body_h), 0, 1,
+                STYLE_COL_INACTIVE);
 
     if (n == 0) {
       /* DESIGN.md XI.5: an empty index is a first-run state, not an
@@ -433,10 +484,31 @@ draw_body(const TuiModel * m)
       }
     } else {
       draw_column(1, browser_row, m->browser, n, cursor,
-                  browser_scroll(m->browser), 1, 0);
+                  browser_scroll(m->browser), 1, 0, STYLE_COL_INACTIVE);
     }
 
-    draw_column(2, browser_preview_row, m->browser, vn, vn, 0, 0, 0);
+    /* Column 2 is the search results while a search is up, and the
+       selection's preview otherwise. The preview cache underneath is
+       untouched either way, which is what makes cancelling restore it
+       exactly: there is nothing to restore. */
+    if (ui_mode() == MODE_SEARCH) {
+      if (m->search_n > 0 && m->search_rows != NULL) {
+        g_search_draw = m->search_rows;
+        /* Cursor index m->search_n never matches a row, so no bar is
+           drawn -- the results are not navigable yet, for the same
+           reason ACT_CONFIRM does not act on one (see dispatch_event). */
+        draw_column(2, search_row_at, NULL, m->search_n, m->search_n, 0, 0, 0,
+                    STYLE_SEARCH_MATCH);
+        g_search_draw = NULL;
+      } else {
+        draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
+                  STYLE_DIM,
+                  (g_search_len > 0) ? "(no results)" : "(type to search)");
+      }
+    } else {
+      draw_column(2, browser_preview_row, m->browser, vn, vn, 0, 0, 0,
+                  STYLE_COL_INACTIVE);
+    }
   }
 
   /* Vertical separators, between the columns only -- the outer edges are
@@ -651,9 +723,29 @@ draw_statusbar(const TuiModel * m)
 
   /* The message takes the row above the status bar rather than competing
      with the clock for space. Errors get the error slot; anything else
-     is dim. */
-  if (m->message != NULL && g_layout.body_h > 0) {
-    draw_text(1, y - 1, g_layout.w - 2, STYLE_DIM, m->message);
+     is dim.
+
+     The search prompt takes the same row and outranks the message: while
+     the user is typing, what they have typed is the only thing on that
+     row that they are looking for. */
+  if (g_layout.body_h > 0) {
+    if (ui_mode() == MODE_SEARCH) {
+      /* The prompt takes the left half and the message the right, rather
+         than the prompt taking the row outright. Found by forcing an
+         allocation failure mid-search: the query's own truncation report
+         goes through player_report like every other one, so a prompt
+         that owns this row makes the one message that matters here the
+         one message that cannot be seen. */
+      int half = (g_layout.w - 2) / 2;
+      char prompt[SEARCH_MAX + 2];
+      snprintf(prompt, sizeof prompt, "/%s", g_search);
+      draw_text(1, y - 1, half, STYLE_NORMAL, prompt);
+      if (m->message != NULL) {
+        draw_text(1 + half, y - 1, g_layout.w - 1 - half, STYLE_DIM, m->message);
+      }
+    } else if (m->message != NULL) {
+      draw_text(1, y - 1, g_layout.w - 2, STYLE_DIM, m->message);
+    }
   }
 } /* draw_statusbar */
 
@@ -719,6 +811,82 @@ overlay_scroll_action(Action a)
 } /* overlay_scroll_action */
 
 /*
+ * search_key: handle one key event while MODE_SEARCH is on top. Takes
+ * the event and the action it resolved to, returns 1 when it was
+ * consumed and 0 when the caller should carry on with it.
+ *
+ * Text entry is the ACT_NONE case, which is the contract keymap.c's
+ * g_bindings_search documents: the table binds five keys and everything
+ * else is literal text. That is what keeps text entry inside the binding
+ * table rather than bypassing it (amendment 04 decision 4).
+ *
+ * Every branch that changes the query calls search_dispatch, so the
+ * results on screen are always the results for what is on the prompt --
+ * there is no "run the search" key and no stale-result window.
+ */
+static int
+search_key(const struct tb_event * ev, Action a)
+{
+  switch (a) {
+    case ACT_SEARCH_CANCEL:
+    case ACT_CONFIRM:
+      /* Both end the search, and they end it identically. Enter does not
+         act on the highlighted result because there is no highlighted
+         result: turning a search hit into a browser position needs a
+         track id resolved back to the library source's key encoding,
+         which is the same machinery ACT_JUMP_TO_PLAYING is waiting on.
+         One resolver, written once, serves both. */
+      ui_mode_pop();
+      search_reset();
+      search_dispatch(NULL);
+      return 1;
+
+    case ACT_QUIT:
+      /* Ctrl-C during a search drops the search and is then dispatched
+         normally, so amendment 04 decision 5's rule -- quit closes what
+         is on top of the stack first -- applies here unchanged rather
+         than getting a special case. */
+      search_reset();
+      search_dispatch(NULL);
+      return 0;
+
+    case ACT_REMOVE:
+      /* Back over a whole codepoint, not a byte: deleting one byte of a
+         multi-byte character leaves the buffer holding a truncated
+         sequence, which is then handed to SQLite. */
+      while (g_search_len > 0) {
+        g_search_len--;
+        if (((unsigned char) g_search[g_search_len] & 0xc0) != 0x80) {
+          break;
+        }
+      }
+      g_search[g_search_len] = '\0';
+      search_dispatch(g_search);
+      return 1;
+
+    case ACT_NONE: {
+      if (ev->ch == 0) {
+        return 1;  /* an unbound non-character key: swallowed, not text */
+      }
+      char   enc[8];
+      int    len = tb_utf8_unicode_to_char(enc, ev->ch);
+      if (len > 0 && g_search_len + (size_t) len < sizeof g_search) {
+        memcpy(g_search + g_search_len, enc, (size_t) len);
+        g_search_len += (size_t) len;
+        g_search[g_search_len] = '\0';
+        search_dispatch(g_search);
+      }
+      /* A full buffer drops the keystroke rather than truncating a
+         codepoint or growing without bound. */
+      return 1;
+    }
+
+    default:
+      return 0;
+  }
+} /* search_key */
+
+/*
  * dispatch_event: route one termbox event by its type. Key events resolve
  * against the table for the current mode and go to action_dispatch;
  * resize recomputes the layout. Every path marks the screen dirty -- the
@@ -733,6 +901,26 @@ dispatch_event(const struct tb_event * ev)
       int32_t arg  = 0;
       UiMode  mode = ui_mode();
       Action  a    = keymap_resolve(mode, ev, &arg);
+
+      /* Search is handled here and not in main.c's action_dispatch
+         because the query is terminal text state and lives in this file.
+         main.c sees only the finished string, through search_dispatch. */
+      if (mode == MODE_SEARCH && search_key(ev, a)) {
+        g_dirty = 1;
+        break;
+      }
+      if (mode == MODE_NORMAL && a == ACT_SEARCH) {
+        /* An empty query on entry, dispatched immediately, so column 2
+           switches to the search pane on the keystroke that opens it
+           rather than on the first character typed. */
+        if (ui_mode_toggle(MODE_SEARCH) > 0) {
+          search_reset();
+          search_dispatch(g_search);
+        }
+        g_dirty = 1;
+        break;
+      }
+
       if (a != ACT_NONE && !(mode != MODE_NORMAL && overlay_scroll_action(a))) {
         action_dispatch(a, arg);
       }
@@ -878,7 +1066,14 @@ ui_mode_toggle(UiMode m)
     return 0;
   }
 
-  if (!overlay_fits() || g_mode_depth >= UI_MODE_STACK_MAX) {
+  /* MODE_SEARCH draws no box: it borrows column 2 and the message row,
+     both of which exist at any size the browser itself draws at. Gating
+     it on the overlay's margins would refuse a search on a terminal that
+     renders the browser perfectly well. A terminal too small to draw
+     anything still refuses, because there would be nowhere to show the
+     prompt. */
+  int fits = (m == MODE_SEARCH) ? !g_layout.too_small : overlay_fits();
+  if (!fits || g_mode_depth >= UI_MODE_STACK_MAX) {
     return -1;
   }
 

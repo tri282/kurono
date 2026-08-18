@@ -676,6 +676,15 @@ typedef struct {
   /* The library index. Opened at startup step 3 and closed at teardown
      step 7, so it outlives every other subsystem that might query it. */
   Db * db;
+
+  /* The current search's results, owned here and rebuilt on every
+     keystroke by search_dispatch. Freed when the search ends and again
+     at teardown, because a run can end with a search still open.
+     Deliberately not inside the Browser: the browser's preview cache is
+     what the search draws over, and keeping the two apart is what makes
+     cancelling a search free rather than a restore. */
+  BrowserRow * search_rows;
+  size_t       search_n;
 } Player;
 
 /*
@@ -912,6 +921,121 @@ action_dispatch(Action a, int32_t arg)
      defined beside that state rather than here. */
   player_action(p, a, arg);
 } /* action_dispatch */
+
+/*
+ * player_search_free: drop the current result set. Takes the Player,
+ * returns nothing. Idempotent, and a no-op when no search has run.
+ */
+static void
+player_search_free(Player * p)
+{
+  for (size_t i = 0; i < p->search_n; i++) {
+    free(p->search_rows[i].name);
+    free(p->search_rows[i].key);
+  }
+  free(p->search_rows);
+  p->search_rows = NULL;
+  p->search_n    = 0;
+} /* player_search_free */
+
+/*
+ * search_dispatch: see include/ui/keymap.h. Runs one query and keeps its
+ * rows for the next repaint. Takes the raw query text or NULL, returns
+ * nothing.
+ *
+ * Three inputs produce zero results and none of them is an error: NULL
+ * (the search ended), a query with no tokens in it -- a bare quote, a
+ * bare star, spaces -- and a query that matches nothing. The middle case
+ * is why query_build_match returns an owned empty string rather than
+ * NULL: the caller can tell "nothing to search for" from "allocation
+ * failed" and skip the query instead of handing FTS5 a string it would
+ * reject. DESIGN.md V.6 is explicit that a residual SQLITE_ERROR here
+ * must never be fatal, and db_query_search already reports one as zero
+ * rows.
+ */
+void
+search_dispatch(const char * query)
+{
+  Player * p = g_ui_player;
+  if (p == NULL) {
+    return;
+  }
+
+  player_search_free(p);
+  tui_mark_dirty();
+
+  if (query == NULL || p->db == NULL) {
+    return;
+  }
+
+  char * match = query_build_match(query);
+  if (match == NULL) {
+    player_report(p, "out of memory, search skipped");
+    return;
+  }
+  if (match[0] == '\0') {
+    free(match);
+    return;  /* nothing to match on yet; not a query and not an error */
+  }
+
+  DbTrackRow * rows = NULL;
+  size_t       n    = 0;
+  (void) db_query_search(p->db, match, &rows, &n);
+  free(match);
+
+  /* DESIGN.md XI.7, read here rather than at the repaint because the
+     flag is non-sticky: the next query overwrites it.
+
+     Worded identically to the browser source's report on purpose. Both
+     read the same Db-level flag, so one truncating search can be
+     reported twice -- once here, and again when the next library load
+     latches the flag this call left set. Two wordings for one event
+     would read as two failures; one wording makes the duplicate
+     invisible, and neither report can be dropped: this one is the only
+     one guaranteed to run when no library load follows. */
+  if (db_result_truncated(p->db)) {
+    player_report(p, "out of memory, result truncated");
+  }
+
+  if (n == 0) {
+    db_track_rows_free(rows, n);
+    return;
+  }
+
+  p->search_rows = calloc(n, sizeof *p->search_rows);
+  if (p->search_rows == NULL) {
+    player_report(p, "out of memory, search skipped");
+    db_track_rows_free(rows, n);
+    return;
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    /* One line per hit, in the shape the columns already use: what it is
+       called, and who by when that is known. A track with no tags at all
+       still has a path, and showing the path beats showing a blank. */
+    char line[512];
+    const char * title = (rows[i].title != NULL) ? rows[i].title : rows[i].path;
+    if (rows[i].artist != NULL) {
+      snprintf(line, sizeof line, "%s - %s", rows[i].artist, title);
+    } else {
+      snprintf(line, sizeof line, "%s", (title != NULL) ? title : "");
+    }
+
+    p->search_rows[i].name   = strdup(line);
+    p->search_rows[i].key    = (rows[i].path != NULL) ? strdup(rows[i].path) : NULL;
+    p->search_rows[i].is_dir = 0;
+
+    if (p->search_rows[i].name == NULL) {
+      /* The same degrade every other result set applies: keep what was
+         built, say so, and draw a short list rather than none. */
+      player_report(p, "out of memory, result truncated");
+      break;
+    }
+    p->search_n = i + 1;
+  }
+
+  db_track_rows_free(rows, n);
+} /* search_dispatch */
 
 /*
  * trace_report_and_shutdown: teardown step 10 (DESIGN.md IV.9.b) --
@@ -2530,6 +2654,8 @@ player_repaint(Player * p)
   browser_refresh_derived(p->br);
   m.browser     = p->br;
   m.view        = p->view;
+  m.search_rows = p->search_rows;
+  m.search_n    = p->search_n;
   m.music_dir   = (p->cfg.nroots > 0) ? p->cfg.roots[0].path : NULL;
 
   /* DESIGN.md XI.7: a result set that ran out of memory is reported and
@@ -2635,6 +2761,11 @@ shutdown_all(Player * p)
         the fs source borrows Config's ignore list, and freeing the list
         under a live source is the kind of ordering error this table
         exists to make unwriteable. */
+  /* Before the browsers only for tidiness -- the results borrow nothing
+     from them. A run can end with a search still open, which is the only
+     reason this is here at all. */
+  player_search_free(p);
+
   for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
     browser_destroy(p->brv[v]);
     p->brv[v] = NULL;

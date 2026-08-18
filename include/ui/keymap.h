@@ -109,4 +109,20 @@ const char * key_name(const Binding * b);
    into the layers below it except through this one entry point. */
 void action_dispatch(Action a, int32_t arg);
 
+/*
+ * search_dispatch: the second entry point from ui/ into main.c, and it
+ * exists for the same reason action_dispatch does -- running a search
+ * needs library/, and ui/ never reaches library/ itself.
+ *
+ * `query` is the raw text the user has typed so far, borrowed for the
+ * duration of the call. main.c puts it through query_build_match and
+ * db_query_search and keeps the results for the next repaint. NULL means
+ * the search ended: drop the results and show nothing.
+ *
+ * It is called on every keystroke, which is what DESIGN.md V.6 step 4's
+ * prepared statement is for. Never fatal: an unparseable query, an empty
+ * one, and a residual SQLITE_ERROR all mean zero results.
+ */
+void search_dispatch(const char * query);
+
 #endif // KURONO_UI_KEYMAP_H

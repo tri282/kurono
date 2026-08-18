@@ -282,7 +282,7 @@ test_mode_tables(void)
   CHECK(keymap_resolve(MODE_SEARCH, &ev, &arg) == ACT_SEARCH_CANCEL,
         "Esc cancels a search rather than popping -- column 3 has to come back");
 
-  /* MODE_SEARCH's contract: anything not in its four-row table resolves
+  /* MODE_SEARCH's contract: anything not in its own table resolves
      ACT_NONE, which tui.c reads as "insert this codepoint". */
   const uint32_t typed[] = { 'j', 'q', 'h', ' ', '/' };
   for (size_t i = 0; i < sizeof typed / sizeof typed[0]; i++) {

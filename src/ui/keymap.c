@@ -161,13 +161,15 @@ static const Binding g_bindings_menu[] = {
 };
 
 /*
- * MODE_SEARCH binds four things and nothing else, and the omission is the
- * design (amendment 04 decision 4): every other event resolves ACT_NONE,
+ * MODE_SEARCH binds the keys below and nothing else, and the omission is
+ * the design (amendment 04 decision 4): every other event resolves ACT_NONE,
  * and tui.c reads ACT_NONE with a non-zero ev->ch as "insert this
  * codepoint into the query". That is what keeps text entry inside the
  * binding table instead of bypassing it. Esc cancels rather than pops --
  * cancelling a search also has to restore column 3 (phase 16), which is
- * more than a pop. Nothing pushes this mode until phase 16.
+ * more than a pop -- though phase 16 found there is nothing to restore,
+ * because the search draws over column 3 without disturbing it.
+ * tui.c pushes this mode on ACT_SEARCH.
  */
 static const Binding g_bindings_search[] = {
   { TB_KEY_ESC,        0, 0, ACT_SEARCH_CANCEL, 0 },
@@ -175,6 +177,11 @@ static const Binding g_bindings_search[] = {
   { TB_KEY_BACKSPACE2, 0, 0, ACT_REMOVE,        0 },
   { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,     0 },
   { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,   0 },
+  /* Ctrl-C is bound here for the same reason it is bound in every other
+     table: it is the one key that must never be swallowed as text. Every
+     other unbound key in this mode is literal input, and without this row
+     Ctrl-C would be one of them. */
+  { TB_KEY_CTRL_C,     0, 0, ACT_QUIT,          0 },
 };
 
 #define TABLE_ROWS(t) (sizeof(t) / sizeof((t)[0]))

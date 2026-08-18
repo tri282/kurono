@@ -64,6 +64,15 @@ typedef struct {
      Borrowed from Config; NULL on a run with no browser. */
   const char *    music_dir;
 
+  /* Search results, for column 2 while MODE_SEARCH is on top. Borrowed
+     from the Player, which owns the rows and frees them when the search
+     ends. Column 2's own preview cache is deliberately NOT touched
+     while a search is up: the results are drawn instead of it, so
+     cancelling restores it byte-for-byte by doing nothing at all
+     (plans/kurono/05-impl/phase-16.md step 6). */
+  const BrowserRow * search_rows;
+  size_t             search_n;
+
   /* DESIGN.md XI.6: a visible underrun counter is worth more than any
      amount of reasoning about whether underruns are happening. Shown
      only when non-zero. */
