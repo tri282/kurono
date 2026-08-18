@@ -130,6 +130,17 @@ static size_t g_search_len = 0;
 static const BrowserRow * g_search_draw = NULL;
 
 /*
+ * The cursor over the results, and the row count the last draw saw.
+ * The count is kept because the cursor is moved from the input path,
+ * which has no model to ask -- clamping it there against a stale count
+ * is what a search that just shrank its results would need, and the
+ * draw is the only place that knows the current one. Both reset with
+ * the query.
+ */
+static size_t g_search_cursor = 0;
+static size_t g_search_shown  = 0;
+
+/*
  * search_row_at: draw_column's accessor over g_search_draw. Takes the
  * (ignored) browser and an index, returns the row.
  */
@@ -146,8 +157,10 @@ search_row_at(const Browser * b, size_t i)
 static void
 search_reset(void)
 {
-  g_search_len = 0;
-  g_search[0]  = '\0';
+  g_search_len    = 0;
+  g_search[0]     = '\0';
+  g_search_cursor = 0;
+  g_search_shown  = 0;
 } /* search_reset */
 
 /*
@@ -369,16 +382,17 @@ draw_header(const TuiModel * m)
  * 0 still marks the row the user is inside, which is what makes the
  * layout readable as a path rather than three unrelated lists.
  *
- * `dim` is the slot a non-cursor row gets in a derived column. It is a
- * parameter rather than a constant because column 2 draws search results
- * in STYLE_SEARCH_MATCH and its own preview in STYLE_COL_INACTIVE, and
+ * `base` is the slot every non-cursor row in this column gets, or
+ * STYLE_COUNT for "decide per row from is_dir". It is a parameter rather
+ * than a constant because column 2 draws its preview in
+ * STYLE_COL_INACTIVE and its search results in STYLE_SEARCH_MATCH, and
  * that is the whole difference between the two -- not a second drawing
  * routine.
  */
 static void
 draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
             const Browser * b, size_t n, size_t cursor, size_t scroll,
-            int is_active, int mark_only, StyleSlot dim)
+            int is_active, int mark_only, StyleSlot base)
 {
   int cx = g_layout.col_x[c];
   int cw = g_layout.col_w[c];
@@ -399,8 +413,8 @@ draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
       slot = STYLE_CURSOR;
     } else if (mark_only && idx == cursor) {
       slot = STYLE_SELECTED;
-    } else if (!is_active && !mark_only) {
-      slot = dim;
+    } else if (base != STYLE_COUNT) {
+      slot = base;
     } else if (br->is_dir) {
       slot = STYLE_DIR;
     } else {
@@ -467,8 +481,7 @@ draw_body(const TuiModel * m)
     size_t vn     = browser_preview_count(m->browser);
 
     draw_column(0, browser_parent_row, m->browser, pn, pcur,
-                scroll_for(pcur, pn, g_layout.body_h), 0, 1,
-                STYLE_COL_INACTIVE);
+                scroll_for(pcur, pn, g_layout.body_h), 0, 1, STYLE_COUNT);
 
     if (n == 0) {
       /* DESIGN.md XI.5: an empty index is a first-run state, not an
@@ -484,7 +497,7 @@ draw_body(const TuiModel * m)
       }
     } else {
       draw_column(1, browser_row, m->browser, n, cursor,
-                  browser_scroll(m->browser), 1, 0, STYLE_COL_INACTIVE);
+                  browser_scroll(m->browser), 1, 0, STYLE_COUNT);
     }
 
     /* Column 2 is the search results while a search is up, and the
@@ -493,14 +506,21 @@ draw_body(const TuiModel * m)
        exactly: there is nothing to restore. */
     if (ui_mode() == MODE_SEARCH) {
       if (m->search_n > 0 && m->search_rows != NULL) {
+        /* The clamp lives here and not in the input path because this is
+           the only place that knows how many rows there are: a keystroke
+           can shrink the result set under a cursor that was valid for
+           the previous query. */
+        g_search_shown = m->search_n;
+        if (g_search_cursor >= m->search_n) {
+          g_search_cursor = m->search_n - 1;
+        }
         g_search_draw = m->search_rows;
-        /* Cursor index m->search_n never matches a row, so no bar is
-           drawn -- the results are not navigable yet, for the same
-           reason ACT_CONFIRM does not act on one (see dispatch_event). */
-        draw_column(2, search_row_at, NULL, m->search_n, m->search_n, 0, 0, 0,
-                    STYLE_SEARCH_MATCH);
+        draw_column(2, search_row_at, NULL, m->search_n, g_search_cursor,
+                    scroll_for(g_search_cursor, m->search_n, g_layout.body_h),
+                    1, 0, STYLE_SEARCH_MATCH);
         g_search_draw = NULL;
       } else {
+        g_search_shown = 0;
         draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
                   STYLE_DIM,
                   (g_search_len > 0) ? "(no results)" : "(type to search)");
@@ -828,17 +848,36 @@ static int
 search_key(const struct tb_event * ev, Action a)
 {
   switch (a) {
-    case ACT_SEARCH_CANCEL:
     case ACT_CONFIRM:
-      /* Both end the search, and they end it identically. Enter does not
-         act on the highlighted result because there is no highlighted
-         result: turning a search hit into a browser position needs a
-         track id resolved back to the library source's key encoding,
-         which is the same machinery ACT_JUMP_TO_PLAYING is waiting on.
-         One resolver, written once, serves both. */
+      /* Enter takes the search's answer and leaves; Esc discards it. The
+         browser move happens before the mode pops so that the results
+         are still alive when search_confirm reads the selected row. */
+      if (g_search_shown > 0) {
+        search_confirm(g_search_cursor);
+      }
       ui_mode_pop();
       search_reset();
       search_dispatch(NULL);
+      return 1;
+
+    case ACT_SEARCH_CANCEL:
+      ui_mode_pop();
+      search_reset();
+      search_dispatch(NULL);
+      return 1;
+
+    case ACT_CURSOR_UP:
+      if (g_search_cursor > 0) {
+        g_search_cursor--;
+      }
+      return 1;
+
+    case ACT_CURSOR_DOWN:
+      /* Clamped against what the last draw showed; the draw clamps again
+         against what it is about to show. */
+      if (g_search_shown > 0 && g_search_cursor + 1 < g_search_shown) {
+        g_search_cursor++;
+      }
       return 1;
 
     case ACT_QUIT:
@@ -861,6 +900,7 @@ search_key(const struct tb_event * ev, Action a)
         }
       }
       g_search[g_search_len] = '\0';
+      g_search_cursor = 0;
       search_dispatch(g_search);
       return 1;
 
@@ -874,6 +914,7 @@ search_key(const struct tb_event * ev, Action a)
         memcpy(g_search + g_search_len, enc, (size_t) len);
         g_search_len += (size_t) len;
         g_search[g_search_len] = '\0';
+        g_search_cursor = 0;  /* a new query starts at its best match */
         search_dispatch(g_search);
       }
       /* A full buffer drops the keystroke rather than truncating a

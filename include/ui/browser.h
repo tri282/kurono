@@ -2,6 +2,7 @@
 #define KURONO_UI_BROWSER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "../library/db.h"
 
@@ -136,6 +137,40 @@ void  browser_library_source(BrowserSource * out, int view, Db * db,
                              const char * const * roots, size_t nroots);
 char * browser_library_root(int view, const char * const * roots, size_t nroots);
 int    browser_library_truncated(const BrowserSource * src);
+
+/*
+ * browser_library_locate: the pair of keys naming where `track` sits in
+ * this source's view, for browser_goto. Takes a library source, a track
+ * row, and out-params for the parent key and the row key; returns 0 with
+ * both owned by the caller, or -1 with neither set.
+ *
+ * browser_goto takes two keys because only the caller knows how a key
+ * decomposes -- and since phase 16 the caller does not, because the
+ * library encoding is private to browser.c. This is how the caller asks
+ * for it instead of reimplementing it. main.c building these keys itself
+ * would put the encoding under two owners, which is the same leak
+ * BrowserSource.parent_key exists to prevent.
+ *
+ * Returns -1 for a track with no position in this view -- an untagged
+ * track in the Artists view has none, and that is an answer rather than
+ * an error. The caller reports it and does not move.
+ */
+int browser_library_locate(const BrowserSource * src, const DbTrackRow * track,
+                           char ** out_parent, char ** out_row);
+
+/*
+ * browser_library_track_id: the library id a track row's key names, or 0
+ * when the key is not a track's (a directory, an artist, an album, or a
+ * key from another source). Takes a library source and a row key.
+ *
+ * The inverse of browser_library_locate, and needed for the same reason:
+ * a row key is the source's private encoding, so a caller that wants the
+ * track behind a row has to ask rather than parse. Before this existed,
+ * ACT_ENQUEUE passed row->key straight to queue_append as if it were a
+ * filesystem path -- true in M1, and silently wrong from phase 16 on,
+ * failing only later at open(2) time.
+ */
+int64_t browser_library_track_id(const BrowserSource * src, const char * row_key);
 
 /*
  * browser_create / browser_destroy: the widget. `root` is the key the

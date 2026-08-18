@@ -856,6 +856,109 @@ lib_parent_key(void * self, const char * key)
 } /* lib_parent_key */
 
 /*
+ * browser_library_locate: see include/ui/browser.h. The inverse of the
+ * key builders above -- given a track, produce the pair of keys that
+ * name where it sits in this source's view. Takes the source, the
+ * track's row and two out-params; returns 0 with both keys owned by the
+ * caller, or -1 with neither set.
+ *
+ * It lives here, next to lib_key, because it is the only other function
+ * that has to know the encoding. A caller that built these keys itself
+ * would be the second owner of the format, which is exactly the leak
+ * BrowserSource.parent_key was added to close -- the same argument,
+ * applied in the other direction.
+ *
+ * The row key is the same in all three views: a track is addressed by
+ * id. The parent differs, and the difference is the whole point of the
+ * views -- the same track is inside a directory, inside its artist's
+ * album, and inside its album artist's album, and those are three
+ * different rows in three different listings.
+ *
+ * A track whose tags do not place it in the current view -- no artist in
+ * the Artists view, no album anywhere -- returns -1. That is "this track
+ * has no position here", not a failure: the caller reports it and stays
+ * where it is.
+ */
+int
+browser_library_locate(const BrowserSource * src, const DbTrackRow * t,
+                       char ** out_parent, char ** out_row)
+{
+  char idbuf[32];
+
+  if (src == NULL || t == NULL || out_parent == NULL || out_row == NULL) {
+    return -1;
+  }
+  /* Only a library source has an encoding to invert. Checked against the
+     load function rather than a flag, so a source that is not one cannot
+     be mistaken for one by an uninitialised field. */
+  if (src->load != lib_load || src->self == NULL) {
+    return -1;
+  }
+
+  LibSource * s      = (LibSource *) src->self;
+  char *      parent = NULL;
+
+  switch (s->view) {
+    case BROWSER_VIEW_DIRECTORY:
+      if (t->parent_dir == NULL) {
+        return -1;
+      }
+      parent = lib_key(LIB_KEY_DIR, t->parent_dir, NULL);
+      break;
+
+    case BROWSER_VIEW_ARTISTS:
+      if (t->artist == NULL || t->album == NULL) {
+        return -1;
+      }
+      parent = lib_key(LIB_KEY_ALBUM, t->artist, t->album);
+      break;
+
+    case BROWSER_VIEW_ALBUM_ARTISTS:
+      if (t->album_artist == NULL || t->album == NULL) {
+        return -1;
+      }
+      parent = lib_key(LIB_KEY_ALBUM, t->album_artist, t->album);
+      break;
+
+    default:
+      return -1;
+  }
+
+  if (parent == NULL) {
+    return -1;
+  }
+
+  snprintf(idbuf, sizeof idbuf, "%" PRId64, t->id);
+  char * row = lib_key(LIB_KEY_TRACK, idbuf, NULL);
+  if (row == NULL) {
+    free(parent);
+    return -1;
+  }
+
+  *out_parent = parent;
+  *out_row    = row;
+  return 0;
+} /* browser_library_locate */
+
+/*
+ * browser_library_track_id: see include/ui/browser.h. The other
+ * direction of the same inversion browser_library_locate performs, and
+ * it lives beside it for the same reason. Takes the source and a row
+ * key, returns the library id or 0 when the key does not name a track.
+ */
+int64_t
+browser_library_track_id(const BrowserSource * src, const char * row_key)
+{
+  if (src == NULL || row_key == NULL || src->load != lib_load) {
+    return 0;
+  }
+  if (row_key[0] != LIB_KEY_TRACK) {
+    return 0;
+  }
+  return (int64_t) strtoll(row_key + 1, NULL, 10);
+} /* browser_library_track_id */
+
+/*
  * lib_free_rows: see BrowserSource.free_rows.
  */
 static void
@@ -1313,30 +1416,57 @@ browser_ascend(Browser * b)
   return 1;
 } /* browser_ascend */
 
+/* Bounds the walk below. A key format that cycled -- a parent_key that
+   never reaches NULL -- would otherwise hang the UI thread, and no
+   library or filesystem hierarchy in this project is anywhere near this
+   deep. Reaching the bound is treated as "not under the root". */
+#define KEY_DEPTH_MAX 64
+
 /*
  * key_under_root: 1 when `key` is the root or lies beneath it. Takes the
  * Browser and a key, returns 0 or 1.
  *
- * A '/' separator is assumed, which is the same assumption browser_ascend
- * already makes when it takes a parent with strrchr. That is not the
- * widget knowing it is looking at a filesystem -- it is the one shape
- * every key format in this project shares, and phase 16's keys keep it.
+ * Walks up with the source's parent_key rather than testing a string
+ * prefix. The prefix test assumed a '/' separator, and its comment
+ * claimed that was "the one shape every key format in this project
+ * shares" -- which stopped being true when phase 16 shipped library keys
+ * as a kind byte and length-prefixed segments. It survived because the
+ * Directory view's keys are a byte plus a path, so a prefix test happens
+ * to work on them; the Artists and Album Artists views, whose root is
+ * the single byte "R" and whose album keys start with "B", failed every
+ * check. That made browser_goto silently unreachable in two of the three
+ * views -- the third place the widget assumed a key was a path, after
+ * browser_ascend and the parent derivation that BrowserSource.parent_key
+ * was added to fix.
+ *
+ * The walk costs one allocation per level, bounded by the depth of the
+ * hierarchy, and runs only on a jump -- never on a cursor move.
  */
 static int
 key_under_root(const Browser * b, const char * key)
 {
-  size_t rlen = strlen(b->root);
-
-  /* A root of "/" (or any key with a trailing separator) would otherwise
-     demand a second separator at the join and reject every child. */
-  while (rlen > 1 && b->root[rlen - 1] == '/') {
-    rlen--;
+  if (strcmp(key, b->root) == 0) {
+    return 1;
   }
-
-  if (strncmp(key, b->root, rlen) != 0) {
+  if (b->src.parent_key == NULL) {
     return 0;
   }
-  return key[rlen] == '\0' || key[rlen] == '/';
+
+  char * cur   = strdup(key);
+  int    under = 0;
+
+  for (int depth = 0; cur != NULL && depth < KEY_DEPTH_MAX; depth++) {
+    char * up = b->src.parent_key(b->src.self, cur);
+    free(cur);
+    cur = up;
+    if (cur != NULL && strcmp(cur, b->root) == 0) {
+      under = 1;
+      break;
+    }
+  }
+
+  free(cur);
+  return under;
 } /* key_under_root */
 
 /*

@@ -125,4 +125,16 @@ void action_dispatch(Action a, int32_t arg);
  */
 void search_dispatch(const char * query);
 
+/*
+ * search_confirm: move the browser to the search result at `index`, in
+ * whichever view is showing, and report if it has no row there. Takes
+ * the index into the rows the last search_dispatch produced; out of
+ * range is a no-op.
+ *
+ * Separate from search_dispatch because it is a different operation on
+ * the same result set, and because it is the point where a search stops
+ * being a list and becomes a position.
+ */
+void search_confirm(size_t index);
+
 #endif // KURONO_UI_KEYMAP_H

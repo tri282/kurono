@@ -14,6 +14,7 @@
 #include "../include/ui/tui.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -598,6 +599,11 @@ typedef struct {
      reason: the QueueEntry it came from dies under queue_clear, which
      ACT_CLEAR_QUEUE reaches while a track is still named here. */
   char            now_path[PATH_MAX];
+  /* The library id of what is playing, or 0 for a --play run with no
+     library behind it. Carried beside the path because since phase 16 a
+     track is addressed by id, not by path: ACT_JUMP_TO_PLAYING needs the
+     row to look up its tags before it can name a position. */
+  int64_t         now_id;
 
   /* Volume, and the whole of gap 4's ruling (2026-08-13). T1 holds the
      authoritative scalar because sink_set_gain and engine_set_gain are
@@ -697,6 +703,7 @@ typedef struct {
  */
 static Player * g_ui_player = NULL;
 
+static void player_locate(Player * p, int64_t track_id, const char * label);
 static void player_drain_cancel(Player * p);
 static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
@@ -923,6 +930,62 @@ action_dispatch(Action a, int32_t arg)
 } /* action_dispatch */
 
 /*
+ * player_row_target: what a browser row means to the queue -- a playable
+ * path and, when the library knows it, the id that goes with it. Takes
+ * the Player, a row, and out-params for a freshly allocated path and the
+ * id; returns 0, or -1 with neither set.
+ *
+ * It exists because a row key stopped being a path. In M1 the browser's
+ * keys were filesystem paths and ACT_ENQUEUE handed row->key straight to
+ * queue_append; since phase 16 a library track's key is a kind byte and
+ * a decimal id, so the queue was being given "I42" as a filename. That
+ * fails at open(2) and not at enqueue, so the report said "queued" and
+ * the failure surfaced a track later.
+ *
+ * The id is asked of the source rather than parsed here, for the reason
+ * browser_library_locate exists: the encoding has one owner.
+ */
+static int
+player_row_target(Player * p, const BrowserRow * row,
+                  char ** out_path, int64_t * out_id)
+{
+  if (row == NULL || row->key == NULL) {
+    return -1;
+  }
+
+  int64_t id = browser_library_track_id(&p->brsrc[p->view], row->key);
+  if (id <= 0) {
+    /* Not a library row -- the filesystem source's keys are still paths,
+       and so is anything a future source hands back that is not a track.
+       Copying it is correct there and harmless here. */
+    char * path = strdup(row->key);
+    if (path == NULL) {
+      return -1;
+    }
+    *out_path = path;
+    *out_id   = 0;
+    return 0;
+  }
+
+  DbTrackRow t;
+  memset(&t, 0, sizeof t);
+  if (p->db == NULL || db_query_track_by_id(p->db, id, &t) != 1 || t.path == NULL) {
+    db_track_row_free_fields(&t);
+    return -1;
+  }
+
+  char * path = strdup(t.path);
+  db_track_row_free_fields(&t);
+  if (path == NULL) {
+    return -1;
+  }
+
+  *out_path = path;
+  *out_id   = id;
+  return 0;
+} /* player_row_target */
+
+/*
  * player_search_free: drop the current result set. Takes the Player,
  * returns nothing. Idempotent, and a no-op when no search has run.
  */
@@ -1021,11 +1084,19 @@ search_dispatch(const char * query)
       snprintf(line, sizeof line, "%s", (title != NULL) ? title : "");
     }
 
+    /* The key is the library id, not the path: a track is addressed by
+       id everywhere since phase 16, and confirming a hit hands this
+       straight to player_locate. Decimal text rather than a parallel
+       int64_t array, because BrowserRow already owns a string here and a
+       second allocation per row would buy nothing. */
+    char idbuf[32];
+    snprintf(idbuf, sizeof idbuf, "%" PRId64, rows[i].id);
+
     p->search_rows[i].name   = strdup(line);
-    p->search_rows[i].key    = (rows[i].path != NULL) ? strdup(rows[i].path) : NULL;
+    p->search_rows[i].key    = strdup(idbuf);
     p->search_rows[i].is_dir = 0;
 
-    if (p->search_rows[i].name == NULL) {
+    if (p->search_rows[i].name == NULL || p->search_rows[i].key == NULL) {
       /* The same degrade every other result set applies: keep what was
          built, say so, and draw a short list rather than none. */
       player_report(p, "out of memory, result truncated");
@@ -1036,6 +1107,26 @@ search_dispatch(const char * query)
 
   db_track_rows_free(rows, n);
 } /* search_dispatch */
+
+/*
+ * search_confirm: see include/ui/keymap.h. Move the browser to the
+ * result at `index`. Takes the index, returns nothing.
+ *
+ * The second consumer of the locate path, and the reason that path is a
+ * function rather than something inlined into the jump: finding a track
+ * by searching for it and finding the one that is playing are the same
+ * move, and the encoding they both need belongs to browser.c either way.
+ */
+void
+search_confirm(size_t index)
+{
+  Player * p = g_ui_player;
+  if (p == NULL || index >= p->search_n || p->search_rows[index].key == NULL) {
+    return;
+  }
+  player_locate(p, (int64_t) strtoll(p->search_rows[index].key, NULL, 10),
+                p->search_rows[index].name);
+} /* search_confirm */
 
 /*
  * trace_report_and_shutdown: teardown step 10 (DESIGN.md IV.9.b) --
@@ -1615,11 +1706,11 @@ drive_seek_paused(Player * p, const atomic_uint_least64_t * pos,
 /*
  * player_now_playing_set: remember the basename of `path` for the status
  * bar. Copies rather than borrowing, because the QueueEntry it came from
- * does not outlive queue_remove or queue_clear. Takes the Player and a
- * path, returns nothing.
+ * does not outlive queue_remove or queue_clear. Takes the Player, a path
+ * and the library id (0 when there is no library row), returns nothing.
  */
 static void
-player_now_playing_set(Player * p, const char * path)
+player_now_playing_set(Player * p, const char * path, int64_t track_id)
 {
   const char * base = strrchr(path, '/');
   base = (base != NULL) ? base + 1 : path;
@@ -1629,6 +1720,7 @@ player_now_playing_set(Player * p, const char * path)
      and reports, which is the same outcome as any other stale key and
      costs less than a second allocation story on this path. */
   snprintf(p->now_path, sizeof p->now_path, "%s", path);
+  p->now_id = track_id;
   p->dur_ms = -1;
 } /* player_now_playing_set */
 
@@ -1654,6 +1746,7 @@ player_stop(Player * p)
   (void) player_set_play_state(p, PLAY_STOPPED);
   p->now_name[0] = '\0';
   p->now_path[0] = '\0';
+  p->now_id      = 0;
   p->dur_ms      = -1;
 } /* player_stop */
 
@@ -1699,7 +1792,7 @@ player_play_entry(Player * p, const QueueEntry * ent)
 
   player_set_redraw(p, 1);
   engine_play(p->e, ent->path, ent->track_id);
-  player_now_playing_set(p, ent->path);
+  player_now_playing_set(p, ent->path, ent->track_id);
 
   /* CMD_PLAY flushes and resyncs both counters to 0 (V.1 step 3), so the
      new track's position is g_frames_consumed alone. The origin survives
@@ -2088,12 +2181,71 @@ player_clear_queue(Player * p)
 } /* player_clear_queue */
 
 /*
+ * player_locate: move the browser to the library track with this id, in
+ * whichever view is showing. Takes the Player, the id and a name for the
+ * message, returns nothing.
+ *
+ * Two callers: ACT_JUMP_TO_PLAYING and confirming a search hit. They are
+ * the same operation with a different track, and are one function rather
+ * than two because the part worth getting right -- the three-way "where
+ * does this track sit in this view" -- is shared, and a second copy of
+ * it would be a second thing to update when a fourth view lands.
+ *
+ * The keys come from browser.c and not from here. Until now this
+ * function took strrchr of the path and passed the halves to
+ * browser_goto, which was right when a key was a path and silently wrong
+ * the moment it stopped being one: a library key is a kind byte and a
+ * payload, so every comparison missed by one byte and the jump reported
+ * "cannot reach" for a track that was on screen.
+ */
+static void
+player_locate(Player * p, int64_t track_id, const char * label)
+{
+  if (p->br == NULL) {
+    player_report(p, "nothing to browse");
+    return;
+  }
+  if (p->db == NULL || track_id <= 0) {
+    /* A --play run has no library row to find, which is less a failure
+       of the jump than an absence of anywhere to jump to. */
+    player_report(p, "no library entry for %s", label);
+    return;
+  }
+
+  DbTrackRow t;
+  memset(&t, 0, sizeof t);
+  if (db_query_track_by_id(p->db, track_id, &t) != 1) {
+    player_report(p, "no library entry for %s", label);
+    return;
+  }
+
+  char * parent = NULL;
+  char * row    = NULL;
+  int    rc     = browser_library_locate(&p->brsrc[p->view], &t, &parent, &row);
+  db_track_row_free_fields(&t);
+
+  if (rc != 0) {
+    /* The track exists but has no row in this view -- no artist tag in
+       the Artists view, say. Saying which view is what makes the next
+       keystroke obvious: the same track is reachable one view over. */
+    player_report(p, "%s is not in this view", label);
+    return;
+  }
+
+  rc = browser_goto(p->br, parent, row);
+  free(parent);
+  free(row);
+
+  if (rc != 0) {
+    player_report(p, "cannot reach %s", label);
+    return;
+  }
+  tui_mark_dirty();
+} /* player_locate */
+
+/*
  * player_jump_to_playing: ACT_JUMP_TO_PLAYING -- move the browser to the
  * playing track. Takes the Player, returns nothing.
- *
- * main.c takes the dirname rather than browser.c, because the key
- * decomposition is the caller's knowledge: M1's keys are filesystem
- * paths, and phase 16's source hands back parents of its own.
  */
 static void
 player_jump_to_playing(Player * p)
@@ -2107,22 +2259,7 @@ player_jump_to_playing(Player * p)
     return;
   }
 
-  char parent[PATH_MAX];
-  snprintf(parent, sizeof parent, "%s", p->now_path);
-  char * slash = strrchr(parent, '/');
-  if (slash == NULL) {
-    player_report(p, "cannot locate %s", p->now_name);
-    return;
-  }
-  /* A track directly under "/" keeps the separator as its parent; every
-     other one drops it. */
-  *(slash == parent ? slash + 1 : slash) = '\0';
-
-  if (browser_goto(p->br, parent, p->now_path) != 0) {
-    player_report(p, "cannot reach %s", p->now_name);
-    return;
-  }
-  tui_mark_dirty();
+  player_locate(p, p->now_id, p->now_name);
 } /* player_jump_to_playing */
 
 /*
@@ -2300,14 +2437,22 @@ player_action(Player * p, Action a, int32_t arg)
         player_report(p, "%s is a directory", sel->name);
         return;
       }
-      /* track_id 0: M1 plays straight off the filesystem and has no
-         library rows yet (DESIGN.md XIV.1). Phase 17's display-metadata
-         branch keys on track_id > 0, which is why the value is carried
-         through the queue from the start rather than added later. */
-      if (queue_append(p->q, 0, sel->key) != 0) {
+      /* The id is 0 only for a source with no library row behind it;
+         phase 17's display-metadata branch keys on track_id > 0, which
+         is why the value is carried through the queue rather than
+         recovered later. */
+      char *  qpath = NULL;
+      int64_t qid   = 0;
+      if (player_row_target(p, sel, &qpath, &qid) != 0) {
         player_report(p, "could not queue %s", sel->name);
         return;
       }
+      if (queue_append(p->q, qid, qpath) != 0) {
+        free(qpath);
+        player_report(p, "could not queue %s", sel->name);
+        return;
+      }
+      free(qpath);
       player_report(p, "queued: %s (%zu in queue)", sel->name,
                     queue_count(p->q));
       tui_mark_dirty();
@@ -2340,14 +2485,23 @@ player_action(Player * p, Action a, int32_t arg)
          order, so queue_advance would return NULL the moment it
          finished and everything already queued behind it would never
          play -- a queue that always stops after exactly one track. */
+      char *  ppath = NULL;
+      int64_t pid   = 0;
+      if (player_row_target(p, sel, &ppath, &pid) != 0) {
+        player_report(p, "could not play %s", sel->name);
+        return;
+      }
+
       size_t at = 0;
-      if (!player_queue_find(p->q, sel->key, &at)) {
+      if (!player_queue_find(p->q, ppath, &at)) {
         at = (queue_count(p->q) == 0) ? 0 : queue_cursor(p->q) + 1;
-        if (queue_insert(p->q, at, 0, sel->key) != 0) {
+        if (queue_insert(p->q, at, pid, ppath) != 0) {
+          free(ppath);
           player_report(p, "could not queue %s", sel->name);
           return;
         }
       }
+      free(ppath);
       /* Set the cursor explicitly: queue_insert adjusts it to keep
          referring to whatever was current *before* the insert, which is
          the opposite of what playing the new entry needs. */
