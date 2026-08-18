@@ -3060,14 +3060,73 @@ player_loop(Player * p)
  * comes from the caller once the scan returns. Takes the unused ctx,
  * the counts, and the path just handled; returns nothing.
  */
+/*
+ * scan_line_close: erase whatever scan_progress_stderr last left on the
+ * line, so a shorter closing message cannot leave the tail of a longer
+ * progress line behind it. Takes and returns nothing.
+ *
+ * "kurono: scanning 38/38" is one character longer than "kurono: scan
+ * complete", so a 38-file scan ended by printing "scan complete8".
+ * Erase-to-end-of-line rather than padding to a fixed width, because the
+ * progress line's length depends on the file count and any fixed width
+ * is wrong for a large enough library. The escape is safe here for the
+ * same reason the carriage return already is: this output only exists
+ * before tb_init, on a terminal (DESIGN.md IV.9.a).
+ */
+static void
+scan_line_close(void)
+{
+  fputs("\r\033[K", stderr);
+} /* scan_line_close */
+
+/*
+ * ScanTally: the last counts scan_progress_stderr saw, so the closing
+ * line can say how much was indexed. It is the ScanOpts ctx, which is
+ * what that field is for -- scan_run returns only the skipped count, and
+ * DESIGN.md V.5 fixes both that return and ScanProgressFn's signature,
+ * so the totals exist nowhere else once the scan has ended.
+ */
+typedef struct {
+  int done;
+  int total;
+} ScanTally;
+
 static void
 scan_progress_stderr(void * ctx, int done, int total, const char * path)
 {
-  (void) ctx;
+  ScanTally * t = (ScanTally *) ctx;
   (void) path;
+
+  if (t != NULL) {
+    t->done  = done;
+    t->total = total;
+  }
   fprintf(stderr, "\rkurono: scanning %d/%d", done, total);
   fflush(stderr);
 } /* scan_progress_stderr */
+
+/*
+ * scan_report: the closing line -- what was indexed, and what was not.
+ * Takes the tally and scan_run's skipped count, returns nothing.
+ *
+ * The counts print unconditionally. They used to appear only when
+ * something was skipped, so a clean scan said "scan complete" and
+ * nothing else -- and an empty root, a mistyped KURONO_MUSIC_DIR and a
+ * good scan of a full library all produced the identical line.
+ */
+static void
+scan_report(const ScanTally * t, int skipped)
+{
+  int indexed = t->done - skipped;
+
+  scan_line_close();
+  fprintf(stderr, "kurono: scan complete, %d track(s) indexed",
+          (indexed > 0) ? indexed : 0);
+  if (skipped > 0) {
+    fprintf(stderr, ", %d file(s) skipped", skipped);
+  }
+  fputc('\n', stderr);
+} /* scan_report */
 
 /*
  * player_start: DESIGN.md IV.9.a steps 1-7, shared by every kind of run.
@@ -3136,27 +3195,25 @@ player_start(Player * p, const char * who, int * have_device)
      rescanned says the index was just cleared, since the flag means
      "do not walk the tree", not "walk it unless it would be slow". */
   if (!p->cfg.no_scan) {
-    ScanOpts so = {
+    ScanTally tally = { 0, 0 };
+    ScanOpts  so    = {
       .roots        = root_paths,
       .nroots       = p->cfg.nroots,
       .ignore_names = (const char * const *) p->cfg.ignore,
       .nignore      = p->cfg.nignore,
       .on_progress  = scan_progress_stderr,
-      .ctx          = NULL,
+      .ctx          = &tally,
     };
     int skipped = scan_run(p->db, &so);
     if (skipped < 0) {
       /* A transaction-level failure leaves the index exactly as it was,
          so this is a degraded start, not a fatal one (DESIGN.md XI.7). */
-      fprintf(stderr, "\rkurono: %s: scan failed, using the existing index\n", who);
+      scan_line_close();
+      fprintf(stderr, "kurono: %s: scan failed, using the existing index\n", who);
     } else {
       /* Closes the carriage-returned progress line scan_progress_stderr
          left open. */
-      fprintf(stderr, "\rkurono: scan complete");
-      if (skipped > 0) {
-        fprintf(stderr, ", %d file(s) skipped", skipped);
-      }
-      fputc('\n', stderr);
+      scan_report(&tally, skipped);
     }
   }
   free(root_paths);
@@ -3619,24 +3676,22 @@ run_scan(void)
   int  rescanned = 0;
   Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
 
-  ScanOpts so = {
+  ScanTally tally = { 0, 0 };
+  ScanOpts  so    = {
     .roots        = root_paths,
     .nroots       = cfg.nroots,
     .ignore_names = (const char * const *) cfg.ignore,
     .nignore      = cfg.nignore,
     .on_progress  = scan_progress_stderr,
-    .ctx          = NULL,
+    .ctx          = &tally,
   };
   int skipped = scan_run(db, &so);
 
   if (skipped < 0) {
-    fprintf(stderr, "\rkurono: --scan: scan failed, index unchanged\n");
+    scan_line_close();
+    fprintf(stderr, "kurono: --scan: scan failed, index unchanged\n");
   } else {
-    fprintf(stderr, "\rkurono: scan complete");
-    if (skipped > 0) {
-      fprintf(stderr, ", %d file(s) skipped", skipped);
-    }
-    fputc('\n', stderr);
+    scan_report(&tally, skipped);
   }
 
   db_close(db);
