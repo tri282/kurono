@@ -54,6 +54,12 @@ typedef enum {
      ACT_PLAY_NOW for it would make the generated help overlay print a
      lie. */
   ACT_HELP_TOGGLE, ACT_MENU_TOGGLE, ACT_CONFIRM,
+  /* Phase 17b, appended for the same reason the three above were: the
+     queue pane is a mode like search, so opening it is one action rather
+     than a view id passed to ACT_VIEW_SET. A view is a source plus a
+     label and the queue is neither -- it is a flat editable list whose
+     rows have no parent to ascend to. */
+  ACT_QUEUE_TOGGLE,
   ACT_COUNT
 } Action;
 
@@ -66,7 +72,7 @@ typedef enum {
  * the name array in tui.c.
  */
 typedef enum {
-  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_COUNT
+  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_QUEUE, MODE_COUNT
 } UiMode;
 
 /*

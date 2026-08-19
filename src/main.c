@@ -11,12 +11,14 @@
 #include "../include/queue.h"
 #include "../include/ui/browser.h"
 #include "../include/ui/keymap.h"
+#include "../include/ui/queueview.h"
 #include "../include/ui/tui.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -327,6 +329,11 @@ run_decode(const char * path)
    main.c ignorant of that internal. */
 #define PLAYER_MAX_FIRED 8
 
+/* How often the ACT_RESCAN progress line repaints, in files. The scan
+   blocks T1, so this is the only repaint happening for its duration --
+   every file would mean one tb_present per file. */
+#define SCAN_UI_EVERY 32
+
 /* Seek-stress target step. A prime, so consecutive targets land far
    apart in the file rather than walking forward: the flush_gen defect
    this row exists to stress is a flush arriving while T2 is midway
@@ -633,6 +640,18 @@ typedef struct {
   uint64_t        drain_until;
   int             drain_ticks;
 
+  /* Amendment 09's transition state, all three fields T1-only.
+     `pend_b` is one boundary entry read out of boundary_ring but not yet
+     due: ring.h has no peek, and the consumer side of a peek is exactly
+     a one-slot hold. `next_pos` is the play-order position T1 last
+     prefetched, which is what the boundary pop moves the cursor to --
+     searching by track_id cannot work, because an entry may have
+     track_id 0 and the same track may be queued twice. */
+  BoundaryEntry   pend_b;
+  int             pend_have;
+  size_t          next_pos;
+  int             next_valid;
+
   DeviceState     dev;
   PlayState       play;              /* T1's own; amendment 05 IV.9.a.i */
   int             ladder_attempt;    /* index into g_ladder_backoff_ms */
@@ -704,6 +723,13 @@ typedef struct {
 static Player * g_ui_player = NULL;
 
 static void player_locate(Player * p, int64_t track_id, const char * label);
+static int  player_play_entry(Player * p, const QueueEntry * ent);
+static void player_queue_confirm(Player * p);
+static int  player_queue_playing_index(const Player * p);
+static void player_rescan(Player * p);
+static void player_fill_model(Player * p, TuiModel * out);
+static void player_queue_changed(Player * p);
+static void player_prefetch_next(Player * p);
 static void player_drain_cancel(Player * p);
 static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
@@ -781,6 +807,34 @@ player_report(Player * p, const char * fmt, ...)
  *
  * Never writes to stderr: termbox2 owns the terminal here.
  */
+/*
+ * queue_cursor_action: move the queue pane's cursor for one navigation
+ * action. Takes the action, returns 1 when it moved the cursor and 0
+ * when the action was not a cursor move.
+ *
+ * Separate from the browser's block in action_dispatch because the two
+ * lists are never both focused: whichever is on top consumes the keys
+ * outright.
+ */
+static int
+queue_cursor_action(Action a)
+{
+  const TuiLayout * l = tui_layout();
+  int page = (l != NULL && l->body_h > 1) ? l->body_h - 1 : 1;
+
+  switch (a) {
+    case ACT_CURSOR_UP:        queueview_cursor_move(-1);         return 1;
+    case ACT_CURSOR_DOWN:      queueview_cursor_move(1);          return 1;
+    case ACT_CURSOR_PAGE_UP:   queueview_cursor_move(-page);      return 1;
+    case ACT_CURSOR_PAGE_DOWN: queueview_cursor_move(page);       return 1;
+    case ACT_CURSOR_HOME:      queueview_cursor_set(0);           return 1;
+    /* SIZE_MAX clamps to the last row inside queueview_cursor_set, which
+       is the only place that knows the count. */
+    case ACT_CURSOR_END:       queueview_cursor_set(SIZE_MAX);    return 1;
+    default:                   return 0;
+  }
+} /* queue_cursor_action */
+
 void
 action_dispatch(Action a, int32_t arg)
 {
@@ -813,6 +867,26 @@ action_dispatch(Action a, int32_t arg)
     return;
   }
 
+  if (a == ACT_QUEUE_TOGGLE) {
+    /* Rebuilt on the way in, never per repaint: the pane's contents can
+       only change through an action, and every action that changes them
+       rebuilds. */
+    if (ui_mode() == MODE_QUEUE) {
+      ui_mode_pop();
+    } else if (ui_mode_toggle(MODE_QUEUE) > 0) {
+      queueview_rebuild(p->q, p->db);
+      /* Open on what is playing rather than at the top: the pane is
+         opened to see where you are far more often than to see entry 1. */
+      if (p->q != NULL && queue_count(p->q) > 0) {
+        queueview_cursor_set(queue_cursor(p->q));
+      }
+    } else {
+      player_report(p, "terminal too small for the queue");
+    }
+    tui_mark_dirty();
+    return;
+  }
+
   if (a == ACT_MENU_TOGGLE) {
     /* Phase 17b owns the menu. The key is bound now so the keymap
        settles in one change; pushing MODE_MENU with nothing to draw
@@ -823,7 +897,21 @@ action_dispatch(Action a, int32_t arg)
   }
 
   if (a == ACT_CONFIRM) {
+    if (ui_mode() == MODE_QUEUE) {
+      player_queue_confirm(p);
+      return;
+    }
     player_report(p, "confirm: nothing to confirm yet");
+    tui_mark_dirty();
+    return;
+  }
+
+  /* The queue pane owns the cursor keys while it is up. Checked above
+     the browser's navigation block rather than inside it: the browser is
+     still on screen underneath and must not move, and a pane whose
+     arrows moved the list behind it would be the same class of silent
+     wrongness as an unbound key. */
+  if (ui_mode() == MODE_QUEUE && queue_cursor_action(a)) {
     tui_mark_dirty();
     return;
   }
@@ -984,6 +1072,158 @@ player_row_target(Player * p, const BrowserRow * row,
   *out_id   = id;
   return 0;
 } /* player_row_target */
+
+/*
+ * player_enqueue_rows: append every track in `rows` to the queue. Takes
+ * the Player, the rows and their count, and an out-param for how many
+ * landed; returns 0, or -1 if nothing could be queued at all.
+ *
+ * A row with no path, or one queue_append refuses, is skipped and
+ * counted rather than abandoning the rest -- per-file failures are never
+ * fatal (CLAUDE.md), and half an album queued beats none. The caller
+ * still owns `rows`.
+ */
+static int
+player_enqueue_rows(Player * p, const DbTrackRow * rows, size_t n, size_t * out_added)
+{
+  size_t added = 0;
+
+  for (size_t i = 0; i < n; i++) {
+    if (rows[i].path == NULL) {
+      continue;
+    }
+    if (queue_append(p->q, rows[i].id, rows[i].path) == 0) {
+      added++;
+    }
+  }
+
+  *out_added = added;
+  return (added > 0 || n == 0) ? 0 : -1;
+} /* player_enqueue_rows */
+
+/*
+ * player_enqueue_row: ACT_ENQUEUE's whole body, for one browser row of
+ * any kind. Takes the Player and the selected row, returns nothing --
+ * every outcome is a status-bar line.
+ *
+ * A container row is expanded by the source (browser_library_expand),
+ * never by parsing its key here: phase 16's ruling that the encoding has
+ * exactly one owner. A row that expands to nothing and is not a track is
+ * reported as empty rather than queued silently.
+ */
+static void
+player_enqueue_row(Player * p, const BrowserRow * sel)
+{
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+  size_t       added = 0;
+
+  if (browser_library_expand(&p->brsrc[p->view], sel->key, &rows, &n) == 0 && n > 0) {
+    int rc = player_enqueue_rows(p, rows, n, &added);
+    db_track_rows_free(rows, n);
+    if (rc != 0) {
+      player_report(p, "could not queue %s", sel->name);
+      return;
+    }
+    /* The skipped count is reported rather than swallowed: an album that
+       queues 11 of 12 tracks has a reason, and silence here would make
+       the missing one look like a scan bug later. */
+    player_queue_changed(p);
+    if (added < n) {
+      player_report(p, "queued %zu of %zu tracks from %s (%zu in queue)",
+                    added, n, sel->name, queue_count(p->q));
+    } else {
+      player_report(p, "queued %zu tracks from %s (%zu in queue)", added,
+                    sel->name, queue_count(p->q));
+    }
+    tui_mark_dirty();
+    return;
+  }
+  db_track_rows_free(rows, n);
+
+  if (sel->is_dir) {
+    /* A container the source could not expand, or one holding nothing:
+       the synthetic root is the first, an empty directory the second.
+       Neither is an error and neither queues anything. */
+    player_report(p, "%s holds no tracks", sel->name);
+    return;
+  }
+
+  /* A track. The id is 0 only for a source with no library row behind
+     it; the display-metadata branch keys on track_id > 0, which is why
+     the value is carried through the queue rather than recovered
+     later. */
+  char *  qpath = NULL;
+  int64_t qid   = 0;
+  if (player_row_target(p, sel, &qpath, &qid) != 0) {
+    player_report(p, "could not queue %s", sel->name);
+    return;
+  }
+  if (queue_append(p->q, qid, qpath) != 0) {
+    free(qpath);
+    player_report(p, "could not queue %s", sel->name);
+    return;
+  }
+  free(qpath);
+  player_queue_changed(p);
+  player_report(p, "queued: %s (%zu in queue)", sel->name, queue_count(p->q));
+  tui_mark_dirty();
+} /* player_enqueue_row */
+
+/*
+ * player_play_container: ACT_PLAY_NOW on a directory, album or artist
+ * row -- insert everything it holds after the cursor and start the first
+ * of it. Takes the Player and the row, returns nothing.
+ *
+ * Inserting rather than appending, for the reason the track path
+ * records: an append puts the tracks last in play order, so
+ * queue_advance returns NULL the moment the first one ends and
+ * everything already queued behind it never plays. There is deliberately
+ * no dedupe here -- the track path dedupes because Enter on one row the
+ * user already queued means "go there", and no such single entry exists
+ * for a container.
+ */
+static void
+player_play_container(Player * p, const BrowserRow * sel)
+{
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+  size_t       added = 0;
+
+  if (browser_library_expand(&p->brsrc[p->view], sel->key, &rows, &n) != 0 || n == 0) {
+    db_track_rows_free(rows, n);
+    player_report(p, "%s holds no tracks", sel->name);
+    return;
+  }
+
+  size_t at = (queue_count(p->q) == 0) ? 0 : queue_cursor(p->q) + 1;
+  for (size_t i = 0; i < n; i++) {
+    if (rows[i].path == NULL) {
+      continue;
+    }
+    if (queue_insert(p->q, at + added, rows[i].id, rows[i].path) == 0) {
+      added++;
+    }
+  }
+  db_track_rows_free(rows, n);
+
+  if (added == 0) {
+    player_report(p, "could not queue %s", sel->name);
+    return;
+  }
+
+  /* Set the cursor explicitly: queue_insert adjusts it to keep referring
+     to whatever was current *before* the insert, which is the opposite
+     of what playing the first new entry needs. */
+  if (queue_set_cursor(p->q, at) != 0) {
+    player_report(p, "could not select %s", sel->name);
+    return;
+  }
+  p->fail_count = 0; /* an explicit user action starts a fresh streak */
+  player_queue_changed(p);
+  player_report(p, "playing %s (%zu tracks)", sel->name, added);
+  (void) player_play_entry(p, queue_at(p->q, at));
+} /* player_play_container */
 
 /*
  * player_search_free: drop the current result set. Takes the Player,
@@ -1744,6 +1984,10 @@ player_stop(Player * p)
   player_drain_cancel(p);  /* amendment 06 rule 4 */
   player_set_redraw(p, 0); /* VIII.3: nothing left to tick for */
   (void) player_set_play_state(p, PLAY_STOPPED);
+  /* After the state change, so it takes the PLAY_STOPPED branch and
+     clears T2's prefetch slot: nothing follows a stopped player, and a
+     slot left full would be consumed at the next track's EOF. */
+  player_prefetch_next(p);
   p->now_name[0] = '\0';
   p->now_path[0] = '\0';
   p->now_id      = 0;
@@ -1813,6 +2057,171 @@ player_play_entry(Player * p, const QueueEntry * ent)
 } /* player_play_entry */
 
 /*
+ * player_queue_changed: everything that has to happen after the queue is
+ * mutated. Takes the Player, returns nothing.
+ *
+ * One function because the two halves must never drift apart: the pane
+ * has to be rebuilt so it shows the new order, and T2 has to be told
+ * again what follows, because queue.h only guarantees
+ * queue_peek_advance matches the following queue_advance when nothing
+ * mutated in between. A mutation site that rebuilt the pane and forgot
+ * the re-push would look completely correct and play the wrong track at
+ * the next boundary.
+ */
+static void
+player_queue_changed(Player * p)
+{
+  queueview_rebuild(p->q, p->db);
+  player_prefetch_next(p);
+} /* player_queue_changed */
+
+/*
+ * player_prefetch_next: tell T2 what follows the current track
+ * (amendment 09). Takes the Player, returns nothing.
+ *
+ * Called on EV_STREAM_INFO and after every queue mutation, because
+ * queue.h guarantees queue_peek_advance predicts the following
+ * queue_advance only while nothing mutates in between -- in the shuffled
+ * REPEAT_ALL wrap it predicts a permutation from a copy of the rand_r
+ * state, and any edit invalidates the prediction.
+ *
+ * Clearing the slot is as important as filling it: at the end of the
+ * queue T2 must fall through to the EV_EOF path, and a stale prefetch
+ * from before the last entry was removed would play a track that is no
+ * longer queued.
+ */
+static void
+player_prefetch_next(Player * p)
+{
+  p->next_valid = 0;
+
+  if (p->e == NULL) {
+    return;
+  }
+  if (p->q == NULL || p->play == PLAY_STOPPED) {
+    engine_set_next(p->e, NULL, 0);
+    return;
+  }
+
+  const QueueEntry * next = queue_peek_advance(p->q);
+  if (next == NULL || next->path == NULL) {
+    engine_set_next(p->e, NULL, 0);
+    return;
+  }
+
+  /* The position, not just the entry: the boundary pop needs somewhere
+     to put the cursor. A pointer scan rather than an index out of
+     queue_peek_advance, which does not report one -- the entry stays
+     valid until the next mutation, and every mutation re-runs this. */
+  size_t n = queue_count(p->q);
+  for (size_t i = 0; i < n; i++) {
+    if (queue_at(p->q, i) == next) {
+      p->next_pos   = i;
+      p->next_valid = 1;
+      break;
+    }
+  }
+
+  engine_set_next(p->e, next->path, next->track_id);
+} /* player_prefetch_next */
+
+/*
+ * player_on_boundary: one popped boundary_ring entry -- the track T2
+ * moved to has now actually reached the speakers (DESIGN.md V.3 step 5).
+ * Takes the Player and the entry, returns nothing.
+ *
+ * The cursor follows the recorded prefetch position and then verifies
+ * it, rather than searching for the track_id: an entry may carry
+ * track_id 0, and ACT_ENQUEUE never dedupes, so a search is ambiguous by
+ * construction. The fallbacks exist for the one race amendment 09
+ * leaves open -- the queue mutated after T2 consumed the slot -- and
+ * degrade rather than guess.
+ */
+static void
+player_on_boundary(Player * p, const BoundaryEntry * b)
+{
+  size_t n = (p->q != NULL) ? queue_count(p->q) : 0;
+  int    placed = 0;
+
+  if (n > 0 && p->next_valid && p->next_pos < n) {
+    const QueueEntry * e = queue_at(p->q, p->next_pos);
+    if (e != NULL && e->track_id == b->track_id) {
+      (void) queue_set_cursor(p->q, p->next_pos);
+      placed = 1;
+    }
+  }
+
+  if (!placed && n > 0 && b->track_id > 0) {
+    for (size_t i = 0; i < n; i++) {
+      const QueueEntry * e = queue_at(p->q, i);
+      if (e != NULL && e->track_id == b->track_id) {
+        (void) queue_set_cursor(p->q, i);
+        placed = 1;
+        break;
+      }
+    }
+  }
+
+  /* Neither worked: the queue no longer contains what is sounding. The
+     cursor stays where it is rather than moving somewhere arbitrary, and
+     now-playing below still names the truth. */
+  const QueueEntry * cur = (placed && p->q != NULL)
+                               ? queue_at(p->q, queue_cursor(p->q))
+                               : NULL;
+  if (cur != NULL && cur->path != NULL) {
+    player_now_playing_set(p, cur->path, cur->track_id);
+  }
+
+  /* The elapsed clock restarts at the boundary, in the same frame domain
+     the boundary is keyed on. dur_ms is cleared until the new track's
+     EV_STREAM_INFO arrives, so the progress bar shows an unknown length
+     rather than the previous track's. */
+  int rate = (int) p->fmt.sample_rate;
+  p->pos_origin_ms = (rate > 0)
+                         ? -(int64_t) (b->frame_index * 1000u / (uint64_t) rate)
+                         : 0;
+  p->dur_ms     = -1;
+  p->fail_count = 0; /* a track that reached its boundary played */
+
+  queueview_rebuild(p->q, p->db);
+  player_prefetch_next(p);
+  tui_mark_dirty();
+} /* player_on_boundary */
+
+/*
+ * player_drain_boundaries: pop every boundary whose frame has been
+ * consumed. Takes the Player and the current consumed count, returns
+ * nothing.
+ *
+ * T1 is the only reader of boundary_ring, which is what keeps it SPSC.
+ * ring.h has no peek, so an entry that is read but not yet due is held
+ * in p->pend_b until it is -- the loop must not drop it and must not
+ * read a second one over it.
+ */
+static void
+player_drain_boundaries(Player * p, uint64_t consumed)
+{
+  Ring * br = engine_boundary_ring(p->e);
+  if (br == NULL) {
+    return;
+  }
+
+  for (;;) {
+    if (!p->pend_have) {
+      if (ring_read(br, &p->pend_b, sizeof p->pend_b) != sizeof p->pend_b) {
+        return;
+      }
+      p->pend_have = 1;
+    }
+    if (p->pend_b.frame_index > consumed) {
+      return; /* not audible yet; it stays held for a later tick */
+    }
+    p->pend_have = 0;
+    player_on_boundary(p, &p->pend_b);
+  }
+} /* player_drain_boundaries */
+
+/*
  * player_advance: DESIGN.md V.1 step 5 and V.4 -- move to whatever plays
  * next and start it, or stop at the end of the queue.
  *
@@ -1851,6 +2260,13 @@ player_drain_cancel(Player * p)
 {
   p->drain_until = 0;
   p->drain_ticks = 0;
+  /* A held boundary entry goes with it, and for the identical reason:
+     its frame_index is a value in the pre-flush frame domain, and
+     pcm_flush_and_resync rewinds both counters and resets boundary_ring
+     under it. Keeping it would fire the next transition immediately
+     against a counter that just went back to zero. */
+  p->pend_have  = 0;
+  p->next_valid = 0;
 } /* player_drain_cancel */
 
 /*
@@ -2176,9 +2592,126 @@ player_clear_queue(Player * p)
   }
   queue_clear(p->q);
   p->fail_count = 0;
+  player_queue_changed(p);
   player_report(p, "queue cleared");
   tui_mark_dirty();
 } /* player_clear_queue */
+
+/*
+ * player_queue_playing_index: the play-order position of the entry that
+ * is sounding, or -1 when nothing is. Takes the Player.
+ *
+ * The queue cursor is the answer while playing: it is what player_advance
+ * and player_play_entry move, and after phase 17e it is also what a track
+ * boundary moves. Stopped, there is no playing entry and the pane must
+ * not mark one -- a stale highlight on the last thing heard reads as
+ * "this is playing" and is the one thing the marker exists to say.
+ */
+static int
+player_queue_playing_index(const Player * p)
+{
+  if (p->q == NULL || p->play == PLAY_STOPPED || queue_count(p->q) == 0) {
+    return -1;
+  }
+  return (int) queue_cursor(p->q);
+} /* player_queue_playing_index */
+
+/*
+ * player_queue_remove: ACT_REMOVE against the queue pane's cursor. Takes
+ * the Player, returns nothing.
+ *
+ * Removing the entry that is playing does not stop playback: the audio
+ * already in flight belongs to a track that is open, and killing it
+ * because its queue row went away would make "tidy the queue" a
+ * transport action. What plays next comes from wherever the cursor lands,
+ * which queue_remove has already decided.
+ */
+static void
+player_queue_remove(Player * p)
+{
+  if (p->q == NULL || queue_count(p->q) == 0) {
+    player_report(p, "queue is empty");
+    return;
+  }
+
+  size_t at = queueview_cursor();
+  if (at >= queue_count(p->q)) {
+    at = queue_count(p->q) - 1;
+  }
+  if (queue_remove(p->q, at) != 0) {
+    player_report(p, "could not remove entry %zu", at + 1);
+    return;
+  }
+
+  player_queue_changed(p);
+  queueview_cursor_set(at);
+  player_report(p, "removed entry %zu (%zu left)", at + 1, queue_count(p->q));
+  tui_mark_dirty();
+} /* player_queue_remove */
+
+/*
+ * player_queue_move: ACT_MOVE_UP / ACT_MOVE_DOWN. Takes the Player and
+ * the direction (-1 or 1), returns nothing.
+ *
+ * The cursor follows the entry rather than staying at the position, so
+ * holding the key walks one entry up the list instead of swapping two
+ * entries repeatedly.
+ */
+static void
+player_queue_move(Player * p, int dir)
+{
+  if (p->q == NULL || queue_count(p->q) == 0) {
+    player_report(p, "queue is empty");
+    return;
+  }
+
+  size_t n    = queue_count(p->q);
+  size_t from = queueview_cursor();
+  if (from >= n) {
+    from = n - 1;
+  }
+  if ((dir < 0 && from == 0) || (dir > 0 && from + 1 >= n)) {
+    return; /* already at the end it is being moved toward */
+  }
+
+  size_t to = (dir < 0) ? from - 1 : from + 1;
+  if (queue_move(p->q, from, to) != 0) {
+    player_report(p, "could not move entry %zu", from + 1);
+    return;
+  }
+
+  player_queue_changed(p);
+  queueview_cursor_set(to);
+  tui_mark_dirty();
+} /* player_queue_move */
+
+/*
+ * player_queue_confirm: Enter in the queue pane -- play the entry under
+ * the cursor. Takes the Player, returns nothing.
+ *
+ * An explicit user action, so it is a real CMD_PLAY and therefore
+ * flushes (DESIGN.md V.1 step 3), unlike the natural transition phase
+ * 17e adds.
+ */
+static void
+player_queue_confirm(Player * p)
+{
+  if (p->q == NULL || queue_count(p->q) == 0) {
+    player_report(p, "queue is empty");
+    return;
+  }
+
+  size_t at = queueview_cursor();
+  if (at >= queue_count(p->q)) {
+    at = queue_count(p->q) - 1;
+  }
+  if (queue_set_cursor(p->q, at) != 0) {
+    player_report(p, "could not select entry %zu", at + 1);
+    return;
+  }
+  p->fail_count = 0; /* an explicit user action starts a fresh streak */
+  (void) player_play_entry(p, queue_at(p->q, at));
+} /* player_queue_confirm */
 
 /*
  * player_locate: move the browser to the library track with this id, in
@@ -2391,6 +2924,10 @@ player_action(Player * p, Action a, int32_t arg)
         return;
       }
       queue_set_shuffle(p->q, !queue_shuffle(p->q));
+      /* Both toggles re-push the prefetch: neither changes the entries,
+         but both change which one comes next, and T2 is holding the old
+         answer (amendment 09 IV). */
+      player_queue_changed(p);
       player_report(p, "shuffle %s", queue_shuffle(p->q) ? "on" : "off");
       tui_mark_dirty();
       return;
@@ -2404,6 +2941,7 @@ player_action(Player * p, Action a, int32_t arg)
       static const char * const name[] = { "off", "all", "one" };
       RepeatMode next = (RepeatMode) ((queue_repeat(p->q) + 1) % 3);
       queue_set_repeat(p->q, next);
+      player_queue_changed(p);
       player_report(p, "repeat %s", name[next]);
       tui_mark_dirty();
       return;
@@ -2413,12 +2951,28 @@ player_action(Player * p, Action a, int32_t arg)
       player_clear_queue(p);
       return;
 
+    case ACT_REMOVE:
+      player_queue_remove(p);
+      return;
+
+    case ACT_MOVE_UP:
+      player_queue_move(p, -1);
+      return;
+
+    case ACT_MOVE_DOWN:
+      player_queue_move(p, 1);
+      return;
+
     case ACT_JUMP_TO_PLAYING:
       player_jump_to_playing(p);
       return;
 
     case ACT_RETRY_DEVICE:
       player_retry_device(p);
+      return;
+
+    case ACT_RESCAN:
+      player_rescan(p);
       return;
 
     case ACT_ENQUEUE: {
@@ -2431,31 +2985,7 @@ player_action(Player * p, Action a, int32_t arg)
         player_report(p, "nothing selected");
         return;
       }
-      if (sel->is_dir) {
-        /* Recursive enqueue of a directory is phase 16's, where the
-           library query can answer it without walking the tree on T1. */
-        player_report(p, "%s is a directory", sel->name);
-        return;
-      }
-      /* The id is 0 only for a source with no library row behind it;
-         phase 17's display-metadata branch keys on track_id > 0, which
-         is why the value is carried through the queue rather than
-         recovered later. */
-      char *  qpath = NULL;
-      int64_t qid   = 0;
-      if (player_row_target(p, sel, &qpath, &qid) != 0) {
-        player_report(p, "could not queue %s", sel->name);
-        return;
-      }
-      if (queue_append(p->q, qid, qpath) != 0) {
-        free(qpath);
-        player_report(p, "could not queue %s", sel->name);
-        return;
-      }
-      free(qpath);
-      player_report(p, "queued: %s (%zu in queue)", sel->name,
-                    queue_count(p->q));
-      tui_mark_dirty();
+      player_enqueue_row(p, sel);
       return;
     }
 
@@ -2470,7 +3000,7 @@ player_action(Player * p, Action a, int32_t arg)
         return;
       }
       if (sel->is_dir) {
-        player_report(p, "%s is a directory", sel->name);
+        player_play_container(p, sel);
         return;
       }
 
@@ -2502,6 +3032,7 @@ player_action(Player * p, Action a, int32_t arg)
         }
       }
       free(ppath);
+      player_queue_changed(p);
       /* Set the cursor explicitly: queue_insert adjusts it to keep
          referring to whatever was current *before* the insert, which is
          the opposite of what playing the new entry needs. */
@@ -2521,6 +3052,126 @@ player_action(Player * p, Action a, int32_t arg)
   player_report(p, "%s (arg %d) -- not implemented yet", action_name(a),
                 (int) arg);
 } /* player_action */
+
+/*
+ * ScanUi: the ScanProgressFn ctx for ACT_RESCAN. Carries the Player the
+ * progress line is painted onto and the same two counts the stderr
+ * tally keeps, so the closing line can name what was indexed.
+ */
+typedef struct {
+  Player * p;
+  int      done;
+  int      total;
+} ScanUi;
+
+/*
+ * scan_progress_statusbar: the second implementation of ScanProgressFn,
+ * and the reason the seam exists (DESIGN.md V.5). Takes the ctx, the
+ * counts and the current path; returns nothing.
+ *
+ * Never writes to stderr: the terminal is claimed by termbox2 here, and
+ * a printf on this path corrupts the display rather than logging
+ * anything. The scan is synchronous on T1, so this is also the only
+ * thing repainting for its duration -- the event loop does not run
+ * again until scan_run returns.
+ */
+static void
+scan_progress_statusbar(void * ctx, int done, int total, const char * path)
+{
+  ScanUi * u = (ScanUi *) ctx;
+  (void) path;
+
+  if (u == NULL || u->p == NULL) {
+    return;
+  }
+  u->done  = done;
+  u->total = total;
+
+  /* ponytail: repaint every SCAN_UI_EVERY files rather than on a clock.
+     One tb_present per file is the thing to avoid and this avoids it;
+     if a slow root ever makes the line look frozen between two
+     multiples, this becomes a timerfd read, not a smaller modulus. */
+  if (done % SCAN_UI_EVERY != 0 && done != total) {
+    return;
+  }
+
+  snprintf(u->p->message, sizeof u->p->message, "scanning %d/%d", done, total);
+
+  TuiModel m;
+  player_fill_model(u->p, &m);
+  tui_draw(&m);
+} /* scan_progress_statusbar */
+
+/*
+ * player_rescan: ACT_RESCAN. Takes the Player, returns nothing.
+ *
+ * The scan is synchronous on T1 and blocks the UI for its duration,
+ * which is accepted for v1 (DESIGN.md V.5). A warm rescan is stat-bound;
+ * a cold one on a large library is not, and after the gapless transition
+ * lands a rescan long enough to starve the decoder's lead will underrun
+ * and can miss a track boundary. A background scan is post-v1 and lands
+ * on this same callback without changing scan.c.
+ */
+static void
+player_rescan(Player * p)
+{
+  if (p->db == NULL) {
+    player_report(p, "no library index");
+    return;
+  }
+
+  const char ** root_paths = calloc(p->cfg.nroots, sizeof *root_paths);
+  if (root_paths == NULL) {
+    player_report(p, "out of memory, rescan skipped");
+    return;
+  }
+  for (size_t i = 0; i < p->cfg.nroots; i++) {
+    root_paths[i] = p->cfg.roots[i].path;
+  }
+
+  ScanUi   ui = { p, 0, 0 };
+  ScanOpts so = {
+    .roots        = root_paths,
+    .nroots       = p->cfg.nroots,
+    .ignore_names = (const char * const *) p->cfg.ignore,
+    .nignore      = p->cfg.nignore,
+    .on_progress  = scan_progress_statusbar,
+    .ctx          = &ui,
+  };
+
+  int skipped = scan_run(p->db, &so);
+  free(root_paths);
+
+  if (skipped < 0) {
+    /* A transaction-level failure rolls back, so the index is exactly
+       what it was and nothing below needs invalidating. */
+    player_report(p, "rescan failed, index unchanged");
+    tui_mark_dirty();
+    return;
+  }
+
+  /* Every column and the queue's cached metadata are now stale: rows
+     may have gone, and a queued entry's track_id may no longer resolve.
+     The queue itself is not touched -- an entry whose id is dangling
+     falls back to its path, which is the branch DESIGN.md III.2 has
+     carried since phase 9 and which this is the v1 consumer of. */
+  for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+    if (p->brv[v] != NULL) {
+      (void) browser_reload(p->brv[v]);
+    }
+  }
+  queueview_rebuild(p->q, p->db);
+
+  int indexed = ui.done - skipped;
+  if (skipped > 0) {
+    player_report(p, "rescan complete, %d track(s) indexed, %d skipped",
+                  (indexed > 0) ? indexed : 0, skipped);
+  } else {
+    player_report(p, "rescan complete, %d track(s) indexed",
+                  (indexed > 0) ? indexed : 0);
+  }
+  tui_mark_dirty();
+} /* player_rescan */
 
 /*
  * player_watchdog: DESIGN.md IV.8.a's authoritative detector. On every
@@ -2614,6 +3265,10 @@ player_handle_engine_event(Player * p, const Event * ev)
          player_track_failed for why that would defeat the counter. */
       p->dur_ms = ev->info.duration_ms;
       if (p->ui) {
+        /* The first point at which the current track is provably open,
+           and therefore the point at which "what follows it" is worth
+           telling T2 (amendment 09). */
+        player_prefetch_next(p);
         tui_mark_dirty();
         break;
       }
@@ -2754,9 +3409,22 @@ player_tick(Player * p)
      so this costs no new fd, no new timer and nothing in the callback.
      The bound is rule 7 -- advance anyway rather than hang if T3 stops
      consuming. */
+  uint64_t consumed =
+      atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
+
+  /* DESIGN.md V.3 step 5, on the same counter load: a track transition
+     becomes visible when the frames T2 wrote before it have actually
+     been read out of pcm_ring, not when T2 decoded them.
+
+     The two counters compared here live in the same domain only because
+     IV.2 step 6 counts frames actually read from the ring and never the
+     device's requested frameCount. A change there makes every boundary
+     after the first underrun fire early, silently and cumulatively. */
+  if (p->e != NULL) {
+    player_drain_boundaries(p, consumed);
+  }
+
   if (p->drain_until != 0) {
-    uint64_t consumed =
-        atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
     if (consumed >= p->drain_until || ++p->drain_ticks >= PLAYER_DRAIN_MAX_TICKS) {
       player_drain_finish(p);
     }
@@ -2781,13 +3449,16 @@ player_tick(Player * p)
 } /* player_tick */
 
 /*
- * player_repaint: fill a TuiModel from the Player and hand it to the one
- * tb_present in the program. Called once at the bottom of a loop
- * iteration and only when something marked the screen dirty. Takes the
- * Player, returns nothing.
+ * player_fill_model: describe the Player to the draw code. Takes the
+ * Player and the model to fill, returns nothing.
+ *
+ * Separate from player_repaint so the scan-progress callback can repaint
+ * from the same description without rebuilding the derived columns --
+ * during a rescan those would re-query a database whose write
+ * transaction is still open, once per file.
  */
 static void
-player_repaint(Player * p)
+player_fill_model(Player * p, TuiModel * out)
 {
   TuiModel m;
   memset(&m, 0, sizeof m);
@@ -2801,15 +3472,14 @@ player_repaint(Player * p)
   m.paused      = (p->play == PLAY_PAUSED);
   m.volume_pct  = p->vol_pct;
   m.muted       = p->muted;
-  /* The one place the derived columns are rebuilt: once per repaint,
-     never in a cursor action. Holding a movement key therefore costs one
-     pair of loads per frame rather than one per repeat
-     (phase-16-browser.md III, "Column reload"). */
-  browser_refresh_derived(p->br);
   m.browser     = p->br;
   m.view        = p->view;
   m.search_rows = p->search_rows;
   m.search_n    = p->search_n;
+  m.queue_rows  = queueview_rows();
+  m.queue_n     = queueview_count();
+  m.queue_cursor = queueview_cursor();
+  m.queue_playing = player_queue_playing_index(p);
   m.music_dir   = (p->cfg.nroots > 0) ? p->cfg.roots[0].path : NULL;
 
   /* DESIGN.md XI.7: a result set that ran out of memory is reported and
@@ -2832,6 +3502,29 @@ player_repaint(Player * p)
   m.internal_format   = p->fmt.internal_format;
   m.internal_channels = p->fmt.internal_channels;
 
+  *out = m;
+} /* player_fill_model */
+
+/*
+ * player_repaint: fill a TuiModel from the Player and hand it to the one
+ * tb_present in the program. Called once at the bottom of a loop
+ * iteration and only when something marked the screen dirty. Takes the
+ * Player, returns nothing.
+ */
+static void
+player_repaint(Player * p)
+{
+  TuiModel m;
+
+  /* The one place the derived columns are rebuilt: once per repaint,
+     never in a cursor action. Holding a movement key therefore costs one
+     pair of loads per frame rather than one per repeat
+     (phase-16-browser.md III, "Column reload"). It is also deliberately
+     not in player_fill_model: the scan-progress repaint shares the fill
+     and must not re-query the database while a scan holds the write
+     transaction open. */
+  browser_refresh_derived(p->br);
+  player_fill_model(p, &m);
   tui_draw(&m);
 } /* player_repaint */
 
@@ -2917,8 +3610,12 @@ shutdown_all(Player * p)
         exists to make unwriteable. */
   /* Before the browsers only for tidiness -- the results borrow nothing
      from them. A run can end with a search still open, which is the only
-     reason this is here at all. */
+     reason this is here at all. The queue pane's rows are in the same
+     position and freed for the same reason: they borrow nothing, and a
+     run can end with the pane up. Both must go before db_close, though,
+     which is step 7 below -- the rows were built from it. */
   player_search_free(p);
+  queueview_free();
 
   for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
     browser_destroy(p->brv[v]);

@@ -500,10 +500,11 @@ draw_body(const TuiModel * m)
                   browser_scroll(m->browser), 1, 0, STYLE_COUNT);
     }
 
-    /* Column 2 is the search results while a search is up, and the
-       selection's preview otherwise. The preview cache underneath is
-       untouched either way, which is what makes cancelling restore it
-       exactly: there is nothing to restore. */
+    /* Column 2 is the search results while a search is up, the queue
+       while the queue pane is up, and the selection's preview otherwise.
+       The preview cache underneath is untouched in every case, which is
+       what makes closing either one restore it exactly: there is nothing
+       to restore. */
     if (ui_mode() == MODE_SEARCH) {
       if (m->search_n > 0 && m->search_rows != NULL) {
         /* The clamp lives here and not in the input path because this is
@@ -524,6 +525,33 @@ draw_body(const TuiModel * m)
         draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
                   STYLE_DIM,
                   (g_search_len > 0) ? "(no results)" : "(type to search)");
+      }
+    } else if (ui_mode() == MODE_QUEUE) {
+      if (m->queue_n > 0 && m->queue_rows != NULL) {
+        size_t qc = (m->queue_cursor < m->queue_n) ? m->queue_cursor : m->queue_n - 1;
+        size_t scroll = scroll_for(qc, m->queue_n, g_layout.body_h);
+
+        g_search_draw = m->queue_rows;   /* the same (rows, index) adapter */
+        draw_column(2, search_row_at, NULL, m->queue_n, qc, scroll, 1, 0,
+                    STYLE_NORMAL);
+        g_search_draw = NULL;
+
+        /* The playing entry, marked after the column rather than through
+           it: draw_column decides a row's slot from the cursor and one
+           base style, and the playing row is neither. Skipped when it is
+           the cursor row, because the cursor bar has to win -- otherwise
+           moving onto the playing track makes the cursor disappear. */
+        if (m->queue_playing >= 0 && (size_t) m->queue_playing != qc) {
+          size_t pi = (size_t) m->queue_playing;
+          if (pi >= scroll && pi < scroll + (size_t) g_layout.body_h && pi < m->queue_n) {
+            draw_text(g_layout.col_x[2],
+                      g_layout.body_y + (int) (pi - scroll),
+                      g_layout.col_w[2], STYLE_PLAYING, m->queue_rows[pi].name);
+          }
+        }
+      } else {
+        draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
+                  STYLE_DIM, "(queue empty)");
       }
     } else {
       draw_column(2, browser_preview_row, m->browser, vn, vn, 0, 0, 0,
@@ -567,6 +595,7 @@ static const char * const g_mode_label[MODE_COUNT] = {
   [MODE_HELP]   = "-- HELP --",
   [MODE_MENU]   = "-- MENU --",
   [MODE_SEARCH] = "-- SEARCH --",
+  [MODE_QUEUE]  = "-- QUEUE --",
 };
 
 _Static_assert(sizeof(g_mode_label) / sizeof(g_mode_label[0]) == MODE_COUNT,
@@ -962,7 +991,13 @@ dispatch_event(const struct tb_event * ev)
         break;
       }
 
-      if (a != ACT_NONE && !(mode != MODE_NORMAL && overlay_scroll_action(a))) {
+      /* Named modes rather than "not normal": overlay_scroll_action moves
+         the box's own scroll offset, which only the two drawn-as-a-box
+         modes have. MODE_QUEUE's cursor lives in ui/queueview.c and is
+         moved through action_dispatch like the browser's, so swallowing
+         its arrows here would leave the pane unnavigable. */
+      int box_overlay = (mode == MODE_HELP || mode == MODE_MENU);
+      if (a != ACT_NONE && !(box_overlay && overlay_scroll_action(a))) {
         action_dispatch(a, arg);
       }
       g_dirty = 1;
@@ -1107,13 +1142,15 @@ ui_mode_toggle(UiMode m)
     return 0;
   }
 
-  /* MODE_SEARCH draws no box: it borrows column 2 and the message row,
+  /* MODE_SEARCH and MODE_QUEUE draw no box: they borrow column 2 and the
+     message row,
      both of which exist at any size the browser itself draws at. Gating
      it on the overlay's margins would refuse a search on a terminal that
      renders the browser perfectly well. A terminal too small to draw
      anything still refuses, because there would be nowhere to show the
      prompt. */
-  int fits = (m == MODE_SEARCH) ? !g_layout.too_small : overlay_fits();
+  int fits = (m == MODE_SEARCH || m == MODE_QUEUE) ? !g_layout.too_small
+                                                  : overlay_fits();
   if (!fits || g_mode_depth >= UI_MODE_STACK_MAX) {
     return -1;
   }

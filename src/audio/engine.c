@@ -112,6 +112,15 @@ struct Engine {
   int64_t  cur_track_id;
   int      has_track;    /* 1 iff src currently has a file open */
 
+  /* Amendment 09's prefetch slot: what T1 last said follows the current
+     track. T2 state, touched only on T2 (in handle_command and at EOF),
+     so it needs no synchronisation of its own -- it arrives through the
+     mutex-protected command queue like every other command payload. An
+     empty next_path means "nothing follows", which is the end-of-queue
+     path and behaves exactly as it did before this existed. */
+  char     next_path[PATH_MAX];
+  int64_t  next_track_id;
+
   atomic_int state;      /* EngineState, T1-pollable via engine_state */
 
   pthread_mutex_t cmd_mtx;
@@ -516,6 +525,14 @@ do_play(Engine * e, const Command * cmd)
     e->has_track = 0;
   }
 
+  /* An explicit play invalidates whatever was prefetched: it names what
+     follows the track being replaced, not what follows this one. T1
+     re-pushes on the EV_STREAM_INFO below, so the slot is only empty for
+     the width of that round trip -- and empty is the safe value, since
+     it degrades to the EV_EOF path rather than to a wrong track. */
+  e->next_path[0]  = '\0';
+  e->next_track_id = 0;
+
   StreamInfo info;
   memset(&info, 0, sizeof(info));
   int ret = e->src.open(e->src.self, cmd->path, &info);
@@ -624,8 +641,94 @@ handle_command(Engine * e, const Command * cmd, int * quit)
     case CMD_SET_GAIN:
       sink_set_gain(cmd->gain);
       break;
+
+    case CMD_SET_NEXT:
+      /* Stored and nothing else. Deliberately does not open the file,
+         does not touch pcm_ring, and does not change EngineState: it is
+         a note for later, consumed at EOF by advance_to_next below.
+         Overwritable until then -- a second one replaces the first, and
+         there is no queue of them because T1 only ever has one answer
+         to "what is next". */
+      snprintf(e->next_path, sizeof e->next_path, "%s", cmd->path);
+      e->next_track_id = cmd->track_id;
+      break;
   }
 } /* handle_command */
+
+/*
+ * advance_to_next: the T2 half of a continuous track transition
+ * (DESIGN.md V.3 steps 1-3, amendment 09). Takes the Engine; returns 1
+ * when the next track is open and writing continues, 0 when there was
+ * nothing to advance to or it could not be opened -- in which case the
+ * caller runs the unchanged end-of-queue path.
+ *
+ * The three things this must NOT do are the reason it is its own
+ * function. It does not stop, does not reset a ring, and does not touch
+ * the sink: an explicit CMD_PLAY flushes and a natural transition must
+ * not (DESIGN.md V.1 step 3 versus V.3, and the note between them). T3
+ * is entirely unaware anything happened, which is the property that
+ * makes the whole design safe.
+ *
+ * e->write_frames is deliberately not reset. It is the counter both the
+ * boundary entry and EV_EOF.end_frame are keyed on, and the only thing
+ * that may rewind it is pcm_flush_and_resync.
+ */
+static int
+advance_to_next(Engine * e)
+{
+  if (e->next_path[0] == '\0') {
+    return 0; /* end of queue: DESIGN.md V.4, unchanged */
+  }
+
+  /* Taken out of the slot before anything can fail, so a failed open
+     cannot leave the same path to be retried forever. */
+  char    path[PATH_MAX];
+  int64_t id = e->next_track_id;
+  snprintf(path, sizeof path, "%s", e->next_path);
+  e->next_path[0]  = '\0';
+  e->next_track_id = 0;
+
+  /* Step 2 before step 3: the boundary names the frame at which the new
+     track starts, which is the current write count -- sampled before a
+     single frame of the new file has been written. Pushed before the
+     open so the entry is not lost if the open is slow and T1 ticks
+     meanwhile; a boundary for a track that then fails to open is
+     harmless, because T1 pops it against a consumed count that the
+     failed track will never advance past. */
+  BoundaryEntry b;
+  b.frame_index = e->write_frames;
+  b.track_id    = id;
+  /* A full ring drops the entry rather than blocking T2 (DESIGN.md V.3's
+     warning): T1 resynchronises on the next tick. Eight slots at 30 Hz
+     means overflow needs eight tracks to end inside 33 ms. */
+  (void) ring_write(&e->boundary_ring, (const uint8_t *) &b, sizeof b);
+
+  if (e->has_track) {
+    e->src.close(e->src.self);
+    e->has_track = 0;
+  }
+
+  StreamInfo info;
+  memset(&info, 0, sizeof(info));
+  if (e->src.open(e->src.self, path, &info) != 0) {
+    /* Degrades to exactly the pre-amendment behaviour: the caller posts
+       EV_EOF for the track that just finished and parks, and T1's drain
+       plus its five-failures rule take it from there. Per-file failures
+       are never fatal. */
+    return 0;
+  }
+
+  e->cur_track_id = id;
+  e->has_track    = 1;
+
+  Event ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.kind     = EV_STREAM_INFO;
+  ev.track_id = id;
+  ev.info     = info;
+  evt_push(e, &ev);
+  return 1;
+} /* advance_to_next */
 
 /* ---------------------------------------------------------------------
  * The thread body.
@@ -743,6 +846,15 @@ engine_thread_main(void * arg)
        the engine left ENG_PLAYING -- in both of those cases the read
        that produced n no longer describes what T2 is doing. */
     if (!quit && !flushed && st == ENG_PLAYING && n < READ_CHUNK_FRAMES) {
+      /* Amendment 09: with a prefetched next track, EOF is not the end
+         of anything T1 needs to hear about -- T2 opens the next file and
+         keeps writing into the same ring, contiguously (DESIGN.md V.3
+         steps 1-3). Only when there is nothing next, or opening it
+         failed, does this fall through to the end-of-queue path below. */
+      if (advance_to_next(e)) {
+        continue;
+      }
+
       Event ev;
       memset(&ev, 0, sizeof(ev));
       ev.kind     = EV_EOF;
@@ -864,6 +976,21 @@ engine_play(Engine * e, const char * path, int64_t track_id)
   cmd.track_id = track_id;
   cmd_push(e, &cmd);
 } /* engine_play */
+
+/* engine_set_next: see include/audio/engine.h. */
+void
+engine_set_next(Engine * e, const char * path, int64_t track_id)
+{
+  Command cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.kind = CMD_SET_NEXT;
+  /* A NULL path is how T1 says "nothing follows": it clears the slot,
+     which is what makes the end-of-queue path reachable again after a
+     prefetch was pushed and then invalidated. */
+  snprintf(cmd.path, sizeof(cmd.path), "%s", (path != NULL) ? path : "");
+  cmd.track_id = track_id;
+  cmd_push(e, &cmd);
+} /* engine_set_next */
 
 /* engine_pause: see include/audio/engine.h. */
 void

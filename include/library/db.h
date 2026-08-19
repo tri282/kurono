@@ -283,6 +283,18 @@ int db_query_tracks_for_artist_album(Db * db, const char * artist, const char * 
 int db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n);
 
 /*
+ * db_query_tracks_under_dir: every track at or below dir -- the
+ * recursive twin of the above, ordered by path, which puts a
+ * subdirectory's tracks after their parent's and each subdirectory's in
+ * its own order. This is what an enqueue of a directory row wants and
+ * db_query_tracks_in_dir is not: a multi-disc album keeps its tracks in
+ * CD1/, CD2/ subdirectories, so the non-recursive query returns only
+ * the loose files beside them. Same degrade policy and same
+ * db_track_rows_free as every other row query here.
+ */
+int db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n);
+
+/*
  * db_query_track_by_id: fetch one row by primary key. Returns 1 and
  * fills *out_row if found, 0 otherwise -- not-found and a database
  * error are not distinguished, same policy as every other query in this

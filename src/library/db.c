@@ -97,6 +97,7 @@ sqlite3_stmt * query_albums_for_album_artist;
   sqlite3_stmt * query_tracks_for_album;
 sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_tracks_in_dir;
+  sqlite3_stmt * query_tracks_under_dir;
   sqlite3_stmt * query_track_by_id;
   sqlite3_stmt * query_search;
   int            corrupt;
@@ -529,6 +530,20 @@ prepare_all_statements(Db * db)
   PREP(query_tracks_for_artist_album,
        "SELECT * FROM tracks WHERE artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
   PREP(query_tracks_in_dir, "SELECT * FROM tracks WHERE parent_dir = ?1 ORDER BY path");
+  /* The recursive twin, for enqueuing a directory row. Same prefix
+     RANGE as query_dirs above and for the same reason -- a GLOB would
+     read '[', '*' and '?' in the bound value as metacharacters, so
+     "[2019] Album" would queue nothing. The equality arm is not
+     redundant with the range arm: the range covers strict descendants
+     only ('/' is excluded at both ends), so ?1's own tracks need it.
+     Multi-disc albums are the case that makes this rather than
+     query_tracks_in_dir the right statement for an enqueue: their
+     tracks live in CD1/, CD2/ subdirectories and the non-recursive
+     query returns only whatever loose files sit beside them. */
+  PREP(query_tracks_under_dir, "SELECT * FROM tracks "
+                                "WHERE parent_dir = ?1 "
+                                "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
+                                "ORDER BY path");
   PREP(query_track_by_id, "SELECT * FROM tracks WHERE id = ?1");
   PREP(query_search,
        "SELECT t.* FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
@@ -618,6 +633,7 @@ db_close(Db * db)
   sqlite3_finalize(db->query_tracks_for_album);
   sqlite3_finalize(db->query_tracks_for_artist_album);
   sqlite3_finalize(db->query_tracks_in_dir);
+  sqlite3_finalize(db->query_tracks_under_dir);
   sqlite3_finalize(db->query_track_by_id);
   sqlite3_finalize(db->query_search);
 
@@ -1015,6 +1031,19 @@ db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t
   sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
   return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_tracks_in_dir */
+
+/*
+ * db_query_tracks_under_dir: see include/library/db.h.
+ */
+int
+db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n)
+{
+  sqlite3_stmt * stmt = db->query_tracks_under_dir;
+  db_reset(db, stmt);
+  sqlite3_clear_bindings(stmt);
+  sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
+  return rows_from_stmt(db, stmt, out_rows, out_n);
+} /* db_query_tracks_under_dir */
 
 /*
  * db_query_track_by_id: see include/library/db.h.

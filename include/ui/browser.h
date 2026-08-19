@@ -173,6 +173,25 @@ int browser_library_locate(const BrowserSource * src, const DbTrackRow * track,
 int64_t browser_library_track_id(const BrowserSource * src, const char * row_key);
 
 /*
+ * browser_library_expand: every track a container row holds, in the
+ * order the browser would list them, for enqueuing a whole directory,
+ * album or artist in one keypress. Takes a library source and a row key
+ * and fills out-params the caller frees with db_track_rows_free;
+ * returns 0, or -1 with neither set.
+ *
+ * Third member of the same family as the two above, existing for the
+ * same reason: main.c must not learn that a key starts with a 'D' or a
+ * 'B'. A directory expands recursively, so a multi-disc album queued
+ * from the Directory view brings CD1/ and CD2/ with it.
+ *
+ * Zero rows is a legitimate answer, not an error: a track row, the
+ * synthetic root, and an empty directory all give it. "Queue the whole
+ * library" is deliberately not what the root row means.
+ */
+int browser_library_expand(const BrowserSource * src, const char * row_key,
+                           DbTrackRow ** out_rows, size_t * out_n);
+
+/*
  * browser_create / browser_destroy: the widget. `root` is the key the
  * first column loads and the point above which ascending stops.
  * Returns NULL on allocation failure or if the root will not load.

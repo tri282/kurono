@@ -17,9 +17,9 @@ Planned milestones, in order:
 
 | Milestone | Contents | State |
 |---|---|---|
-| M1 — spine | Audio engine, ring buffer, decoder, sink, event loop, single-column directory list, playback controls, status bar | not started |
-| M2 — library (v1) | SQLite index and scan, three-column browser, Artists / Album Artists views, FTS5 search, queue view | not started |
-| post-v1 | Cover art, spectrum visualiser, playlists, config file, EQ, gapless, live rescan | not started |
+| M1 — spine | Audio engine, ring buffer, decoder, sink, event loop, single-column directory list, playback controls, status bar | complete |
+| M2 — library (v1) | SQLite index and scan, three-column browser, Artists / Album Artists views, FTS5 search, queue view, gapless transition, in-app rescan | built, verifying |
+| post-v1 | Cover art, spectrum visualiser, playlists, config file, EQ, exact lossy gapless, background scan | not started |
 
 ---
 

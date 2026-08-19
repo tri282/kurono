@@ -73,6 +73,17 @@ typedef struct {
   const BrowserRow * search_rows;
   size_t             search_n;
 
+  /* The queue pane's rows, for column 2 while MODE_QUEUE is on top.
+     Borrowed from ui/queueview.c, which owns them and the cursor;
+     main.c passes them through for the same reason it passes the search
+     results through, and column 2's preview cache is untouched here as
+     well. `queue_playing` is the play-order position of the entry that
+     is sounding, or -1 when nothing is. */
+  const BrowserRow * queue_rows;
+  size_t             queue_n;
+  size_t             queue_cursor;
+  int                queue_playing;
+
   /* DESIGN.md XI.6: a visible underrun counter is worth more than any
      amount of reasoning about whether underruns are happening. Shown
      only when non-zero. */

@@ -47,7 +47,14 @@ typedef enum { ENG_STOPPED, ENG_PLAYING, ENG_PAUSED, ENG_DEVICE_LOST } EngineSta
  * thread boundary (DESIGN.md V.1 step 2).
  */
 typedef enum {
-  CMD_PLAY, CMD_PAUSE, CMD_RESUME, CMD_SEEK, CMD_STOP, CMD_QUIT, CMD_SET_GAIN
+  CMD_PLAY, CMD_PAUSE, CMD_RESUME, CMD_SEEK, CMD_STOP, CMD_QUIT, CMD_SET_GAIN,
+  /* Amendment 09: what plays after the current track, told to T2 in
+     advance so a natural EOF-to-next transition needs no round trip to
+     T1 (DESIGN.md V.3 step 3). T2 stores it and acts on nothing until
+     EOF; an empty path clears the slot and means end of queue. Unlike
+     CMD_PLAY this does NOT flush -- that asymmetry is the whole design
+     (DESIGN.md V.1 step 3 versus V.3). */
+  CMD_SET_NEXT
 } CommandKind;
 
 typedef struct {
@@ -162,6 +169,24 @@ void engine_join(Engine * e);
  * CMD_PLAY.
  */
 void engine_play(Engine * e, const char * path, int64_t track_id);
+
+/*
+ * engine_set_next: tell T2 what follows the current track, so a natural
+ * EOF-to-next transition needs no round trip to T1 (amendment 09,
+ * DESIGN.md V.3 step 3). Takes the Engine, the path (NULL or "" clears
+ * the slot and means end of queue) and its library id; returns nothing.
+ *
+ * Push it whenever the answer changes: on EV_STREAM_INFO for the current
+ * track, and after ANY queue mutation while playing. queue.h guarantees
+ * queue_peek_advance matches the following queue_advance only when
+ * nothing mutates in between, so a missed re-push is how T2 ends up
+ * holding a path the queue no longer agrees with.
+ *
+ * Unlike engine_play this does NOT flush. That asymmetry is the design:
+ * an explicit CMD_PLAY flushes (V.1 step 3), a natural transition must
+ * not (V.3), and T3 never learns either happened.
+ */
+void engine_set_next(Engine * e, const char * path, int64_t track_id);
 void engine_pause(Engine * e);
 void engine_resume(Engine * e);
 void engine_seek(Engine * e, int64_t ms);

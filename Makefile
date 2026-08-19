@@ -61,9 +61,14 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # string builder. Pure: no database handle, no SQLite header, so it also
 # links standalone into tools/fts_query_test. main.c's --search and
 # --dirs are its callers until ui/browser.c in phase 16.
+# src/ui/queueview.c (phase 17): the queue pane's cursor and the display
+# metadata behind each line. It deliberately does not draw -- ui/tui.c
+# owns every tb_* call and every draw primitive -- so this file reaches
+# library/db.c for a title and a duration and nothing else.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
        src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c \
+       src/ui/queueview.c \
        src/library/db.c src/library/scan.c src/library/query.c
 
 # Sources that exist and must be statically analysed, but are not yet

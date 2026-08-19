@@ -959,6 +959,147 @@ browser_library_track_id(const BrowserSource * src, const char * row_key)
 } /* browser_library_track_id */
 
 /*
+ * rows_take: move `n` DbTrackRows from `add` onto the end of `*acc`,
+ * growing it. Takes the accumulator, its count, and the batch; returns 0
+ * or -1 on allocation failure, and consumes `add` either way -- the
+ * owned strings are moved by struct assignment, so only the batch's
+ * array is freed, never its fields. On failure the accumulator keeps
+ * whatever it already had and the caller frees it as one.
+ */
+static int
+rows_take(DbTrackRow ** acc, size_t * n, DbTrackRow * add, size_t nadd)
+{
+  if (nadd == 0) {
+    free(add);
+    return 0;
+  }
+
+  DbTrackRow * grown = realloc(*acc, (*n + nadd) * sizeof *grown);
+  if (grown == NULL) {
+    db_track_rows_free(add, nadd);
+    return -1;
+  }
+
+  memcpy(grown + *n, add, nadd * sizeof *add);
+  *acc = grown;
+  *n  += nadd;
+  free(add); /* fields moved above; only the array itself is ours to drop */
+  return 0;
+} /* rows_take */
+
+/*
+ * browser_library_expand: see include/ui/browser.h. Every kind that can
+ * hold tracks answers here, so main.c never learns what a key looks
+ * like -- the same reason browser_library_locate and
+ * browser_library_track_id exist.
+ *
+ * A track key answers zero rows rather than itself: player_row_target
+ * already handles that case and answering it twice would put one
+ * decision in two places. The root answers zero too -- "queue the whole
+ * library" is a different action from "queue this row", and silently
+ * making it this one is worse than refusing.
+ */
+int
+browser_library_expand(const BrowserSource * src, const char * row_key,
+                       DbTrackRow ** out_rows, size_t * out_n)
+{
+  if (src == NULL || row_key == NULL || out_rows == NULL || out_n == NULL ||
+      src->load != lib_load) {
+    return -1;
+  }
+
+  LibSource *  s     = (LibSource *) src->self;
+  DbTrackRow * acc   = NULL;
+  size_t       count = 0;
+  int          rc    = 0;
+
+  switch (row_key[0]) {
+    case LIB_KEY_DIR: {
+      DbTrackRow * tracks = NULL;
+      size_t       nt = 0;
+      db_query_tracks_under_dir(s->db, row_key + 1, &tracks, &nt);
+      s->truncated |= db_result_truncated(s->db);
+      rc = rows_take(&acc, &count, tracks, nt);
+      break;
+    }
+
+    case LIB_KEY_ALBUM: {
+      char *       name  = NULL;
+      char *       album = NULL;
+      const char * p     = seg_get(row_key + 1, &name);
+      DbTrackRow * tracks = NULL;
+      size_t       nt = 0;
+
+      if (p == NULL || seg_get(p, &album) == NULL) {
+        free(name);
+        return -1;
+      }
+      /* The same view split lib_load makes, and for the same reason: an
+         Album Artists row filtered on `artist` misses every
+         compilation. */
+      if (s->view == BROWSER_VIEW_ARTISTS) {
+        db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
+      } else {
+        db_query_tracks_for_album(s->db, name, album, &tracks, &nt);
+      }
+      s->truncated |= db_result_truncated(s->db);
+      rc = rows_take(&acc, &count, tracks, nt);
+      free(name);
+      free(album);
+      break;
+    }
+
+    case LIB_KEY_NAME: {
+      /* An artist is its albums, in album order, each album in its own
+         disc/track order. There is no one-statement form of this and it
+         does not need one: it is the album query in a loop over what
+         lib_load already lists under this row, so the queue order is
+         exactly the browse order. */
+      char *  name = NULL;
+      char ** albums = NULL;
+      size_t  na = 0;
+
+      if (seg_get(row_key + 1, &name) == NULL) {
+        return -1;
+      }
+      if (s->view == BROWSER_VIEW_ARTISTS) {
+        db_query_albums_for(s->db, name, &albums, &na);
+      } else {
+        db_query_albums_for_album_artist(s->db, name, &albums, &na);
+      }
+      s->truncated |= db_result_truncated(s->db);
+
+      for (size_t i = 0; i < na && rc == 0; i++) {
+        DbTrackRow * tracks = NULL;
+        size_t       nt = 0;
+        if (s->view == BROWSER_VIEW_ARTISTS) {
+          db_query_tracks_for_artist_album(s->db, name, albums[i], &tracks, &nt);
+        } else {
+          db_query_tracks_for_album(s->db, name, albums[i], &tracks, &nt);
+        }
+        s->truncated |= db_result_truncated(s->db);
+        rc = rows_take(&acc, &count, tracks, nt);
+      }
+      db_names_free(albums, na);
+      free(name);
+      break;
+    }
+
+    default:
+      break; /* ROOT, TRACK, and anything malformed: zero rows, not an error */
+  }
+
+  if (rc != 0) {
+    db_track_rows_free(acc, count);
+    return -1;
+  }
+
+  *out_rows = acc;
+  *out_n    = count;
+  return 0;
+} /* browser_library_expand */
+
+/*
  * lib_free_rows: see BrowserSource.free_rows.
  */
 static void

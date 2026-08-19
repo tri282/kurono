@@ -84,15 +84,26 @@ static const Binding g_bindings_normal[] = {
   { 0, 'h',  0, ACT_HELP_TOGGLE,      0 },
   { 0, 'm',  0, ACT_MENU_TOGGLE,      0 },
 
-  /* queue */
+  /* queue. `v` opens the pane -- one of the few unshifted keys left that
+     is not h/j/k/l, which amendment 04 decision 1 keeps reserved. `d`
+     and `C` stay bound here as well as in the queue's own table: both
+     act on the queue rather than on what is under the browser cursor,
+     so they work with the pane closed and report what they did. */
   { 0, 'a',  0, ACT_ENQUEUE,          0 },
   { 0, 'd',  0, ACT_REMOVE,           0 },
   { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
   { 0, 'o',  0, ACT_JUMP_TO_PLAYING,  0 },
+  { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
 
   /* device. Shift-R because `r` is repeat; 12b's settings menu offers the
      same action to anyone who does not know the key. */
   { 0, 'R',  0, ACT_RETRY_DEVICE,     0 },
+
+  /* library. Ctrl-R rather than a bare letter: a rescan blocks the UI
+     for its duration (DESIGN.md V.5), so it should not be one keystroke
+     away from `r` (repeat) and `R` (retry device), which are the two
+     keys a hand reaching for it will already be near. */
+  { TB_KEY_CTRL_R, 0, 0, ACT_RESCAN,  0 },
 
   /* search */
   { 0, '/',  0, ACT_SEARCH,           0 },
@@ -184,6 +195,40 @@ static const Binding g_bindings_search[] = {
   { TB_KEY_CTRL_C,     0, 0, ACT_QUIT,          0 },
 };
 
+/*
+ * MODE_QUEUE. The pane is a list to move a cursor through and edit, so
+ * it takes the overlay tables' shape and adds the four edits. Two rows
+ * are worth their own note:
+ *
+ * `d` and `C` repeat their normal-mode bindings rather than being moved
+ * here, because both act on the queue and neither needs the pane open --
+ * the pane changes which entry `d` means, not whether it works.
+ *
+ * ACT_MOVE_UP / ACT_MOVE_DOWN get their first bindings in the program
+ * here. K and J rather than shift+arrow: termbox2 v2.5.0 sets
+ * TB_MOD_SHIFT only on TB_KEY_ARROW_*, and those four are already seek.
+ */
+static const Binding g_bindings_queue[] = {
+  { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,        0 },
+  { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,      0 },
+  { TB_KEY_PGUP,       0, 0, ACT_CURSOR_PAGE_UP,   0 },
+  { TB_KEY_PGDN,       0, 0, ACT_CURSOR_PAGE_DOWN, 0 },
+  { TB_KEY_HOME,       0, 0, ACT_CURSOR_HOME,      0 },
+  { TB_KEY_END,        0, 0, ACT_CURSOR_END,       0 },
+  { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,          0 },
+  { 0, 'd',  0, ACT_REMOVE,           0 },
+  { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
+  { 0, 'K',  0, ACT_MOVE_UP,          0 },
+  { 0, 'J',  0, ACT_MOVE_DOWN,        0 },
+  { 0, 's',  0, ACT_TOGGLE_SHUFFLE,   0 },
+  { 0, 'r',  0, ACT_CYCLE_REPEAT,     0 },
+  { 0, ' ',  0, ACT_PLAY_PAUSE,       0 },
+  { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
+  { 0, 'q',  0, ACT_QUIT,             0 },
+  { TB_KEY_ESC,    0, 0, ACT_QUIT,    0 },
+  { TB_KEY_CTRL_C, 0, 0, ACT_QUIT,    0 },
+};
+
 #define TABLE_ROWS(t) (sizeof(t) / sizeof((t)[0]))
 
 /*
@@ -199,6 +244,7 @@ static const struct {
   [MODE_HELP]   = { g_bindings_help,   TABLE_ROWS(g_bindings_help)   },
   [MODE_MENU]   = { g_bindings_menu,   TABLE_ROWS(g_bindings_menu)   },
   [MODE_SEARCH] = { g_bindings_search, TABLE_ROWS(g_bindings_search) },
+  [MODE_QUEUE]  = { g_bindings_queue,  TABLE_ROWS(g_bindings_queue)  },
 };
 
 /*
@@ -257,6 +303,7 @@ static const char * const g_action_name[] = {
   [ACT_HELP_TOGGLE]      = "help_toggle",
   [ACT_MENU_TOGGLE]      = "menu_toggle",
   [ACT_CONFIRM]          = "confirm",
+  [ACT_QUEUE_TOGGLE]     = "queue_toggle",
 };
 
 _Static_assert(sizeof(g_action_name) / sizeof(g_action_name[0]) == ACT_COUNT,
