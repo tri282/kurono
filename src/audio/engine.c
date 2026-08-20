@@ -445,7 +445,13 @@ engine_device_reflush(Engine * e, const SessionFormat * fmt)
      file, which the next read surfaces as EV_DECODE_ERROR through the
      normal per-file path (DESIGN.md XI.1), and the flush below must
      still run either way or the counters stay apart. */
-  int ret = decoder_retarget_rate(&e->src, fmt->sample_rate);
+  /* Through the vtable, and NULL-tolerant: a source that does not
+     resample has no target to move, and that is success rather than
+     failure (decoder.h's note on the slot). The production decoder
+     always provides it. */
+  int ret = (e->src.retarget != NULL)
+                ? e->src.retarget(e->src.self, fmt->sample_rate)
+                : 0;
 
   /* The same two routines the seek window uses, not a second divergent
      implementation of the sequence (DESIGN.md IV.7.8). The fence inside
@@ -894,25 +900,25 @@ engine_thread_main(void * arg)
 
 /* engine_create: see include/audio/engine.h. */
 Engine *
-engine_create(const SessionFormat * fmt, AudioSink * sink)
+engine_create(const SessionFormat * fmt, AudioSource src, AudioSink * sink)
 {
-  if (fmt == NULL || sink == NULL) {
+  if (fmt == NULL || sink == NULL || src.self == NULL) {
+    /* A source that failed to construct arrives here with an all-NULL
+       vtable (decoder_create's contract), so there is nothing to destroy
+       and nothing to leak. */
     return NULL;
   }
 
   Engine * e = calloc(1, sizeof(Engine));
   if (e == NULL) {
+    src.destroy(src.self);
     return NULL;
   }
 
-  e->src = decoder_create(fmt);
-  if (e->src.self == NULL) {
-    free(e);
-    return NULL;
-  }
+  e->src = src; /* owned from here; released by engine_destroy */
 
   if (ring_init(&e->boundary_ring, BOUNDARY_RING_BYTES) != 0) {
-    decoder_destroy(&e->src);
+    e->src.destroy(e->src.self);
     free(e);
     return NULL;
   }
@@ -941,7 +947,10 @@ engine_destroy(Engine * e)
   if (e->has_track) {
     e->src.close(e->src.self);
   }
-  decoder_destroy(&e->src);
+  if (e->src.destroy != NULL) {
+    e->src.destroy(e->src.self);
+  }
+  memset(&e->src, 0, sizeof(e->src));
   ring_free(&e->boundary_ring);
   pthread_mutex_destroy(&e->cmd_mtx);
   pthread_cond_destroy(&e->cmd_cond);

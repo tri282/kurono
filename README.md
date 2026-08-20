@@ -110,6 +110,22 @@ make
 
 *Note: object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.*
 
+### 2. Command-line flags
+
+`kurono` with no arguments is the player. Everything else is diagnostic.
+
+| Flag | Does |
+|---|---|
+| `--version` | Print the version and exit. |
+| `--paths` | Print the resolved music roots, database path and playlist directory, then exit. What to run first when the wrong tree is being indexed. |
+| `--scan` | Scan and index the music tree, then exit. No TUI, no device. |
+| `--play FILE` | Play one file headless — a real sink and decoder wired through the engine, no terminal UI. |
+| `--play FILE --seek MS` | The same, seeking once to `MS` as soon as the track is open. |
+| `--play FILE --seek-stress N` | `N` randomised seeks in a row. This is the flush-handshake driver, and it is what to run under `make tsan`. |
+| `--play FILE --seek-paused MS` | Seek while paused, which is the case where the ring and the device disagree about what has been consumed. |
+
+*Five further flags — `--tone`, `--decode`, `--dev-latency`, `--search`, `--dirs` — existed during development and were deleted once the phases that needed them were done. An entry point into the middle of a program with nothing exercising it does not stay correct.*
+
 *Note: `CFLAGS` includes `-D_POSIX_C_SOURCE=200809L`. This is not optional — under strict `-std=c11` the POSIX `strdup` is undeclared, and gcc then assumes it returns `int`, truncating the pointer on 64-bit builds.*
 
 *Note: every target must pass `-DTB_OPT_ATTR_W=32` when compiling the translation unit that includes `vendor/termbox2.h`. `termbox2` defaults `TB_OPT_ATTR_W` to 16, which silently drops `TB_OUTPUT_TRUECOLOR` support. `ui/tui.c` carries `_Static_assert(TB_OPT_ATTR_W == 32, ...)` so a dropped flag is a build failure, not a degraded runtime.*
@@ -297,17 +313,25 @@ kurono/
 │   ├── event.c             epoll loop over tty/signal/timer/engine fds
 │   ├── config.c            env var resolution, XDG paths
 │   ├── queue.c             playback queue: order, shuffle, repeat
-│   ├── audio/              engine, ring buffer, decoder, sink
+│   ├── audio/              engine, ring buffer, decoder, sink, test sources
 │   ├── library/            sqlite index, filesystem scan, queries
 │   └── ui/                 tui, theme, keymap, browser, queue view, status bar
 ├── include/                mirrors src/, one header per source file
+├── tools/                  standalone test binaries and harnesses
 ├── vendor/                 single-header third-party, never edited
-├── Makefile
-├── DESIGN.md               thread model, ownership, schema, interfaces
-└── CLAUDE.md               AI-assistant working context
+└── Makefile
 ```
 
-Read `DESIGN.md` before changing anything in `src/`. The audio-callback contract and the seek handshake are not evident from the headers alone.
+`tools/` holds what `DESIGN.md` §XII.2 calls the testable tier: `ring_stress`
+(SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test` and
+`fts_query_test`. Each links against exactly the one source file it tests, and
+each is pure enough to run with no device, no terminal and no music.
+
+*`DESIGN.md`, `CLAUDE.md`, `plans/`, `notes/` and `commits/` are local working
+documents and are gitignored — a clone will not have them. `DESIGN.md` in
+particular is where the thread model, the audio-callback contract and the seek
+handshake are written down, and none of the three is evident from the headers
+alone.*
 
 ---
 

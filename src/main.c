@@ -127,179 +127,6 @@ resolve_trace_log_path(void)
   return path;
 } /* resolve_trace_log_path */
 
-/*
- * No real device is opened for --decode (phase-6-decoder.md I.7: "no
- * device, no ring, no threads"), so there is no negotiated session rate
- * to target the way a live run would read one back from audio/sink.c.
- * The probe pass uses this rate only to reach StreamInfo and learn the
- * file's own rate; the measuring pass then re-opens at that native rate
- * (see run_decode). It does not claim to match whatever rate this
- * process's sink would negotiate at runtime.
- */
-#define DECODE_PROBE_SAMPLE_RATE 48000u
-
-/* Frames per read() call in the drain pass. Arbitrary -- large enough
-   that the pass is not dominated by call overhead, small enough that a
-   short return is exercised well before the end of any real track. */
-#define DECODE_READ_CHUNK_FRAMES 4096
-
-/*
- * decode_probe_rate: open path just far enough to read its StreamInfo
- * and report the file's own sample rate, so the measuring pass can
- * target it. Takes the path and the StreamInfo to fill, returns the
- * file's sample rate, or 0 if the file could not be opened at all (the
- * caller reports that; this function prints nothing).
- */
-static unsigned
-decode_probe_rate(const char * path, StreamInfo * out_info)
-{
-  SessionFormat probe;
-  memset(&probe, 0, sizeof(probe));
-  probe.sample_rate = DECODE_PROBE_SAMPLE_RATE;
-  probe.channels    = 2;
-
-  AudioSource src = decoder_create(&probe);
-  if (src.self == NULL) {
-    return 0;
-  }
-  if (src.open(src.self, path, out_info) != 0) {
-    decoder_destroy(&src);
-    return 0;
-  }
-  unsigned rate = (out_info->sample_rate > 0) ? (unsigned) out_info->sample_rate
-                                              : DECODE_PROBE_SAMPLE_RATE;
-  src.close(src.self);
-  decoder_destroy(&src);
-  return rate;
-} /* decode_probe_rate */
-
-/*
- * run_decode: implements --decode FILE (plan.md VI.8,
- * phase-6-decoder.md I.7). Three passes over the file, in order:
- *
- *   1. Probe, to learn the file's own sample rate (decode_probe_rate).
- *   2. Step pass, at that native rate, printing the raw frame count of
- *      each of the first ten decode steps plus the total.
- *      decoder_diag_step reports a step's true size, where
- *      AudioSource.read clips to the caller's request and would hide a
- *      short first step inside a larger one -- and a short first step
- *      is exactly what phase-6-decoder.md III.1 exists to observe.
- *   3. Drain pass, after seeking back to 0, pulling the whole file
- *      through AudioSource.read into a discard buffer.
- *
- * Passes 2 and 3 both run at the file's native rate so that swr is a
- * passthrough. Resampling would add its own filter delay to the first
- * output and scale every count, which is precisely the measurement
- * III.1 is trying to make -- a 48 kHz target would report the
- * resampler's delay rather than the encoder's.
- *
- * Pass 3 exists because read() is the function phase 7 actually calls;
- * without it the only diagnostic in this phase would exercise a code
- * path the engine never uses. Its total must equal pass 2's -- the two
- * paths drain the same decoder through different plumbing, so a
- * mismatch is a residual-buffer or seek bug.
- *
- * Takes the file path, returns 0 when both passes complete, or 1 on any
- * open failure, decode error, or disagreement between the two totals.
- * A corrupt file or unsupported codec is reported on one stderr line
- * and never crashes (DESIGN.md XI.1).
- */
-static int
-run_decode(const char * path)
-{
-  StreamInfo info;
-  unsigned   rate = decode_probe_rate(path, &info);
-  if (rate == 0) {
-    fprintf(stderr, "kurono: --decode: cannot open %s\n", path);
-    return 1;
-  }
-
-  SessionFormat fmt;
-  memset(&fmt, 0, sizeof(fmt));
-  fmt.sample_rate = rate;
-  fmt.channels    = 2;
-
-  AudioSource src = decoder_create(&fmt);
-  if (src.self == NULL) {
-    fprintf(stderr, "kurono: --decode: allocation failed\n");
-    return 1;
-  }
-
-  int ret = src.open(src.self, path, &info);
-  if (ret != 0) {
-    fprintf(stderr, "kurono: --decode: open failed for %s (error %d)\n", path, ret);
-    decoder_destroy(&src);
-    return 1;
-  }
-
-  printf("duration_ms=%lld bitrate=%lld sample_rate=%d channels=%d codec=%s\n",
-         (long long) info.duration_ms, (long long) info.bitrate,
-         info.sample_rate, info.channels, info.codec);
-  printf("target rate: %u Hz (file native -- swr is a passthrough)\n", rate);
-
-  /* Pass 2 -- raw step sizes. */
-  int  status     = 0;
-  long step_total = 0;
-  int  step       = 0;
-  for (;;) {
-    long n = decoder_diag_step(&src);
-    if (n < 0) {
-      fprintf(stderr, "kurono: --decode: decode error (%ld)\n", n);
-      status = 1;
-      break;
-    }
-    if (n == 0) {
-      break; /* end of stream */
-    }
-    if (step < 10) {
-      printf("step %2d: %ld frames\n", step, n);
-    }
-    step++;
-    step_total += n;
-  }
-  printf("total frames (steps): %ld\n", step_total);
-
-  /* Pass 3 -- the same file through the interface phase 7 uses. */
-  long read_total = 0;
-  if (status == 0) {
-    ret = src.seek(src.self, 0);
-    if (ret != 0) {
-      fprintf(stderr, "kurono: --decode: seek to 0 failed (error %d)\n", ret);
-      status = 1;
-    } else {
-      static float discard[DECODE_READ_CHUNK_FRAMES * 2];
-      for (;;) {
-        long n = src.read(src.self, discard, DECODE_READ_CHUNK_FRAMES);
-        if (n < 0) {
-          fprintf(stderr, "kurono: --decode: read error (%ld)\n", n);
-          status = 1;
-          break;
-        }
-        read_total += n;
-        if (n < DECODE_READ_CHUNK_FRAMES) {
-          break; /* short return is the EOF signal */
-        }
-      }
-      printf("total frames (read):  %ld\n", read_total);
-
-      /* Reported, deliberately not fatal. On a lossless format the two
-         totals should match exactly and a difference means a
-         residual-buffer bug. On a lossy one they legitimately can
-         differ: AVSEEK_FLAG_BACKWARD lands on a frame boundary rather
-         than on sample 0, so pass 3 may start slightly earlier or later
-         than pass 2 did. Judging which case applies is the reader's
-         job, so print the delta and let them. */
-      if (read_total != step_total) {
-        printf("note: totals differ by %ld frames (exact match expected for lossless)\n",
-               read_total - step_total);
-      }
-    }
-  }
-
-  src.close(src.self);
-  decoder_destroy(&src);
-  return status;
-} /* run_decode */
 
 /* Arbitrary: --play has no library, so there is no real track_id to
    report in EV_STREAM_INFO/EV_OPEN_FAILED/EV_DECODE_ERROR. Any
@@ -3968,8 +3795,14 @@ player_start(Player * p, const char * who, int * have_device)
      atomic. */
 
   /* Step 7: engine_create then engine_start. T2 starts parked on the
-     command condvar with no track loaded. */
-  p->e = engine_create(&p->fmt, &p->sink);
+     command condvar with no track loaded.
+
+     The source is constructed here and handed over, rather than built
+     inside the engine: that is what makes DESIGN.md VI's doubles
+     substitutable (phase 18). This is the production path, so it is the
+     real decoder; a harness passes a testsrc_create instead. The engine
+     owns it from this call on, including on failure. */
+  p->e = engine_create(&p->fmt, decoder_create(&p->fmt), &p->sink);
   if (p->e == NULL) {
     fprintf(stderr, "kurono: %s: engine_create failed\n", who);
     p->sink.close(p->sink.self);
@@ -4073,150 +3906,6 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
   return p.status;
 } /* run_play */
 
-/*
- * cmp_double: qsort(3) comparator over double, for the latency medians
- * below. Takes two const double *, returns the usual -1/0/1.
- */
-static int
-cmp_double(const void * a, const void * b)
-{
-  double x = *(const double *) a;
-  double y = *(const double *) b;
-  return (x < y) ? -1 : ((x > y) ? 1 : 0);
-} /* cmp_double */
-
-/*
- * report_latency: print min/median/max over a sample array, in ms.
- * Sorts in place. Takes a label, the samples, and the count; returns
- * nothing. stderr only, and only from a diagnostic mode that returns
- * before tui_init.
- */
-static void
-report_latency(const char * label, double * v, int n)
-{
-  if (n <= 0) {
-    fprintf(stderr, "  %-22s no samples\n", label);
-    return;
-  }
-  qsort(v, (size_t) n, sizeof v[0], cmp_double);
-  double med = (n % 2 == 1) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
-  fprintf(stderr, "  %-22s min %7.3f  med %7.3f  max %7.3f  (n=%d)\n",
-          label, v[0], med, v[n - 1], n);
-} /* report_latency */
-
-/*
- * run_dev_latency: measure what AudioSink.start and AudioSink.stop
- * actually cost on this host. Evidence for the DESIGN.md IV.9.a step 8
- * device-lifecycle amendment: DESIGN.md V.4 asserts that stopping the
- * device on end-of-queue costs "hundreds of milliseconds of latency on
- * the next play", and phase 11 measured that leaving it started costs
- * 1.33% CPU forever. Exactly one of those numbers was ever measured.
- *
- * Builds the full startup (IV.9.a steps 1-7) so the device is the real
- * one, with the real negotiated format and the real rings, then cycles
- * start/stop n times with a gap between them. T2 exists and stays parked
- * with no track, so engine_state is never ENG_PLAYING and the IV.8.a
- * notification policy ignores every `stopped` this generates -- the
- * ladder cannot fire here, which is why no event loop is needed.
- *
- * The gap matters and is the reason it is a parameter: PulseAudio's
- * module-suspend-on-idle suspends a sink that has been idle (5 s by
- * default), and a restart that has to resume a suspended sink is a
- * different measurement from one that does not. A restart on end-of-
- * queue is the suspended case; a restart on unpause is not.
- *
- * Takes the cycle count and the inter-cycle gap in ms; returns 0, or 1
- * if startup or any start/stop failed.
- */
-static int
-run_dev_latency(int n, long gap_ms)
-{
-  if (n < 1) {
-    n = 1;
-  }
-  if (n > 200) {
-    n = 200;
-  }
-
-  Player p;
-  memset(&p, 0, sizeof p);
-  p.mode    = PLAY_PLAIN;
-  p.dev     = DEV_READY;
-  p.running = 1;
-  p.ui      = 0;
-
-  int have_device = 0;
-  if (player_start(&p, "--dev-latency", &have_device) != 0) {
-    return 1;
-  }
-  if (!have_device) {
-    fprintf(stderr, "kurono: --dev-latency: no device, nothing to measure\n");
-    player_browse_only(&p, "device open failed at startup");
-    shutdown_all(&p);
-    return 1;
-  }
-
-  double * starts = calloc((size_t) n, sizeof *starts);
-  double * stops  = calloc((size_t) n, sizeof *stops);
-  if (starts == NULL || stops == NULL) {
-    free(starts);
-    free(stops);
-    shutdown_all(&p);
-    return 1;
-  }
-
-  fprintf(stderr, "dev-latency: rate %u, channels %u, period %u frames, "
-                  "cycles %d, gap %ld ms\n",
-          p.fmt.sample_rate, p.fmt.channels, p.fmt.period_frames, n, gap_ms);
-
-  int failed = 0;
-  int ns = 0, nt = 0;
-
-  for (int i = 0; i < n; i++) {
-    struct timespec t0, t1, t2;
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = p.sink.start(p.sink.self);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    if (rc != 0) {
-      fprintf(stderr, "dev-latency: start failed at cycle %d\n", i);
-      failed = 1;
-      break;
-    }
-    starts[ns++] = elapsed_ms(&t0, &t1);
-
-    /* Let the device actually run for a period or two before stopping
-       it, so the stop is measured against a live stream rather than one
-       that never left the pre-fill. */
-    play_sleep_ms(50);
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    p.sink.stop(p.sink.self);
-    clock_gettime(CLOCK_MONOTONIC, &t2);
-    stops[nt++] = elapsed_ms(&t1, &t2);
-
-    /* The first cycle is the cold one -- it starts a device that has
-       never been started. Reported separately below because it is the
-       IV.9.a step 8 number, and the rest are the phase-12 number. */
-    if (i == 0) {
-      fprintf(stderr, "  cold start %.3f ms, first stop %.3f ms\n",
-              starts[0], stops[0]);
-    }
-
-    if (gap_ms > 0 && i + 1 < n) {
-      play_sleep_ms(gap_ms);
-    }
-  }
-
-  fprintf(stderr, "dev-latency: warm cycles (cold excluded)\n");
-  report_latency("AudioSink.start", starts + 1, ns - 1);
-  report_latency("AudioSink.stop",  stops  + 1, nt - 1);
-
-  free(starts);
-  free(stops);
-  shutdown_all(&p);
-  return failed ? 1 : p.status;
-} /* run_dev_latency */
 
 /*
  * run_tui: bare `kurono` -- the real player. The same ten startup steps
@@ -4419,138 +4108,7 @@ run_scan(void)
   return (skipped < 0) ? 1 : 0;
 } /* run_scan */
 
-/*
- * run_search: implements --search STR. Opens the database read-only in
- * effect (it runs no scan), transforms the raw argument through
- * query_build_match, runs db_query_search, and prints one line per row.
- * Takes the user's raw search text, returns the process exit status: 0
- * unless the database could not be opened. Zero rows is a successful
- * run, and so is a match string FTS5 rejects -- DESIGN.md V.6 warns a
- * residual query error must be shown as "no results", never as a
- * failure, and db_query_search already applies that policy.
- *
- * This is phase 15's verification surface for the transform and the
- * prepared statement together: the unit tests in tools/fts_query_test.c
- * prove the string parses, and this proves the string that parses is
- * also the string that finds the track.
- */
-static int
-run_search(const char * raw)
-{
-  Config cfg;
-  if (config_init(&cfg) != 0) {
-    kurono_die("failed to initialize configuration");
-  }
 
-  const char ** root_paths = malloc(cfg.nroots * sizeof(*root_paths));
-  if (root_paths == NULL) {
-    kurono_die("out of memory resolving music roots");
-  }
-  for (size_t i = 0; i < cfg.nroots; i++) {
-    root_paths[i] = cfg.roots[i].path;
-  }
-
-  int  rescanned = 0;
-  Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
-  if (db == NULL) {
-    fprintf(stderr, "kurono: --search: could not open %s\n", cfg.db_path);
-    free(root_paths);
-    config_free(&cfg);
-    return 1;
-  }
-
-  char * match = query_build_match(raw);
-  if (match == NULL) {
-    kurono_die("out of memory building the search string");
-  }
-  fprintf(stderr, "kurono: MATCH %s\n", match);
-
-  if (match[0] == '\0') {
-    /* No tokens at all. query.h's contract: this is "no search", not a
-       query FTS5 has a spelling for. */
-    fprintf(stderr, "kurono: empty search, 0 result(s)\n");
-  } else {
-    DbTrackRow * rows = NULL;
-    size_t       n    = 0;
-
-    db_query_search(db, match, &rows, &n);
-    for (size_t i = 0; i < n; i++) {
-      printf("%s  --  %s / %s / %s\n",
-             rows[i].path,
-             rows[i].artist ? rows[i].artist : "(no artist)",
-             rows[i].album ? rows[i].album : "(no album)",
-             rows[i].title ? rows[i].title : "(no title)");
-    }
-    fprintf(stderr, "kurono: %zu result(s)%s\n", n,
-            db_result_truncated(db) ? " (truncated: out of memory)" : "");
-    db_track_rows_free(rows, n);
-  }
-
-  free(match);
-  db_close(db);
-  free(root_paths);
-  config_free(&cfg);
-  return 0;
-} /* run_search */
-
-/*
- * run_dirs: implements --dirs PARENT. Runs db_query_dirs and prints
- * what query_dirs_collapse makes of it, one immediate child name per
- * line. Takes the parent directory, returns the process exit status.
- *
- * The two halves of the phase 13 split -- db.c matching a prefix range,
- * query.c parsing the segments -- have no other place where they meet
- * before the browser does in phase 16. tools/fts_query_test.c covers
- * the collapse against synthetic paths; this covers it against the
- * paths db.c actually produces, which is where a disagreement about
- * trailing slashes or root-level parents would show up.
- */
-static int
-run_dirs(const char * parent)
-{
-  Config cfg;
-  if (config_init(&cfg) != 0) {
-    kurono_die("failed to initialize configuration");
-  }
-
-  const char ** root_paths = malloc(cfg.nroots * sizeof(*root_paths));
-  if (root_paths == NULL) {
-    kurono_die("out of memory resolving music roots");
-  }
-  for (size_t i = 0; i < cfg.nroots; i++) {
-    root_paths[i] = cfg.roots[i].path;
-  }
-
-  int  rescanned = 0;
-  Db * db = db_open(cfg.db_path, root_paths, cfg.nroots, &rescanned);
-  if (db == NULL) {
-    fprintf(stderr, "kurono: --dirs: could not open %s\n", cfg.db_path);
-    free(root_paths);
-    config_free(&cfg);
-    return 1;
-  }
-
-  char ** paths = NULL;
-  size_t  npaths = 0;
-  db_query_dirs(db, parent, &paths, &npaths);
-
-  char ** names = NULL;
-  size_t  nnames = 0;
-  int     truncated = query_dirs_collapse(parent, paths, npaths, &names, &nnames);
-
-  for (size_t i = 0; i < nnames; i++) {
-    printf("%s\n", names[i]);
-  }
-  fprintf(stderr, "kurono: %zu descendant path(s) collapsed to %zu child name(s)%s\n",
-          npaths, nnames, truncated ? " (truncated: out of memory)" : "");
-
-  db_names_free(names, nnames);
-  db_names_free(paths, npaths);
-  db_close(db);
-  free(root_paths);
-  config_free(&cfg);
-  return 0;
-} /* run_dirs */
 
 /*
  * Entry point. Handles --version by printing "kurono <version>" to
@@ -4611,30 +4169,15 @@ main(int argc, char * argv[])
   } else if (argc == 2 && strcmp(argv[1], "--scan") == 0) {
     status = run_scan();
 
-  } else if (argc == 3 && strcmp(argv[1], "--search") == 0) {
-    status = run_search(argv[2]);
-
-  } else if (argc == 3 && strcmp(argv[1], "--dirs") == 0) {
-    status = run_dirs(argv[2]);
-
-  } else if (argc == 2 && strcmp(argv[1], "--tone") == 0) {
-    /* plan.md VI.8 diagnostic scaffolding -- exercises audio/sink.c's
-       device, ring, and callback with no ffmpeg and no audio file.
-       sink_run_tone drives sink_open_impl, which registers the frame
-       counter and sample rate with trace.c (trace.h,
-       trace_set_frame_counter / trace_set_sample_rate). */
-    status = (sink_run_tone() == 0) ? 0 : 1;
-
-  } else if (argc == 3 && strcmp(argv[1], "--decode") == 0) {
-    /* plan.md VI.8 diagnostic scaffolding -- exercises audio/decoder.c's
-       AudioSource over ffmpeg with no device, no ring, and no threads. */
-    status = run_decode(argv[2]);
-
   } else if (argc >= 3 && strcmp(argv[1], "--play") == 0) {
-    /* plan.md VI.8 diagnostic scaffolding, phase-7-engine.md I.9 --
-       exercises audio/engine.c's T2 wired to a real sink and decoder,
-       headless. Optional trailing "--seek MS" exercises the flush
-       handshake once EV_STREAM_INFO confirms the track is open. */
+    /* The one diagnostic mode that survived phase 18's scaffolding cull
+       (plan.md VII gap 1). It exercises audio/engine.c's T2 headless,
+       wired to a real sink and a real decoder, and its --seek-stress and
+       --seek-paused drivers are how the flush handshake gets hammered
+       under a sanitiser without a person at the keyboard. The others --
+       --tone, --decode, --dev-latency, --search, --dirs -- had each
+       served exactly one phase and were deleted rather than left to rot
+       as untested entry points into the middle of the program. */
     if (argc == 3) {
       status = run_play(argv[2], PLAY_PLAIN, 0);
     } else if (argc == 5 && strcmp(argv[3], "--seek") == 0) {
@@ -4649,13 +4192,6 @@ main(int argc, char * argv[])
       status = 1;
     }
 
-  } else if (argc >= 2 && strcmp(argv[1], "--dev-latency") == 0) {
-    /* Evidence for the IV.9.a step 8 device-lifecycle amendment. No
-       file, no decode, no event loop -- just the device. */
-    int  cycles = (argc >= 3) ? atoi(argv[2]) : 10;
-    long gap    = (argc >= 4) ? atol(argv[3]) : 0;
-    status = run_dev_latency(cycles, gap);
-
   } else if (argc == 1) {
     /* The player. Phase 4's --headless smoke loop is gone: its structure
        is what player_loop became, and keeping a second event loop around
@@ -4664,9 +4200,8 @@ main(int argc, char * argv[])
 
   } else {
     fprintf(stderr, "kurono: usage: kurono [--version | --paths | --scan | "
-                    "--search STR | --dirs PARENT | --tone | "
-                    "--decode FILE | --play FILE [...] | "
-                    "--dev-latency [N [GAP_MS]]]\n");
+                    "--play FILE [--seek MS | --seek-stress N | "
+                    "--seek-paused MS]]\n");
     status = 1;
   }
 

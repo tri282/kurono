@@ -245,16 +245,13 @@ void sink_set_producer_active(int active);
  */
 void sink_set_event_pipe(int fd);
 
-/*
- * sink_run_tone: implements --tone (plan.md VI.8) -- the SineSource of
- * DESIGN.md VI. Opens the sink, fills pcm_ring with a 441 Hz tone from
- * this thread (mirroring what audio/decoder.c's T2 will do once it
- * exists), starts the device, plays for a few seconds, stops, and
- * closes. Exercises the ring, the callback, gain, and the device with
- * no ffmpeg and no audio file. Prints the negotiated session format and
- * the underrun count. Takes nothing, returns 0 on success, -1 on
- * device-open or device-start failure.
- */
-int sink_run_tone(void);
+/* sink_run_tone is gone (phase 18, plan.md VII gap 1). It was --tone's
+   implementation and DESIGN.md VI's SineSource in the only form the
+   code then permitted: a tone generator living inside sink.c, writing
+   pcm_ring from T1 with the engine bypassed entirely. The real
+   SineSource is now audio/testsrc.c's TESTSRC_SINE -- an AudioSource,
+   injectable through engine_create, driving the same T2 path a real
+   file does. That is what §VI always described; this was the
+   stand-in. */
 
 #endif // KURONO_AUDIO_SINK_H

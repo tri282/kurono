@@ -83,8 +83,14 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # metadata behind each line. It deliberately does not draw -- ui/tui.c
 # owns every tb_* call and every draw primitive -- so this file reaches
 # library/db.c for a title and a duration and nothing else.
+# src/audio/testsrc.c (phase 18): the AudioSource doubles of DESIGN.md
+# VI, made injectable by the same phase's engine_create seam. Wired in
+# with no caller in the linked binary yet, the same way queue.c and
+# theme.c were before theirs existed -- so it is not silently unanalysed
+# by `make analyze` and so the sanitiser builds compile it.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
-       src/audio/trace.c src/audio/decoder.c src/audio/engine.c src/queue.c \
+       src/audio/trace.c src/audio/decoder.c src/audio/engine.c \
+       src/audio/testsrc.c src/queue.c \
        src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c \
        src/ui/queueview.c \
        src/library/db.c src/library/scan.c src/library/query.c
@@ -102,7 +108,7 @@ OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
         check-theme check-deps ring-stress queue-test keymap-test \
-        fts-query-test install uninstall clean
+        testsrc-test fts-query-test install uninstall clean
 
 all: kurono
 
@@ -169,9 +175,13 @@ build/tsan/%.o: src/%.c
 # instance and shares the same scrutiny as ring.c and sink.c.
 # audio/engine.c (phase 7) joins too -- it is T2, on the audio path,
 # and holds the pcm_ring producer side.
-build/default/audio/ring.o build/default/audio/sink.o build/default/audio/trace.o build/default/audio/engine.o \
-build/asan/audio/ring.o    build/asan/audio/sink.o    build/asan/audio/trace.o    build/asan/audio/engine.o \
-build/tsan/audio/ring.o    build/tsan/audio/sink.o    build/tsan/audio/trace.o    build/tsan/audio/engine.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
+# audio/testsrc.c (phase 18) joins as well. It is a test double, but it
+# feeds the same ring through the same producer path, and a double that
+# is held to a weaker standard than the thing it stands in for is a
+# double that can produce a clean run over a real defect.
+build/default/audio/ring.o build/default/audio/sink.o build/default/audio/trace.o build/default/audio/engine.o build/default/audio/testsrc.o \
+build/asan/audio/ring.o    build/asan/audio/sink.o    build/asan/audio/trace.o    build/asan/audio/engine.o    build/asan/audio/testsrc.o \
+build/tsan/audio/ring.o    build/tsan/audio/sink.o    build/tsan/audio/trace.o    build/tsan/audio/engine.o    build/tsan/audio/testsrc.o: EXTRA_WARN = -Wvla -Wshadow -Wconversion
 
 # pkg-config failure must name the missing MODULE, never a distro
 # package -- module names are the stable cross-distro interface
@@ -301,6 +311,15 @@ tools/keymap_test: build/default/tools/keymap_test.o build/default/ui/keymap.o \
 # `./tools/fts_query_test --pure` skips it. The object gets its own rule
 # rather than the tools/%.o pattern above because it is the only one
 # here that includes a pkg-config-provided header.
+# Pure, dependency-free (DESIGN.md XII.2's testable tier), and that is
+# the whole point of what it tests: audio/testsrc.c is the file that
+# lets the ring, the callback and the boundary path run with no ffmpeg,
+# no device and no audio file, so its own test must need none either.
+testsrc-test: tools/testsrc_test
+
+tools/testsrc_test: build/default/tools/testsrc_test.o build/default/audio/testsrc.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lm
+
 fts-query-test: tools/fts_query_test
 
 tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library/query.o
@@ -319,7 +338,8 @@ uninstall:
 
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
-	       tools/queue_test tools/keymap_test tools/fts_query_test
+	       tools/queue_test tools/keymap_test tools/testsrc_test \
+	       tools/fts_query_test
 
 # The .d files written by DEPFLAGS above. A wildcard rather than a list
 # derived from SRCS: the tools' objects live under build/<mode>/tools/

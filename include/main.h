@@ -2,10 +2,13 @@
 #define KURONO_MAIN_H
 
 /*
- * Version string reported by --version. DESIGN.md does not specify a
- * value (plan.md VII gap 11) -- plan.md phase 2 settles it here.
+ * Version string reported by --version. plan.md VII gap 11 left the
+ * value unspecified and phase 2 parked "0.1.0-dev" here; phase 18
+ * closed the gap at 1.0.0, on the grounds that v1 is what M1 plus M2
+ * was defined to be and both are complete. A -dev suffix on a finished
+ * v1 would be the version string lying about the milestone.
  */
-#define KURONO_VERSION "0.1.0-dev"
+#define KURONO_VERSION "1.0.0"
 
 /*
  * kurono_die: restore the terminal if it was claimed, print msg to

@@ -22,6 +22,20 @@ typedef struct {
   long (* read)(void * self, float * dst, long frames);   /* 0 <= n < frames == EOF; < 0 == error */
   int  (* seek)(void * self, int64_t ms);
   void (* close)(void * self);
+  /* retarget and destroy complete the vtable so that a *holder* of an
+     AudioSource never has to know which implementation it holds
+     (phase 18, plan.md VII gap 5b). Before this, audio/engine.c named
+     decoder_retarget_rate and decoder_destroy directly, which is what
+     made DESIGN.md VI's claim that a NullSource/SineSource can be
+     substituted untrue in practice: the engine constructed its own
+     decoder and then called two decoder-only functions on it.
+
+     retarget may be NULL. It exists for the device-reopen path alone
+     (DESIGN.md II.2's warning) and a source that does not resample has
+     nothing to retarget; the engine treats a NULL retarget as success,
+     not as failure. destroy must not be NULL. */
+  int  (* retarget)(void * self, uint32_t sample_rate);   /* may be NULL */
+  void (* destroy)(void * self);
   void * self;
 } AudioSource;
 
@@ -99,24 +113,12 @@ void decoder_destroy(AudioSource * src);
  */
 int decoder_retarget_rate(AudioSource * src, uint32_t sample_rate);
 
-/*
- * decoder_diag_step: --decode-only diagnostic (plan.md VI.8,
- * phase-6-decoder.md I.7), not part of the AudioSource contract and
- * never called by phase 7's engine. AudioSource.read clips its return
- * to the caller's requested frame count, which can hide a short first
- * decode step inside a larger request -- exactly the thing
- * phase-6-decoder.md III.1 needs to observe (whether the first decoded
- * chunk of a LAME-encoded MP3 is short by the encoder delay, DESIGN.md
- * V.3 note). This performs exactly one internal decode-and-resample
- * step (or the terminal flush at end of stream) and returns its raw,
- * unclipped frame count. It must never be interleaved with
- * AudioSource.read calls on the same open source -- both drain the same
- * internal buffer and would corrupt each other's accounting. Takes the
- * AudioSource, returns the frame count produced by this step (0 at true
- * EOF, and every call after that also returns 0), or a negative AVERROR
- * mapped through as an opaque negative int -- the caller never needs to
- * decode which one, only that it is an error.
- */
-long decoder_diag_step(const AudioSource * src);
+/* decoder_diag_step is gone (phase 18, plan.md VII gap 1). It existed
+   solely for --decode, which measured whether a LAME-encoded MP3's
+   first decode step comes back short by the encoder delay (DESIGN.md
+   V.3's note). The flag was deleted with the rest of the per-phase
+   scaffolding, and a diagnostic with no way to invoke it is not a
+   diagnostic. The measurement it was built for is still worth taking
+   and is now a testsrc/decoder comparison rather than a print. */
 
 #endif // KURONO_AUDIO_DECODER_H

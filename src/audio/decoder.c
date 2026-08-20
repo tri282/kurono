@@ -311,6 +311,14 @@ decoder_close_file(Decoder * d)
   d->residual_off = 0;
 } /* decoder_close_file */
 
+/* The two vtable slots whose bodies sit below decoder_create, beside the
+   public wrappers that share them. Forward-declared rather than moved:
+   decoder_destroy_impl and decoder_retarget_impl belong next to
+   decoder_destroy and decoder_retarget_rate, which is where anyone
+   changing one will look for the other. */
+static void decoder_destroy_impl(void * self);
+static int  decoder_retarget_impl(void * self, uint32_t sample_rate);
+
 /*
  * decoder_open_impl: AudioSource.open. Closes any previously open file
  * first (this Decoder is reused across every track, DESIGN.md V.1),
@@ -570,11 +578,13 @@ decoder_create(const SessionFormat * fmt)
      T2's lifetime, so in practice this runs once). */
   av_log_set_level(AV_LOG_QUIET);
 
-  src.open  = decoder_open_impl;
-  src.read  = decoder_read_impl;
-  src.seek  = decoder_seek_impl;
-  src.close = decoder_close_impl;
-  src.self  = d;
+  src.open     = decoder_open_impl;
+  src.read     = decoder_read_impl;
+  src.seek     = decoder_seek_impl;
+  src.close    = decoder_close_impl;
+  src.retarget = decoder_retarget_impl;
+  src.destroy  = decoder_destroy_impl;
+  src.self     = d;
   return src;
 } /* decoder_create */
 
@@ -643,6 +653,27 @@ done:
   return ret;
 } /* decoder_probe */
 
+/* decoder_destroy_impl: the AudioSource.destroy slot. Frees the Decoder
+   behind self and everything it owns. Takes the self pointer, returns
+   nothing.
+
+   Note what it does NOT do, unlike decoder_destroy below: it cannot zero
+   the caller's AudioSource, because a vtable slot is handed the self
+   pointer and never the struct that holds it. Clearing the struct is the
+   holder's job -- audio/engine.c does it in engine_destroy. */
+static void
+decoder_destroy_impl(void * self)
+{
+  if (self == NULL) {
+    return;
+  }
+
+  Decoder * d = (Decoder *) self;
+  decoder_close_file(d);
+  free(d->residual);
+  free(d);
+} /* decoder_destroy_impl */
+
 /* decoder_destroy: see include/audio/decoder.h. */
 void
 decoder_destroy(AudioSource * src)
@@ -651,23 +682,22 @@ decoder_destroy(AudioSource * src)
     return;
   }
 
-  Decoder * d = (Decoder *) src->self;
-  decoder_close_file(d);
-  free(d->residual);
-  free(d);
-
+  decoder_destroy_impl(src->self);
   memset(src, 0, sizeof(*src));
 } /* decoder_destroy */
 
-/* decoder_retarget_rate: see include/audio/decoder.h. */
-int
-decoder_retarget_rate(AudioSource * src, uint32_t sample_rate)
+/* decoder_retarget_impl: the AudioSource.retarget slot. Same body as
+   decoder_retarget_rate below, reached through the vtable rather than
+   through the concrete type. Takes the self pointer and the new rate in
+   Hz, returns 0 on success and a negative AVERROR otherwise. */
+static int
+decoder_retarget_impl(void * self, uint32_t sample_rate)
 {
-  if (src == NULL || src->self == NULL || sample_rate == 0) {
+  if (self == NULL || sample_rate == 0) {
     return AVERROR(EINVAL);
   }
 
-  Decoder * d = (Decoder *) src->self;
+  Decoder * d = (Decoder *) self;
   d->target_fmt.sample_rate = sample_rate;
 
   /* The residual holds frames resampled to the *old* rate. They belong
@@ -687,39 +717,15 @@ decoder_retarget_rate(AudioSource * src, uint32_t sample_rate)
   }
   d->swr_flushed = 0; /* a fresh context has its own delay left to flush */
   return 0;
+} /* decoder_retarget_impl */
+
+/* decoder_retarget_rate: see include/audio/decoder.h. */
+int
+decoder_retarget_rate(AudioSource * src, uint32_t sample_rate)
+{
+  if (src == NULL) {
+    return AVERROR(EINVAL);
+  }
+  return decoder_retarget_impl(src->self, sample_rate);
 } /* decoder_retarget_rate */
 
-/* decoder_diag_step: see include/audio/decoder.h. */
-long
-decoder_diag_step(const AudioSource * src)
-{
-  if (src == NULL || src->self == NULL) {
-    return AVERROR(EINVAL);
-  }
-
-  Decoder * d = (Decoder *) src->self;
-  if (d->fmt_ctx == NULL) {
-    return AVERROR(EINVAL);
-  }
-
-  /* Always starts from an empty residual so the count returned is
-     exactly one decode step's raw output, never a leftover from a
-     previous call -- see the header comment on why this must not be
-     interleaved with AudioSource.read on the same open source. */
-  d->residual_len = 0;
-  d->residual_off = 0;
-
-  if (!decode_one_frame(d)) {
-    if (d->last_error < 0) {
-      long err = d->last_error;
-      d->last_error = 0;
-      return err;
-    }
-    return 0;
-  }
-
-  long n = d->residual_len;
-  d->residual_len = 0;
-  d->residual_off = 0;
-  return n;
-} /* decoder_diag_step */

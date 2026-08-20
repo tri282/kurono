@@ -106,16 +106,34 @@ typedef struct {
 typedef struct Engine Engine;
 
 /*
- * engine_create: allocate an Engine bound to fmt (passed straight to
- * decoder_create, DESIGN.md II.2) and sink (used only for
- * sink_is_started -- engine.c never calls sink.open/start/stop/close;
+ * engine_create: allocate an Engine bound to fmt, to `src` -- the
+ * AudioSource it will decode through -- and to sink (used only for
+ * sink_is_started; engine.c never calls sink.open/start/stop/close,
  * those stay on T1, DESIGN.md IV.9). Also allocates boundary_ring and
  * binds pcm_ring via sink_pcm_ring(), so sink.open must already have
- * succeeded before this is called. Takes the negotiated session format
- * and the sink handle, returns a heap-allocated Engine or NULL on
- * allocation failure (nothing is left partially allocated on NULL).
+ * succeeded before this is called.
+ *
+ * **The Engine takes ownership of src** and destroys it through
+ * src.destroy in engine_destroy. The caller must not destroy it, and
+ * must not use it afterwards. On failure src is destroyed here too, so
+ * an unchecked NULL return leaks nothing.
+ *
+ * The source is a parameter rather than something this function builds
+ * (it called decoder_create itself until phase 18) because DESIGN.md
+ * VI's NullSource/SineSource are only substitutable if the engine never
+ * names a concrete implementation. That was the gap: the engine
+ * constructed its own decoder and then called decoder_retarget_rate and
+ * decoder_destroy on it, so no double could be injected and §VI's claim
+ * that the ring and the callback can be exercised without an audio file
+ * was aspirational. audio/testsrc.c holds the doubles; the production
+ * caller passes decoder_create(fmt).
+ *
+ * Takes the negotiated session format, the source to own, and the sink
+ * handle. Returns a heap-allocated Engine, or NULL on allocation
+ * failure or a src with a NULL self (nothing is left partially
+ * allocated on NULL).
  */
-Engine * engine_create(const SessionFormat * fmt, AudioSink * sink);
+Engine * engine_create(const SessionFormat * fmt, AudioSource src, AudioSink * sink);
 
 /*
  * engine_destroy: free everything engine_create allocated, including
