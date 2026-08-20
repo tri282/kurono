@@ -99,7 +99,16 @@ make
 | `make debug` | `-Og -fno-omit-frame-pointer` | Readable stack traces under a debugger. |
 | `make asan` | `-fsanitize=address,undefined` | Memory error detection. |
 | `make tsan` | `-fsanitize=thread` | Data race detection. The important one here. |
-| `make clean` | | Remove objects and binaries. |
+| `make clean` | | Remove objects, dependency files and binaries. |
+| `make install` | | Build `release` and install to `$PREFIX/bin` (default `~/.local/bin`). |
+| `make check` | | The three grep-based invariants: `check-layering`, `check-flush`, `check-theme`. |
+| `make analyze` | | `-fanalyzer` over every source. Produces no binary. |
+| `make ring-stress` | `-fsanitize=thread` | Build `tools/ring_stress`, the SPSC producer/consumer harness. |
+| `make queue-test` | | Build `tools/queue_test`. |
+| `make keymap-test` | | Build `tools/keymap_test`. |
+| `make fts-query-test` | | Build `tools/fts_query_test`. Links `sqlite3` for the real FTS5 parser. |
+
+*Note: object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.*
 
 *Note: `CFLAGS` includes `-D_POSIX_C_SOURCE=200809L`. This is not optional — under strict `-std=c11` the POSIX `strdup` is undeclared, and gcc then assumes it returns `int`, truncating the pointer on 64-bit builds.*
 
@@ -229,20 +238,31 @@ Arrow keys navigate; letters act. Every binding resolves through a table to an a
 | `enter` | Play the selection now |
 | `a` | Add the selection to the queue |
 | `d` | Remove from the queue |
+| `C` | Clear the queue |
+| `v` | Open / close the queue pane |
+| `K` / `J` | Move an entry up / down (queue pane) |
+| `o` | Jump to the playing track |
 | `n` / `p` | Next / previous track |
+| `x` | Stop |
 | `shift+←` / `shift+→` | Seek 5 s back / forward |
 | `shift+↓` / `shift+↑` | Seek 30 s back / forward |
 | `,` / `.` | Seek 5 s back / forward (fallback) |
 | `H` / `L` | Seek 30 s back / forward (fallback) |
 | `+` / `-` | Volume up / down |
+| `M` | Mute / unmute |
 | `/` | Search |
 | `s` | Toggle shuffle |
-| `r` | Toggle repeat |
+| `r` | Cycle repeat — off, all, one |
 | `tab` | Cycle view |
+| `1` / `2` / `3` | Directories / Artists / Album Artists |
+| `ctrl+r` | Rescan the library |
+| `R` | Retry the audio device after a loss |
 | `h` | Help — the key list, generated from the bindings themselves |
 | `m` | Settings menu |
 | `esc` | Close the open overlay or cancel a search |
-| `q` | Close the open overlay, or quit when none is open |
+| `q` / `ctrl+c` | Close the open overlay, or quit when none is open |
+
+*The queue pane is a mode of its own. While it is open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport — play/pause, seek, volume, mute, next/previous, shuffle, repeat — works there too. View switching (`tab`, `1`/`2`/`3`) and rescan do not; close the pane with `esc` or `v` first.*
 
 `h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help; a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
 

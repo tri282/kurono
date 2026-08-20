@@ -876,6 +876,22 @@ engine_thread_main(void * arg)
  * Lifecycle and T1-side convenience wrappers.
  * ------------------------------------------------------------------- */
 
+/* Reserved, post-v1: the EQ's coefficient buffers belong in THIS file,
+   not in audio/sink.c (DESIGN.md IX.3). The filter itself runs on T3, in
+   audio/dsp.c, at the seam between callback steps 6 and 7 -- a band
+   adjustment has to be audible within one device period, and anything on
+   T2 is two seconds late. But the buffers T1 writes and T3 reads are
+   published from here, through a double-buffered atomic index: T1 fills
+   the inactive set, then release-stores the index; T3 acquire-loads it
+   once per invocation and uses that set for the whole block.
+
+   The ownership is the point, and it is why this comment exists in v1
+   with nothing under it. Putting the coefficients in sink.c would be the
+   obvious shortcut -- that is where the callback is -- and it would drag
+   miniaudio into the EQ and break the confinement that makes sink.c
+   replaceable at all (DESIGN.md III.2). Declared here so the next person
+   to build it finds the claim already staked. */
+
 /* engine_create: see include/audio/engine.h. */
 Engine *
 engine_create(const SessionFormat * fmt, AudioSink * sink)
