@@ -190,12 +190,32 @@ consumer_thread(void * arg_v)
       idx0 at or after read_pos, the value this same thread mirrors
       exactly (it is the ring's sole consumer of viz_ring-style state).
 
-   The search window is bounded by the ring's capacity, not by elapsed
-   time or bytes produced: ring_read_latest can only discard bytes still
-   held in the ring, and the ring invariant write_pos - read_pos <= cap
-   (DESIGN.md IV.4 rule 1) means the true starting index can be at most
-   `cap` past the previous read position. That bound holds regardless of
-   how long the test has been running. */
+   The search window is bounded by the ring's capacity plus one block,
+   not by elapsed time or bytes produced. ring_read_latest drains the
+   ring, so `read_pos` below is the writer's position at the moment of
+   the previous read; the producer can then write a full `cap` before it
+   blocks on a full ring (it retries rather than dropping), which is the
+   `cap` term. The `+ MAX_BLOCK` is the producer's in-flight block: the
+   read is not atomic against the writer, so one block may land between
+   the previous read's snapshot and its return, and that block is
+   reported by the *next* read rather than being lost.
+
+   That second term was missing until 2026-08-20, and its absence is a
+   textbook example of why a duration-bounded stress test proves less
+   than it looks like it does. `--latest 10` passed every time; the
+   failure needs the producer to both fill the ring completely and land
+   an extra block between two reads, which is rare per iteration and
+   near-certain over a minute. Phase 1 accepted this harness on a 10 s
+   run. `--latest 60` fails on it reproducibly, with the true match
+   sitting 206 and 911 bytes past the old limit on the two runs that
+   were measured -- both well inside one MAX_BLOCK, which is what
+   identifies the missing term rather than merely widening until green.
+
+   A window that is too tight reports a ring defect that is not there,
+   which is the worse direction to be wrong in on this particular file:
+   ring.c holds the project's rank-1 invariant (DESIGN.md XVI risk 1)
+   and a false positive here costs a day of looking for a memory-
+   ordering bug that does not exist. */
 static void *
 consumer_thread_latest(void * arg_v)
 {
@@ -204,7 +224,7 @@ consumer_thread_latest(void * arg_v)
   unsigned int seed     = args->seed;
   uint64_t     read_pos = 0;
   uint8_t      buf[MAX_BLOCK];
-  uint64_t     window = (uint64_t) sh->ring->cap;
+  uint64_t     window = (uint64_t) sh->ring->cap + MAX_BLOCK;
 
   for (;;) {
     size_t n   = pick_block_size(&seed);
