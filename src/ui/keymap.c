@@ -223,6 +223,25 @@ static const Binding g_bindings_queue[] = {
   { 0, 's',  0, ACT_TOGGLE_SHUFFLE,   0 },
   { 0, 'r',  0, ACT_CYCLE_REPEAT,     0 },
   { 0, ' ',  0, ACT_PLAY_PAUSE,       0 },
+  /* Transport, repeated from normal mode rather than moved: the pane is
+     an overlay on a player that is still playing, and a mode that binds
+     play/pause but not seek or volume is an omission wearing a design's
+     clothes (phase 17 runbook item 3). The shift+arrow rows do not
+     collide with the bare arrows above -- the resolver matches the
+     modifier -- which is what makes K/J the right keys for the moves. */
+  { TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_SMALL_MS },
+  { TB_KEY_ARROW_LEFT,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_SMALL_MS },
+  { TB_KEY_ARROW_UP,    0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_LARGE_MS },
+  { TB_KEY_ARROW_DOWN,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_LARGE_MS },
+  { 0, '.',  0, ACT_SEEK_FWD,         SEEK_SMALL_MS },
+  { 0, ',',  0, ACT_SEEK_BACK,        SEEK_SMALL_MS },
+  { 0, 'L',  0, ACT_SEEK_FWD,         SEEK_LARGE_MS },
+  { 0, 'H',  0, ACT_SEEK_BACK,        SEEK_LARGE_MS },
+  { 0, '+',  0, ACT_VOL_UP,           VOL_STEP_PCT },
+  { 0, '-',  0, ACT_VOL_DOWN,         VOL_STEP_PCT },
+  { 0, 'M',  0, ACT_MUTE,             0 },
+  { 0, 'n',  0, ACT_NEXT,             0 },
+  { 0, 'p',  0, ACT_PREV,             0 },
   { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
   { 0, 'q',  0, ACT_QUIT,             0 },
   { TB_KEY_ESC,    0, 0, ACT_QUIT,    0 },

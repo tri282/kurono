@@ -601,6 +601,16 @@ typedef struct {
   char            now_name[192];
   int64_t         dur_ms;
 
+  /* The duration of a track that T2 has opened but that is not sounding
+     yet. amendment 09's prefetch means EV_STREAM_INFO for track N+1
+     arrives at the decoder's EOF of track N -- up to a ring's worth of
+     audio before the boundary that makes it current. Applying it to
+     dur_ms there would name the wrong track's length, and clearing
+     dur_ms at the boundary would throw the only copy away, so it is
+     parked here under its own id until the boundary claims it. */
+  int64_t         pend_dur_id;
+  int64_t         pend_dur_ms;
+
   /* The playing track's full key, for ACT_JUMP_TO_PLAYING. Kept beside
      the basename rather than derived from it, and copied for the same
      reason: the QueueEntry it came from dies under queue_clear, which
@@ -2173,14 +2183,18 @@ player_on_boundary(Player * p, const BoundaryEntry * b)
   }
 
   /* The elapsed clock restarts at the boundary, in the same frame domain
-     the boundary is keyed on. dur_ms is cleared until the new track's
-     EV_STREAM_INFO arrives, so the progress bar shows an unknown length
-     rather than the previous track's. */
+     the boundary is keyed on. The new track's duration was parked by
+     EV_STREAM_INFO when T2 opened it, a ring's worth of audio ago; the
+     boundary is where it becomes current. Anything else -- a boundary
+     for a track no stream info was seen for -- leaves the length
+     unknown rather than showing the previous track's. */
   int rate = (int) p->fmt.sample_rate;
   p->pos_origin_ms = (rate > 0)
                          ? -(int64_t) (b->frame_index * 1000u / (uint64_t) rate)
                          : 0;
-  p->dur_ms     = -1;
+  p->dur_ms     = (p->pend_dur_id > 0 && p->pend_dur_id == b->track_id)
+                      ? p->pend_dur_ms
+                      : -1;
   p->fail_count = 0; /* a track that reached its boundary played */
 
   queueview_rebuild(p->q, p->db);
@@ -3263,7 +3277,15 @@ player_handle_engine_event(Player * p, const Event * ev)
          duration is known, which is what the progress bar needs. It is
          deliberately NOT where the failure counter resets -- see
          player_track_failed for why that would defeat the counter. */
-      p->dur_ms = ev->info.duration_ms;
+      if (ev->track_id > 0 && ev->track_id != p->now_id) {
+        /* amendment 09's prefetch: T2 has opened what follows, but it
+           will not be heard until its boundary. Parked, not applied --
+           dur_ms names what is sounding. */
+        p->pend_dur_id = ev->track_id;
+        p->pend_dur_ms = ev->info.duration_ms;
+      } else {
+        p->dur_ms = ev->info.duration_ms;
+      }
       if (p->ui) {
         /* The first point at which the current track is provably open,
            and therefore the point at which "what follows it" is worth

@@ -256,6 +256,29 @@ test_mode_tables(void)
             arg == 30000,
         "shift+up must be the large forward seek");
 
+  /* MODE_QUEUE is an overlay on a player that is still playing, so the
+     transport keys have to survive it (phase 17 runbook item 3). The
+     bare arrows must still be the pane's cursor: the modifier is the
+     whole of the difference, and a resolver that ignored it would make
+     every cursor move a seek. */
+  ev  = synth_event(TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT);
+  arg = -1;
+  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_SEEK_FWD && arg == 5000,
+        "shift+right must seek forward with the queue pane open");
+
+  ev  = synth_event(TB_KEY_ARROW_DOWN, 0, 0);
+  arg = -1;
+  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_CURSOR_DOWN,
+        "a bare down arrow must still move the queue cursor, not seek");
+
+  ev = synth_event(0, '+', 0);
+  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_VOL_UP,
+        "volume must work with the queue pane open");
+
+  ev = synth_event(0, 'n', 0);
+  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_NEXT,
+        "next must work with the queue pane open");
+
   /* The vim keys are unbound and reserved, and h is help in both the
      mode that opens it and the mode it opens. */
   const uint32_t gone[] = { 'j', 'k', 'l' };
