@@ -11,6 +11,24 @@ DEFS = -DTB_OPT_ATTR_W=32
 CFLAGS = $(STD) $(WARN) $(DEFS) -g
 INCLUDES = -Iinclude -Ivendor
 
+# Header dependency tracking. Deliberately NOT part of CFLAGS: `release`
+# and `debug` recurse with CFLAGS set to an explicit string, so anything
+# living there is dropped on exactly the builds that override it. Carried
+# by each compile rule instead, so no target can lose it.
+#
+# -MMD writes build/<mode>/<path>.d beside each object, listing the
+# headers that object was compiled against; -MP adds a phony target for
+# each of those headers so that deleting or renaming one is a rebuild
+# rather than "No rule to make target". System and pkg-config headers are
+# excluded (-MMD, not -MD): they change with the distro, not with this
+# tree, and including them makes every package update a full rebuild.
+#
+# Added 2026-08-19, after a stale ui/keymap.o held an old ACT_COUNT
+# across a header change and failed keymap_test for reasons that had
+# nothing to do with the diff under test. Before this, `make clean` after
+# any header edit was mandatory and undocumented.
+DEPFLAGS = -MMD -MP
+
 PREFIX ?= $(HOME)/.local
 BINDIR = $(PREFIX)/bin
 
@@ -132,15 +150,15 @@ kurono-tsan: $(OBJS_TSAN) | check-deps
 
 build/default/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
 build/asan/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
 build/tsan/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(EXTRA_WARN) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
 # DESIGN.md XII.5 / plan.md VI.1: -Wvla -Wshadow -Wconversion for the
 # audio path specifically. -Wconversion does not reach vendor/miniaudio.h's
@@ -244,7 +262,7 @@ tools/ring_stress: build/tsan/tools/ring_stress.o build/tsan/audio/ring.o
 
 build/tsan/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 # Pure, dependency-free (DESIGN.md III.2, XII.2 testable tier): no
 # PKGS, no check-deps, no sanitiser by default -- the ASan+UBSan variant
@@ -260,7 +278,7 @@ tools/queue_test: build/default/tools/queue_test.o build/default/queue.o
 
 build/default/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 # Pure, dependency-free (DESIGN.md XII.2 testable tier): no PKGS, no
 # check-deps, no terminal. vendor/termbox2.h is included by ui/keymap.h
@@ -290,7 +308,7 @@ tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library
 
 build/default/tools/fts_query_test.o: tools/fts_query_test.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
 install: release
 	install -d $(BINDIR)
@@ -302,3 +320,13 @@ uninstall:
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
 	       tools/queue_test tools/keymap_test tools/fts_query_test
+
+# The .d files written by DEPFLAGS above. A wildcard rather than a list
+# derived from SRCS: the tools' objects live under build/<mode>/tools/
+# and are not in any SRCS-shaped variable, and a wildcard cannot drift
+# when a source is added. Two depths cover the tree (build/default/main.d
+# and build/default/audio/ring.d); nothing nests deeper.
+#
+# Leading `-`: on a clean tree there are no .d files and that is not an
+# error. They are removed with build/ by `clean` above.
+-include $(wildcard build/*/*.d build/*/*/*.d)
