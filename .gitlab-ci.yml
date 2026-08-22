@@ -1,40 +1,38 @@
 # kurono CI -- build and test only, no deploy.
-#
-# Two things shape this file and are worth stating before the jobs:
-#
-# 1. NO JOB CAN RUN kurono ITSELF. There is no audio device and no pty in
-#    a CI container, so the TUI and the audio path are out of reach. What
-#    runs here is the deviceless tier: every compile, the three grep
-#    invariants, -fanalyzer, and the five standalone test binaries. A
-#    green pipeline means the parts that regress silently are still
-#    correct. It does NOT mean the player was exercised -- the browser,
-#    the scan, the queue pane and the audio callback are covered by the
-#    interactive sanitiser runs described in README, by hand.
-#
-# 2. System dependencies are resolved by pkg-config, never by hardcoded
-#    -l flags, so the only distro-specific thing in this file is the
-#    install command. The Debian job therefore doubles as the test of
-#    README's Debian install line.
 
 stages:
   - build
   - release
 
-# Tags build automatically. main and dev do not build on push -- start
-# one from the UI with "Run pipeline" (that arrives as CI_PIPELINE_SOURCE
-# == "web"). Everything else never runs.
-workflow:
+# Which pushes create a pipeline at all. Tags, main and dev do; a
+# pipeline started from the UI does; nothing else
   rules:
     - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "dev"
     - if: $CI_PIPELINE_SOURCE == "web"
     - when: never
 
-# The build and the whole deviceless test tier, run once per distro.
-# Kept as one job rather than split across stages so the dependency
-# install happens once and nothing has to be passed between jobs as an
-# artifact.
+
 .build_and_test:
   stage: build
+  # main and tags build on their own; dev waits to be started. dev is
+  # where work in progress lands
+  #
+  # allow_failure: false is not decoration on the manual rule. A manual
+  # job defaults to allow_failure: true, which would let a dev pipeline
+  # report success with every job un-run
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == "dev"
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: on_success
+    - when: never
   script:
     # Every target must compile clean. -Wall -Wextra live in the
     # Makefile's WARN; -Werror is added here rather than there so a
@@ -101,12 +99,7 @@ build:debian:
     - pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
 
 # Build the source tarball and its checksums, and upload both to the
-# generic package registry. kurono links dynamically and DESIGN.md VI
-# rejects a vendored zero-dependency build, so a binary artifact would
-# only run on a distro with matching library versions -- source plus a
-# checksum is the artifact that works everywhere, and it is what a
-# packager wants regardless.
-package:source:
+# generic package registry.
   stage: release
   image: debian:13
   rules:
