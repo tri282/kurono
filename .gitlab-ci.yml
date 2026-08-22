@@ -1,11 +1,15 @@
 # kurono CI -- build and test only, no deploy.
 
+
 stages:
   - build
   - release
 
 # Which pushes create a pipeline at all. Tags, main and dev do; a
-# pipeline started from the UI does; nothing else
+# pipeline started from the UI does; nothing else. Whether the jobs in
+# that pipeline then start on their own is a per-job decision, set by
+# the rules on .build_and_test below.
+workflow:
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == "main"
@@ -18,11 +22,6 @@ stages:
   stage: build
   # main and tags build on their own; dev waits to be started. dev is
   # where work in progress lands
-  #
-  # allow_failure: false is not decoration on the manual rule. A manual
-  # job defaults to allow_failure: true, which would let a dev pipeline
-  # report success with every job un-run
-  rules:
     - if: $CI_COMMIT_TAG
       when: on_success
     - if: $CI_COMMIT_BRANCH == "dev"
@@ -35,8 +34,7 @@ stages:
     - when: never
   script:
     # Every target must compile clean. -Wall -Wextra live in the
-    # Makefile's WARN; -Werror is added here rather than there so a
-    # warning stops CI without making local development painful.
+    # Makefile's WARN; -Werror is added
     - make WARN="-Wall -Wextra -Werror"
     - ./kurono --version
     - make clean && make release
@@ -56,19 +54,20 @@ stages:
     - make analyze
 
     # The standalone test binaries. Each is pure enough to run with no
-    # device, no terminal and no music. Note the targets only BUILD them
-    # -- running them is a separate step on purpose.
+    # device, no terminal and no music.
     - make queue-test    && ./tools/queue_test
     - make keymap-test   && ./tools/keymap_test
     - make testsrc-test  && ./tools/testsrc_test
     - make fts-query-test && ./tools/fts_query_test
 
-    # The SPSC ring under ThreadSanitizer, both modes, time-boxed. This
-    # is the one place a subtle bug costs the most, and the one test here
-    # that is genuinely concurrent.
+    # The SPSC ring under ThreadSanitizer, both modes, time-boxed
     - make ring-stress
     - ./tools/ring_stress 20
-    - ./tools/ring_stress --latest 20
+    # --latest runs longer than the default mode deliberately. The class
+    # of bug it finds is duration- and contention-dependent: the harness
+    # defect fixed on 2026-08-22 passed --latest 20 on an idle machine
+    # every time and failed on both CI runners, which are contended
+    - ./tools/ring_stress --latest 60
 
 build:fedora:
   extends: .build_and_test
@@ -99,7 +98,7 @@ build:debian:
     - pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
 
 # Build the source tarball and its checksums, and upload both to the
-# generic package registry.
+# generic package registry. kurono links dynamicallypackage:source:
   stage: release
   image: debian:13
   rules:

@@ -48,6 +48,10 @@ typedef struct {
   Ring *      ring;
   atomic_bool producer_done;
   double      duration_sec;
+  /* Total bytes the producer has published, monotonic. Read only by the
+     --latest consumer, to bound its search by where the writer actually
+     is rather than by a guess at how far ahead it can get. */
+  atomic_uint_fast64_t written;
 } Shared;
 
 typedef struct {
@@ -125,6 +129,24 @@ producer_thread(void * arg_v)
       block_buf[k] = payload_byte(idx + k);
     }
 
+    /* Published BEFORE the bytes are written, which is the only order
+       that makes this counter usable as a bound.
+
+       Publishing it after -- either per block or per partial write --
+       looks more natural and is wrong: the producer's ring_write makes
+       bytes readable before the store lands, so a consumer that reads
+       in that gap holds data newer than the counter it then loads. The
+       consumer would compute an upper bound BELOW what it legitimately
+       received and report a defect that is not there. Measured, not
+       reasoned: chunks ending 1121 and 6154 bytes past the counter.
+
+       Published first, the value can only ever OVERSTATE what is
+       readable, by at most one block. An upper bound that is too
+       generous costs a slightly wider search; one that is too tight
+       costs a false failure on the project's rank-1 invariant. */
+    atomic_store_explicit(&sh->written, (uint_fast64_t) (idx + block),
+                          memory_order_release);
+
     size_t off = 0;
     while (off < block) {
       size_t n = ring_write(sh->ring, block_buf + off, block - off);
@@ -197,27 +219,49 @@ consumer_thread(void * arg_v)
    ring, so `read_pos` below is the writer's position at the moment of
    the previous read; the producer can then write a full `cap` before it
    blocks on a full ring (it retries rather than dropping), which is the
-   `cap` term. The `+ MAX_BLOCK` is the producer's in-flight block: the
-   read is not atomic against the writer, so one block may land between
-   the previous read's snapshot and its return, and that block is
-   reported by the *next* read rather than being lost.
+   ordering is checked against where the writer actually is, not against
+   a guess at how far ahead of the reader it can get.
 
-   That second term was missing until 2026-08-20, and its absence is a
-   textbook example of why a duration-bounded stress test proves less
-   than it looks like it does. `--latest 10` passed every time; the
-   failure needs the producer to both fill the ring completely and land
-   an extra block between two reads, which is rare per iteration and
-   near-certain over a minute. Phase 1 accepted this harness on a 10 s
-   run. `--latest 60` fails on it reproducibly, with the true match
-   sitting 206 and 911 bytes past the old limit on the two runs that
-   were measured -- both well inside one MAX_BLOCK, which is what
-   identifies the missing term rather than merely widening until green.
+   THAT GUESS IS WHY THIS CHECK HAS BEEN WRONG TWICE. It was originally
+   `cap`; on 2026-08-20 a `+ MAX_BLOCK` term was added for the producer's
+   in-flight block, after `--latest 60` failed with the true match 206
+   and 911 bytes past the old limit. That fix was real but treated a
+   symptom. On 2026-08-22 CI failed on both distros at `--latest 20`,
+   and the true match was 1528 to 2136 bytes past the widened limit --
+   reproducible locally under `taskset -c 0`, which is what a contended
+   shared runner looks like.
+
+   The actual defect is in how the position was recovered, not in how
+   wide the window was. payload_byte() maps an index to ONE byte, so a
+   short chunk has many false matches: for got == 1 a wrong candidate
+   turns up within ~256 bytes essentially always, and the loop takes the
+   FIRST match it finds. read_pos then advances a few hundred bytes when
+   the writer has moved tens of thousands, and that lag is permanent and
+   cumulative. Any fixed window is eventually exceeded; widening it only
+   buys iterations. Both earlier failures were this, at different stages
+   of the same drift.
+
+   So the window is no longer guessed. The producer publishes its byte
+   count, and the consumer loads it AFTER the read returns. The chunk it
+   holds must end at or before that value, so its start lies in
+   [read_pos, written - got] -- a range that is correct by construction
+   under any scheduling, and that still contains the true position even
+   when a previous iteration took a false match. A short-chunk
+   ambiguity now self-heals: the next chunk long enough to be unique
+   snaps read_pos back to the truth.
+
+   It is also a STRONGER check than before. A fixed window could not
+   tell "the writer got further ahead than I assumed" from "the ring
+   returned something it should not have"; anchoring to the writer means
+   data claiming to be past the writer's own position is now a failure
+   rather than something a wider window would hide.
 
    A window that is too tight reports a ring defect that is not there,
    which is the worse direction to be wrong in on this particular file:
    ring.c holds the project's rank-1 invariant (DESIGN.md XVI risk 1)
    and a false positive here costs a day of looking for a memory-
-   ordering bug that does not exist. */
+   ordering bug that does not exist. Both times, that is exactly what it
+   cost. */
 static void *
 consumer_thread_latest(void * arg_v)
 {
@@ -226,15 +270,34 @@ consumer_thread_latest(void * arg_v)
   unsigned int seed     = args->seed;
   uint64_t     read_pos = 0;
   uint8_t      buf[MAX_BLOCK];
-  uint64_t     window = (uint64_t) sh->ring->cap + MAX_BLOCK;
 
   for (;;) {
     size_t n   = pick_block_size(&seed);
     size_t got = (n == 0) ? 0 : ring_read_latest(sh->ring, buf, n);
 
     if (got > 0) {
+      /* Loaded after the read, so every byte just returned is covered by
+         it. The chunk ends at or before `written`, so it starts at or
+         before `written - got`. */
+      uint64_t written = (uint64_t) atomic_load_explicit(&sh->written,
+                                                         memory_order_acquire);
       uint64_t idx0  = UINT64_MAX;
-      uint64_t limit = read_pos + window;
+
+      if (written < (uint64_t) got) {
+        fprintf(stderr,
+                "ring_read_latest: returned %zu bytes but only %" PRIu64
+                " have been written\n", got, written);
+        exit(1);
+      }
+      uint64_t limit = written - (uint64_t) got;
+
+      if (limit < read_pos) {
+        fprintf(stderr,
+                "ring_read_latest: chunk ends at or before read_pos "
+                "(read_pos %" PRIu64 ", written %" PRIu64 ", got %zu)\n",
+                read_pos, written, got);
+        exit(1);
+      }
 
       for (uint64_t cand = read_pos; cand <= limit; cand++) {
         if (payload_byte(cand) != buf[0]) {
@@ -254,9 +317,13 @@ consumer_thread_latest(void * arg_v)
       }
 
       if (idx0 == UINT64_MAX) {
+        /* No position in the legal range produces these bytes. Unlike
+           the old fixed window, this range cannot be too small, so this
+           is a ring defect rather than a harness assumption. */
         fprintf(stderr,
-                "ring_read_latest: no contiguous suffix match in [%" PRIu64 ", %" PRIu64 "]\n",
-                read_pos, limit);
+                "ring_read_latest: %zu bytes match no position in "
+                "[%" PRIu64 ", %" PRIu64 "] (writer at %" PRIu64 ")\n",
+                got, read_pos, limit, written);
         exit(1);
       }
       if (idx0 < read_pos) {
@@ -308,6 +375,7 @@ main(int argc, char ** argv)
   shared.ring         = &ring;
   shared.duration_sec = duration;
   atomic_init(&shared.producer_done, false);
+  atomic_init(&shared.written, (uint_fast64_t) 0);
 
   ThreadArgs producer_args = { .shared = &shared, .seed = 12345u };
   ThreadArgs consumer_args = { .shared = &shared, .seed = 67890u };
