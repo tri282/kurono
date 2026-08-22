@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "../../include/library/query.h"
 
@@ -23,14 +24,24 @@
 #define MATCH_SLACK  8
 
 /*
- * cmp_str: qsort comparator over char * elements, ordering by strcmp so
- * the collapsed names agree with SQLite's BINARY collation.
+ * query_name_cmp: see query.h.
+ */
+int query_name_cmp(const char * a, const char * b)
+{
+  int c = strcasecmp(a, b);
+  return (c != 0) ? c : strcmp(a, b);
+} /* query_name_cmp */
+
+/*
+ * cmp_str: qsort comparator over char * elements, ordering by
+ * query_name_cmp so the collapsed names agree with the COLLATE NOCASE
+ * order db.c produces.
  */
 static int cmp_str(const void * a, const void * b)
 {
   const char * const * pa = a;
   const char * const * pb = b;
-  return strcmp(*pa, *pb);
+  return query_name_cmp(*pa, *pb);
 } /* cmp_str */
 
 /*

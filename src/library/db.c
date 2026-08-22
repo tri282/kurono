@@ -505,10 +505,31 @@ prepare_all_statements(Db * db)
                     "WHERE parent_dir = ?1 "
                     "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
                     "ORDER BY parent_dir");
-  PREP(query_artists, "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL ORDER BY artist");
+  /* COLLATE NOCASE on every ORDER BY whose result the user reads as a
+     list. The default BINARY collation put every A-Z name above every
+     a-z one, so a single alphabetised column rendered as two (reported
+     2026-08-21). NOCASE folds ASCII only, which is exactly what
+     query_name_cmp does on the browser's side -- the two orderings must
+     stay in step, because the Directory view sorts with one and the
+     library views with the other.
+
+     Cost: idx_tracks_artist and the UNIQUE index on path are BINARY, so
+     these clauses no longer order through an index and SQLite sorts in
+     a temp B-tree instead. Measured irrelevant at v1 scale; the fix if
+     it ever matters is a second NOCASE index, not a schema change, and
+     no schema_version bump is involved either way.
+
+     query_dirs below is deliberately left BINARY: its output is always
+     fed through query_dirs_collapse, which re-sorts with
+     query_name_cmp, so a COLLATE here would buy nothing and cost the
+     index. */
+  PREP(query_artists, "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL "
+                      "ORDER BY artist COLLATE NOCASE");
   PREP(query_album_artists,
-       "SELECT DISTINCT album_artist FROM tracks WHERE album_artist IS NOT NULL ORDER BY album_artist");
-  PREP(query_albums_for, "SELECT DISTINCT album FROM tracks WHERE artist = ?1 AND album IS NOT NULL ORDER BY album");
+       "SELECT DISTINCT album_artist FROM tracks WHERE album_artist IS NOT NULL "
+       "ORDER BY album_artist COLLATE NOCASE");
+  PREP(query_albums_for, "SELECT DISTINCT album FROM tracks WHERE artist = ?1 AND album IS NOT NULL "
+                         "ORDER BY album COLLATE NOCASE");
   /* The album_artist twin of the line above. Both views ask "which
      albums belong to this name", but they mean different columns, and
      one statement cannot serve both: an Album Artists view filtered on
@@ -517,7 +538,8 @@ prepare_all_statements(Db * db)
      idx_tracks_album_artist's leading column, so DISTINCT needs no
      sort. */
   PREP(query_albums_for_album_artist,
-       "SELECT DISTINCT album FROM tracks WHERE album_artist = ?1 AND album IS NOT NULL ORDER BY album");
+       "SELECT DISTINCT album FROM tracks WHERE album_artist = ?1 AND album IS NOT NULL "
+       "ORDER BY album COLLATE NOCASE");
   PREP(query_tracks_for_album,
        "SELECT * FROM tracks WHERE album_artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
   /* The artist twin, for the Artists view, which reaches an album
@@ -529,7 +551,7 @@ prepare_all_statements(Db * db)
      of rows. */
   PREP(query_tracks_for_artist_album,
        "SELECT * FROM tracks WHERE artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
-  PREP(query_tracks_in_dir, "SELECT * FROM tracks WHERE parent_dir = ?1 ORDER BY path");
+  PREP(query_tracks_in_dir, "SELECT * FROM tracks WHERE parent_dir = ?1 ORDER BY path COLLATE NOCASE");
   /* The recursive twin, for enqueuing a directory row. Same prefix
      RANGE as query_dirs above and for the same reason -- a GLOB would
      read '[', '*' and '?' in the bound value as metacharacters, so
@@ -543,7 +565,7 @@ prepare_all_statements(Db * db)
   PREP(query_tracks_under_dir, "SELECT * FROM tracks "
                                 "WHERE parent_dir = ?1 "
                                 "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
-                                "ORDER BY path");
+                                "ORDER BY path COLLATE NOCASE");
   PREP(query_track_by_id, "SELECT * FROM tracks WHERE id = ?1");
   PREP(query_search,
        "SELECT t.* FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "

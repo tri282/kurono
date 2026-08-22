@@ -51,6 +51,34 @@ int query_dirs_collapse(const char * parent, char * const * paths, size_t n,
                         char *** out_names, size_t * out_n);
 
 /*
+ * query_name_cmp: the one display ordering for names the user reads --
+ * directory entries, artists, albums. strcmp(3) semantics: negative,
+ * zero, positive.
+ *
+ * ASCII case-insensitive first, then strcmp as a tiebreak. Plain
+ * strcmp put every A-Z name above every a-z name, because uppercase
+ * ASCII is 0x41-0x5A and lowercase is 0x61-0x7A -- one listing rendered
+ * as two separately alphabetised blocks (reported 2026-08-21).
+ *
+ * Not strcoll: the locale is never set, and a deterministic listing is
+ * worth more here than a linguistically correct one. In the C locale
+ * strcasecmp folds A-Z and nothing else, so every UTF-8 byte is left
+ * alone and the result stays codepoint-stable.
+ *
+ * **The strcmp tiebreak is load-bearing, not decoration.** strcasecmp
+ * alone calls "abc" and "ABC" equal; qsort(3) is not stable, so without
+ * a total order two names differing only in case may swap between runs
+ * of the same unchanged directory. That is the determinism this
+ * function exists to keep, and tools/fts_query_test asserts it.
+ *
+ * db.c's ORDER BY clauses carry COLLATE NOCASE to match. The two
+ * orderings must agree: the Directory view collapses db_query_dirs'
+ * output through query_dirs_collapse, so a divergence would show as a
+ * column that reorders itself when the source of its rows changes.
+ */
+int query_name_cmp(const char * a, const char * b);
+
+/*
  * query_build_match: turn raw user input into an FTS5 MATCH string that
  * always parses (DESIGN.md V.6 step 3).
  *

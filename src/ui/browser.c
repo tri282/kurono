@@ -97,11 +97,11 @@ fs_is_ignored(const FsSource * s, const char * name)
 } /* fs_is_ignored */
 
 /*
- * row_cmp: directories before files, then byte order within each group.
- * Byte order rather than strcoll because the locale is not set and a
- * deterministic listing is worth more here than a linguistically
- * correct one -- for UTF-8 this is codepoint order, which is stable.
- * qsort(3) comparator over BrowserRow.
+ * row_cmp: directories before files, then query_name_cmp within each
+ * group -- ASCII case-insensitive with a strcmp tiebreak, which is the
+ * same ordering db.c's COLLATE NOCASE clauses produce and the same one
+ * query_dirs_collapse sorts by. See query.h for why it is not strcmp
+ * and not strcoll. qsort(3) comparator over BrowserRow.
  */
 static int
 row_cmp(const void * a, const void * b)
@@ -112,7 +112,7 @@ row_cmp(const void * a, const void * b)
   if (x->is_dir != y->is_dir) {
     return y->is_dir - x->is_dir; /* is_dir 1 sorts before is_dir 0 */
   }
-  return strcmp(x->name, y->name);
+  return query_name_cmp(x->name, y->name);
 } /* row_cmp */
 
 /*

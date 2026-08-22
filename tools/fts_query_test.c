@@ -430,6 +430,74 @@ static void test_against_fts5(void)
 } /* test_against_fts5 */
 
 /*
+ * cmp_name_qsort: qsort(3) adapter over query_name_cmp for the listing
+ * check below. Takes two `const char *` elements by address.
+ */
+static int cmp_name_qsort(const void * a, const void * b)
+{
+  const char * const * pa = a;
+  const char * const * pb = b;
+  return query_name_cmp(*pa, *pb);
+} /* cmp_name_qsort */
+
+/*
+ * test_name_cmp: query_name_cmp is the display ordering for every list
+ * of names the user reads, and two properties of it are load-bearing.
+ *
+ * The first is that case does not partition the list: plain strcmp put
+ * every A-Z name above every a-z one, which is the bug this function
+ * was introduced to fix (2026-08-21).
+ *
+ * The second is that it is still a *total* order. strcasecmp alone
+ * calls "abc" and "ABC" equal; qsort(3) is not stable, so dropping the
+ * strcmp tiebreak would let two names differing only in case swap
+ * between runs over an unchanged directory. That failure is invisible
+ * in a single run, which is why it is asserted here rather than left to
+ * inspection. Takes nothing, returns nothing, reports through CHECK.
+ */
+static void test_name_cmp(void)
+{
+  /* Case must not partition: the interleaved order is the whole point. */
+  CHECK(query_name_cmp("abba", "Zeppelin") < 0,
+        "a lowercase name must sort before a later uppercase one");
+  CHECK(query_name_cmp("Zeppelin", "abba") > 0,
+        "query_name_cmp must be antisymmetric on that pair");
+  CHECK(query_name_cmp("Beatles", "abba") > 0,
+        "an uppercase B must sort after a lowercase a");
+
+  /* Equal ignoring case, so the tiebreak decides -- and must decide
+     consistently rather than returning 0. Deleting the tiebreak makes
+     both of these fail. */
+  CHECK(query_name_cmp("abc", "ABC") != 0,
+        "names differing only in case must be totally ordered, not equal");
+  CHECK((query_name_cmp("abc", "ABC") > 0) == (strcmp("abc", "ABC") > 0),
+        "the tiebreak must be strcmp, so the order is deterministic");
+
+  /* Identity, and the ordinary cases still hold. */
+  CHECK(query_name_cmp("same", "same") == 0, "a name must equal itself");
+  CHECK(query_name_cmp("a", "b") < 0, "plain lowercase ordering must hold");
+  CHECK(query_name_cmp("A", "B") < 0, "plain uppercase ordering must hold");
+  CHECK(query_name_cmp("abc", "abcd") < 0, "a prefix must sort before what extends it");
+
+  /* Non-ASCII is untouched: strcasecmp in the C locale folds A-Z and
+     nothing else, so UTF-8 stays in codepoint order. */
+  CHECK(query_name_cmp("\xc3\xa9tude", "Zzz") > 0,
+        "a leading UTF-8 byte must keep its codepoint order");
+
+  /* The ordering an actual listing gets, sorted through the real
+     comparator rather than asserted pairwise. */
+  const char * want[] = { "abba", "Beatles", "Chopin", "dvorak", "Elgar" };
+  const char * got[]  = { "Elgar", "abba", "Chopin", "Beatles", "dvorak" };
+  size_t       n      = sizeof got / sizeof got[0];
+
+  qsort((void *) got, n, sizeof got[0], cmp_name_qsort);
+  for (size_t i = 0; i < n; i++) {
+    CHECK(strcmp(got[i], want[i]) == 0,
+          "sorted listing position %zu is %s, want %s", i, got[i], want[i]);
+  }
+} /* test_name_cmp */
+
+/*
  * main: runs the pure tests always and the FTS5 mode unless --pure is
  * given. Takes the usual argc/argv; returns 0 if every check passed, 1
  * otherwise.
@@ -442,6 +510,7 @@ int main(int argc, char ** argv)
   test_match_edges();
   test_match_big();
   test_match_utf8();
+  test_name_cmp();
   test_collapse();
   test_collapse_wide();
 
