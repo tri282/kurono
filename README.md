@@ -343,6 +343,24 @@ Third-party use is confined on purpose, all ffmpeg lives in `audio/decoder.c`, a
 
 ---
 
+## Releases
+
+Tagged releases carry a source tarball and its SHA-256 checksum. `kurono`
+links dynamically, so there is no prebuilt binary — a binary would run only on
+a distro with matching library versions. Build from source, or wait for a
+package.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for what changed in each release.
+
+CI builds and tests every tag on both Fedora and Debian. It cannot run
+`kurono` itself — there is no audio device and no pty in a container — so a
+green pipeline covers the compile, the invariants, `-fanalyzer` and the five
+standalone test binaries, but not the player. The interface and the audio path
+are verified by hand under ThreadSanitizer and AddressSanitizer before a
+release.
+
+---
+
 ## License
 
 Copyright (C) 2026 Tri Minh Do.

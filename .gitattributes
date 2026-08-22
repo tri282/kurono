@@ -1,0 +1,12 @@
+# Files excluded from `git archive`, which is what builds the release
+# source tarball (.gitlab-ci.yml, package:source).
+#
+# The screenshots are ~2.6 MB and exist to explain kurono on the project
+# page. A packager building from the tarball needs none of them, and
+# they would be the largest thing in it by an order of magnitude. The
+# README's image links therefore do not resolve inside the tarball --
+# that is expected, and the project page is where the README is meant to
+# be read.
+assets/         export-ignore
+.gitattributes  export-ignore
+.gitlab-ci.yml  export-ignore

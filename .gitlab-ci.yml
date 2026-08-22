@@ -1,0 +1,155 @@
+# kurono CI -- build and test only, no deploy.
+#
+# Two things shape this file and are worth stating before the jobs:
+#
+# 1. NO JOB CAN RUN kurono ITSELF. There is no audio device and no pty in
+#    a CI container, so the TUI and the audio path are out of reach. What
+#    runs here is the deviceless tier: every compile, the three grep
+#    invariants, -fanalyzer, and the five standalone test binaries. A
+#    green pipeline means the parts that regress silently are still
+#    correct. It does NOT mean the player was exercised -- the browser,
+#    the scan, the queue pane and the audio callback are covered by the
+#    interactive sanitiser runs described in README, by hand.
+#
+# 2. System dependencies are resolved by pkg-config, never by hardcoded
+#    -l flags, so the only distro-specific thing in this file is the
+#    install command. The Debian job therefore doubles as the test of
+#    README's Debian install line.
+
+stages:
+  - build
+  - release
+
+# Tags build automatically. main and dev do not build on push -- start
+# one from the UI with "Run pipeline" (that arrives as CI_PIPELINE_SOURCE
+# == "web"). Everything else never runs.
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - when: never
+
+# The build and the whole deviceless test tier, run once per distro.
+# Kept as one job rather than split across stages so the dependency
+# install happens once and nothing has to be passed between jobs as an
+# artifact.
+.build_and_test:
+  stage: build
+  script:
+    # Every target must compile clean. -Wall -Wextra live in the
+    # Makefile's WARN; -Werror is added here rather than there so a
+    # warning stops CI without making local development painful.
+    - make WARN="-Wall -Wextra -Werror"
+    - ./kurono --version
+    - make clean && make release
+    - make clean && make debug
+
+    # The sanitiser builds must link, even though nothing can run them.
+    # This is what catches a missing libasan/libtsan or a flag that stops
+    # composing, which otherwise surfaces only when someone needs it.
+    - make clean && make asan
+    - make clean && make tsan
+    - make clean
+
+    # The three grep invariants: check-layering, check-flush, check-theme.
+    - make check
+
+    # -fanalyzer over every source, including the unlinked ones.
+    - make analyze
+
+    # The standalone test binaries. Each is pure enough to run with no
+    # device, no terminal and no music. Note the targets only BUILD them
+    # -- running them is a separate step on purpose.
+    - make queue-test    && ./tools/queue_test
+    - make keymap-test   && ./tools/keymap_test
+    - make testsrc-test  && ./tools/testsrc_test
+    - make fts-query-test && ./tools/fts_query_test
+
+    # The SPSC ring under ThreadSanitizer, both modes, time-boxed. This
+    # is the one place a subtle bug costs the most, and the one test here
+    # that is genuinely concurrent.
+    - make ring-stress
+    - ./tools/ring_stress 20
+    - ./tools/ring_stress --latest 20
+
+build:fedora:
+  extends: .build_and_test
+  image: fedora:latest
+  before_script:
+    # The four lib*-free-devel packages, NOT ffmpeg-free-devel: that is a
+    # metapackage pulling in three more devel packages kurono does not
+    # use. RPM Fusion's ffmpeg-devel would also satisfy
+    # pkgconfig(libavformat) and must not be used -- it is a
+    # --enable-gpl build, which conflicts with how kurono is licensed
+    # (see THIRD-PARTY.md).
+    - dnf -y install gcc make pkgconf-pkg-config git
+                     libavformat-free-devel libavcodec-free-devel
+                     libavutil-free-devel libswresample-free-devel
+                     sqlite-devel taglib-devel
+                     libasan libtsan libubsan
+    - pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
+
+build:debian:
+  extends: .build_and_test
+  image: debian:13
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends
+                     build-essential pkg-config git
+                     libavformat-dev libavcodec-dev libavutil-dev
+                     libswresample-dev libsqlite3-dev libtag1-dev
+    - pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
+
+# Build the source tarball and its checksums, and upload both to the
+# generic package registry. kurono links dynamically and DESIGN.md VI
+# rejects a vendored zero-dependency build, so a binary artifact would
+# only run on a distro with matching library versions -- source plus a
+# checksum is the artifact that works everywhere, and it is what a
+# packager wants regardless.
+package:source:
+  stage: release
+  image: debian:13
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends git ca-certificates curl
+  script:
+    - export PKG="kurono-${CI_COMMIT_TAG}"
+    - git archive --format=tar.gz --prefix="${PKG}/" -o "${PKG}.tar.gz" "${CI_COMMIT_TAG}"
+    - sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+    - cat "${PKG}.tar.gz.sha256"
+    - |
+      for f in "${PKG}.tar.gz" "${PKG}.tar.gz.sha256"; do
+        curl --fail --silent --show-error \
+             --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+             --upload-file "${f}" \
+             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kurono/${CI_COMMIT_TAG}/${f}"
+      done
+  artifacts:
+    paths:
+      - kurono-*.tar.gz
+      - kurono-*.tar.gz.sha256
+
+# Attach the uploaded tarball and checksum to the tag's release page.
+# release-cli only creates the release entry; the assets themselves live
+# in the package registry, which is why package:source runs first.
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - package:source
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release ${CI_COMMIT_TAG}"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "kurono ${CI_COMMIT_TAG}"
+    description: "See CHANGELOG.md for what changed in this release."
+    assets:
+      links:
+        - name: "kurono-${CI_COMMIT_TAG}.tar.gz"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kurono/${CI_COMMIT_TAG}/kurono-${CI_COMMIT_TAG}.tar.gz"
+        - name: "kurono-${CI_COMMIT_TAG}.tar.gz.sha256"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kurono/${CI_COMMIT_TAG}/kurono-${CI_COMMIT_TAG}.tar.gz.sha256"
