@@ -243,6 +243,11 @@ static const Binding g_bindings_queue[] = {
   { 0, 'n',  0, ACT_NEXT,             0 },
   { 0, 'p',  0, ACT_PREV,             0 },
   { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
+  /* Rescan, for the same reason as the transport rows above: it acts on
+     the library, not on the pane, and the pane is an overlay rather than
+     a screen. View switching stays out -- it would have to close the
+     pane to mean anything, which is a decision, not an omission. */
+  { TB_KEY_CTRL_R, 0, 0, ACT_RESCAN,  0 },
   { 0, 'q',  0, ACT_QUIT,             0 },
   { TB_KEY_ESC,    0, 0, ACT_QUIT,    0 },
   { TB_KEY_CTRL_C, 0, 0, ACT_QUIT,    0 },

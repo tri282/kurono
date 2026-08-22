@@ -278,7 +278,7 @@ Arrow keys navigate; letters act. Every binding resolves through a table to an a
 | `esc` | Close the open overlay or cancel a search |
 | `q` / `ctrl+c` | Close the open overlay, or quit when none is open |
 
-*The queue pane is a mode of its own. While it is open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport — play/pause, seek, volume, mute, next/previous, shuffle, repeat — works there too. View switching (`tab`, `1`/`2`/`3`) and rescan do not; close the pane with `esc` or `v` first.*
+*The queue pane is a mode of its own. While it is open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport — play/pause, seek, volume, mute, next/previous, shuffle, repeat — works there too, as does rescan (`ctrl-r`). View switching (`tab`, `1`/`2`/`3`) does not; close the pane with `esc` or `v` first.*
 
 `h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help; a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
 

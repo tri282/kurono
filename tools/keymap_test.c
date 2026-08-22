@@ -279,6 +279,10 @@ test_mode_tables(void)
   CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_NEXT,
         "next must work with the queue pane open");
 
+  ev = synth_event(TB_KEY_CTRL_R, 0, 0);
+  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_RESCAN,
+        "rescan must work with the queue pane open");
+
   /* The vim keys are unbound and reserved, and h is help in both the
      mode that opens it and the mode it opens. */
   const uint32_t gone[] = { 'j', 'k', 'l' };
