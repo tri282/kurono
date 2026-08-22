@@ -22,6 +22,7 @@ workflow:
   stage: build
   # main and tags build on their own; dev waits to be started. dev is
   # where work in progress lands
+  rules:
     - if: $CI_COMMIT_TAG
       when: on_success
     - if: $CI_COMMIT_BRANCH == "dev"
@@ -98,7 +99,9 @@ build:debian:
     - pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
 
 # Build the source tarball and its checksums, and upload both to the
-# generic package registry. kurono links dynamicallypackage:source:
+# generic package registry. kurono links dynamically, so a binary
+# artifact would only run on a distro with matching library versions.
+package:source:
   stage: release
   image: debian:13
   rules:
