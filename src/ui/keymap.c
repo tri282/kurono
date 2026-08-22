@@ -434,6 +434,7 @@ static const struct {
   { TB_KEY_END,         "end"       },
   { TB_KEY_BACKSPACE2,  "backspace" },
   { TB_KEY_CTRL_C,      "ctrl-c"    },
+  { TB_KEY_CTRL_R,      "ctrl-r"    },
 };
 
 /* key_name: see include/ui/keymap.h. */

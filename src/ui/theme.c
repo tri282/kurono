@@ -54,7 +54,16 @@ const Theme g_theme_default = {
     [STYLE_SPECTRUM_PEAK]  = { 0xff9e64, 0x11131a, 0 },
     [STYLE_PLAYING]        = { 0x9ece6a, 0x11131a, TB_BOLD },
     [STYLE_ERROR]          = { 0xf7768e, 0x11131a, TB_BOLD },
-    [STYLE_SEARCH_MATCH]   = { 0x11131a, 0xe0af68, 0 },
+    /* A foreground accent, not a filled bar. This slot was
+       { 0x11131a, 0xe0af68, 0 } -- dark text on the accent background,
+       which is STYLE_CURSOR's colour exactly, differing only by
+       TB_BOLD. Every result row therefore drew as an orange bar and the
+       cursor row drew as the same orange bar, so the arrow keys moved
+       an invisible cursor (reported 2026-08-21). The filled bar belongs
+       to the cursor alone; a match earns its emphasis from the
+       foreground. Same accent as STYLE_MODE, which is where this pairing
+       is already proven legible. */
+    [STYLE_SEARCH_MATCH]   = { 0xe0af68, 0x11131a, 0 },
     [STYLE_SCROLLBAR]      = { 0x565f73, 0x11131a, 0 },
     [STYLE_POPUP]          = { 0xc8ccd4, 0x232733, 0 },
     [STYLE_COVER_BORDER]   = { 0x565f73, 0x11131a, 0 },

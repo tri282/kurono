@@ -424,6 +424,57 @@ test_reserved_actions_present(void)
 } /* test_reserved_actions_present */
 
 /*
+ * test_key_names_are_named: every binding in every mode table must
+ * render through key_name() as a name a person recognises, never as
+ * key_name's fallback spelling.
+ *
+ * The help overlay is generated from the binding tables rather than
+ * hand-written, which is what keeps it from drifting -- but it means an
+ * unnamed key silently reaches the screen as "key#18" instead of
+ * "ctrl-r". That is exactly what shipped: TB_KEY_CTRL_R was bound in
+ * two tables and absent from g_key_name, so help advertised a keystroke
+ * nobody could type (reported 2026-08-21). Nothing failed; the wrong
+ * text was simply drawn.
+ *
+ * Both fallbacks are checked. "key#" catches a special key missing from
+ * g_key_name, and "U+" catches a non-ASCII codepoint binding, which
+ * nothing in v1 has but a config file could add. Takes nothing, returns
+ * nothing.
+ */
+static void
+test_key_names_are_named(void)
+{
+  for (int m = 0; m < MODE_COUNT; m++) {
+    size_t          n = 0;
+    const Binding * t = keymap_table((UiMode) m, &n);
+
+    CHECK(t != NULL, "mode %d has no binding table", m);
+    if (t == NULL) {
+      continue;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+      const char * name = key_name(&t[i]);
+
+      CHECK(name != NULL && name[0] != '\0',
+            "mode %d row %zu (action %s) has an empty key name",
+            m, i, action_name(t[i].action));
+      if (name == NULL) {
+        continue;
+      }
+      CHECK(strstr(name, "key#") == NULL,
+            "mode %d row %zu (action %s) renders as \"%s\" -- the key is "
+            "missing from g_key_name and help will show it that way",
+            m, i, action_name(t[i].action), name);
+      CHECK(strstr(name, "U+") == NULL,
+            "mode %d row %zu (action %s) renders as \"%s\" -- a bare "
+            "codepoint is not a key name a user can act on",
+            m, i, action_name(t[i].action), name);
+    }
+  }
+} /* test_key_names_are_named */
+
+/*
  * test_theme_slots: every StyleSlot is populated (a slot left at
  * {0,0,0} means "terminal default on both channels", which looks
  * plausible on screen and is impossible to spot in a screenshot), the
@@ -452,6 +503,27 @@ test_theme_slots(void)
         "style_fg must OR the attribute bits into the colour");
   CHECK(style_bg(t, STYLE_CURSOR) == g_theme_default.slot[STYLE_CURSOR].bg,
         "style_bg must not carry attribute bits");
+
+  /* The cursor row must be distinguishable from every base style a
+     non-cursor row in the same column can carry -- and distinguishable
+     by colour, not by attribute. STYLE_SEARCH_MATCH was
+     { 0x11131a, 0xe0af68, 0 } against STYLE_CURSOR's
+     { 0x11131a, 0xe0af68, TB_BOLD }: the same two colours, differing
+     only in bold, which is invisible on dark text over a light bar. The
+     result was a search column where the arrow keys moved a cursor
+     nobody could see (2026-08-21). Attributes are deliberately excluded
+     from the comparison here -- that is the whole point. */
+  StyleSlot base_slots[] = {
+    STYLE_NORMAL, STYLE_DIM, STYLE_DIR, STYLE_PLAYING,
+    STYLE_SEARCH_MATCH, STYLE_COL_INACTIVE, STYLE_SELECTED,
+  };
+  for (size_t i = 0; i < sizeof base_slots / sizeof base_slots[0]; i++) {
+    StyleSlot b = base_slots[i];
+    CHECK(!(t->slot[b].fg == t->slot[STYLE_CURSOR].fg &&
+            t->slot[b].bg == t->slot[STYLE_CURSOR].bg),
+          "slot %d is STYLE_CURSOR's exact colours; the cursor would be "
+          "invisible on a row drawn with it", (int) b);
+  }
 
   /* Reserved slots: named here so deleting one fails the build. */
   StyleSlot reserved[] = {
@@ -512,6 +584,7 @@ main(void)
   test_key_names();
   test_action_names();
   test_reserved_actions_present();
+  test_key_names_are_named();
   test_theme_slots();
   test_theme_degrade();
 
