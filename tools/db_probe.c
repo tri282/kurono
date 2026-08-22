@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * db_probe: a scratch driver for phase 13's verify table. main.c does
  * not call db_open yet (that wiring belongs to phase 14), so every row

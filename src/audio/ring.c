@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* Lock-free SPSC byte ring. See ../../include/audio/ring.h for the binding
    single-producer/single-consumer assumption and the struct layout.
 

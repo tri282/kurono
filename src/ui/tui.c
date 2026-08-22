@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * ui/tui.c -- the terminal: termbox2's lifecycle, the drain loop folded
  * into the phase-4 epoll, DESIGN.md VIII.4's layout, and VIII.3's

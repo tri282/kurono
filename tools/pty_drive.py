@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 pty_drive.py -- drive kurono's TUI from a script and capture what it drew.
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * audio/sink.c -- the AudioSink implementation over miniaudio, and the
  * project's rank-1 invariant: the data callback (DESIGN.md IV.2) and

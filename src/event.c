@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * pipe2() is a GNU extension declared in <unistd.h> only under
  * __USE_GNU; the Makefile builds with -D_POSIX_C_SOURCE=200809L, which

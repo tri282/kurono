@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * audio/testsrc.c -- the AudioSource doubles of DESIGN.md VI. See
  * ../../include/audio/testsrc.h for the contract and for why they are

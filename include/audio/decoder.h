@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #ifndef KURONO_AUDIO_DECODER_H
 #define KURONO_AUDIO_DECODER_H
 

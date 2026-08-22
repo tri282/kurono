@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "../../include/ui/browser.h"
 
 #include "../../include/library/db.h"

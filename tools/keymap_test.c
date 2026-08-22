@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* tools/keymap_test.c -- standalone test binary for src/ui/keymap.c and
    src/ui/theme.c (DESIGN.md XII.2 testable tier,
    phase-10-theme-keymap.md I.5). Pure and dependency-free: links only

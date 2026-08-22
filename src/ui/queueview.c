@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "../../include/ui/queueview.h"
 
 #include "../../include/library/db.h"

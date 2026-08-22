@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* tools/testsrc_test.c -- standalone test binary for src/audio/testsrc.c
    (DESIGN.md XII.2's testable tier). Pure, dependency-free,
    deterministic: links only against testsrc.c and libc. No ffmpeg, no

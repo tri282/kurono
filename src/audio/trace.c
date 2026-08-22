@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * audio/trace.c -- the SPSC trace ring: fixed-size records recorded out
  * of T3 (the audio thread) via trace_emit, rendered on T1 via

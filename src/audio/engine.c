@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * audio/engine.c -- T2, the decoder thread: the command/event channels
  * (DESIGN.md IV.6), the producer side of pcm_ring, and the seek/play

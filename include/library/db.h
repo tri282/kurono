@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #ifndef KURONO_LIBRARY_DB_H
 #define KURONO_LIBRARY_DB_H
 

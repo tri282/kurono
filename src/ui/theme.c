@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * ui/theme.c -- the one compiled-in Theme and the 256-colour degrade.
  *

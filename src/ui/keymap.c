@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * ui/keymap.c -- the one compiled-in Binding table and the table walk
  * that resolves a termbox2 key event to an Action.

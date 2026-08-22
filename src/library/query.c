@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * library/query.c -- the two transforms between db.c's rows and what a
  * view can show. Stateless, takes no database handle and includes no

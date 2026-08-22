@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /*
  * audio/decoder.c -- the AudioSource implementation over ffmpeg:
  * demux, decode, and resample any supported file to the session format

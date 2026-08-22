@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #ifndef KURONO_UI_TUI_H
 #define KURONO_UI_TUI_H
 

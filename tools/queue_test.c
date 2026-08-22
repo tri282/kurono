@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* tools/queue_test.c -- standalone test binary for src/queue.c
    (DESIGN.md XII.2, phase-9-queue.md I.6). Pure, dependency-free,
    deterministic: links only against queue.c and libc.

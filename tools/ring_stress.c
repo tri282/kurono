@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* tools/ring_stress.c -- standalone producer/consumer stress harness for
    audio/ring.c (DESIGN.md XII.3). Dependency-free by design: ring.c,
    pthread, and libc only. Compiles without the Makefile, which is why it

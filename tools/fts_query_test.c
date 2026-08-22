@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* tools/fts_query_test.c -- standalone test binary for
    src/library/query.c (DESIGN.md XII.2 testable tier,
    phase-15-query.md I.5).
