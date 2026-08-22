@@ -4140,7 +4140,17 @@ int
 main(int argc, char * argv[])
 {
   if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    /* The GNU --version formula, which is what packagers and users
+       expect once a tool is distributed: version, copyright, licence,
+       and the two sentences GPL-3 section 5's interactive-notice clause
+       is conventionally satisfied by. Printed before tb_init, so it is
+       plain stdout and never touches the alternate screen. */
     printf("kurono %s\n", KURONO_VERSION);
+    printf("Copyright (C) 2026 Tri Minh Do\n");
+    printf("License GPLv3+: GNU GPL version 3 or later"
+           " <https://gnu.org/licenses/gpl.html>\n");
+    printf("This is free software: you are free to change and redistribute it.\n");
+    printf("There is NO WARRANTY, to the extent permitted by law.\n");
     return 0;
   }
 

@@ -1,171 +1,133 @@
 # kurono
 
-A terminal music player in C. Standalone — it owns its own decode and output path, with no daemon, no MPD protocol, and no external player process. Three-column ranger/lf-style browsing over a SQLite-indexed music tree, keyboard driven throughout.
+A simple, local terminal music player in C.
 
-Goal: build `kurono` from source and run it against a local music directory.  
-*Requirements: `gcc`, GNU `make`, `pkg-config`, and the system libraries in section I. Linux only.*
+`kurono` is standalone. It decodes and plays audio itself, no daemon, no MPD protocol, no client/server split, no other player wrapped underneath. One process, one binary, keyboard driven throughout. It indexes your music tree into SQLite and gives you a three-column [ranger](https://github.com/ranger/ranger)-style browser over it, with gapless playback and full-text search.
 
----
+Linux only, deliberately.
 
-## 0. Status
-
-**Nothing is implemented yet.** This repository currently contains the design and its supporting documents. Everything below section I describes the intended contract, not working behaviour.
-
-`DESIGN.md` is the authoritative specification. Read it before writing any code.
-
-Planned milestones, in order:
-
-| Milestone | Contents | State |
-|---|---|---|
-| M1 — spine | Audio engine, ring buffer, decoder, sink, event loop, single-column directory list, playback controls, status bar | complete |
-| M2 — library (v1) | SQLite index and scan, three-column browser, Artists / Album Artists views, FTS5 search, queue view, gapless transition, in-app rescan | complete |
-| post-v1 | Cover art, spectrum visualiser, playlists, config file, EQ, exact lossy gapless, background scan | not started |
+![The kurono browser: artists, albums and tracks in three columns, with a track playing and the status bar showing progress, time and volume.](./assets/hero.png)
 
 ---
 
-## I. Dependencies
+## Features
 
-Third-party code is split between system libraries resolved by `pkg-config` and single-header sources vendored into `vendor/`.
+* **Three-column browsing.** Artists, albums, tracks, or directories, if you'd rather see the tree as it is on disk. Same widget, different query.
+* **Gapless playback.** The next track is opened and decoding before the current one ends. No silence at album boundaries, no click.
+* **Full-text search** over your whole library through SQLite's FTS5, ranked, updating as you type.
+* **A real queue** you can reorder and edit while it plays, in a pane that keeps the transport keys live.
+* **Instant rescans.** The first scan reads tags from every file; after that `kurono` compares size and mtime and skips everything unchanged.
+* **Multiple music roots**, so an archive disk and a home directory can be one library.
+* **Shuffle and repeat** off, all, one.
+* **Truecolor themed**, with every colour behind a named slot rather than hardcoded in the drawing code.
+* **Fast and small.** No runtime, no garbage collector, no config parsing on the hot path. Playback runs lock-free.
 
-| Library | Origin | Purpose | Needed by |
-|---|---|---|---|
-| ffmpeg ≥ 5.1 (`libavformat`, `libavcodec`, `libavutil`, `libswresample`) | system | Demux, decode, resample | M1 |
-| `miniaudio` | vendored, pinned `0.11.25` | Device output (PipeWire / PulseAudio / ALSA / JACK) | M1 |
-| `termbox2` | vendored, pinned `v2.5.0` | TUI rendering | M1 |
-| `sqlite3` | system | Library index and FTS5 search | M2 |
-| `taglib_c` | system | Tag reading during the scan | M2 |
-| `chafa` | system | Cover art rendering | post-v1 |
-| `kissfft` | vendored, tag `131.1.0` | Spectrum FFT | post-v1 |
-
-**Install the system libraries and verification tooling on Fedora:**
-
-```bash
-sudo dnf install libavformat-free-devel libavcodec-free-devel libavutil-free-devel \
-                 libswresample-free-devel sqlite-devel taglib-devel \
-                 libasan libtsan libubsan valgrind cppcheck
-```
-
-`chafa-devel` is not installed yet — it is needed only for post-v1 cover-art work.
-
-**Verify `pkg-config` can resolve everything:**
-
-```bash
-pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
-```
-
-Expected — six version strings, no errors. A missing module prints `No package 'X' found` and names exactly what is absent.
-
-*Note: package names differ across distributions (`libavcodec-free-devel` on Fedora, `libavcodec-dev` on Debian, `ffmpeg` on Arch). The `Makefile` never hardcodes `-l` flags or include paths — `pkg-config` is the single source of truth, so only the install command above is distro-specific.*
-
-*Warning: install the four `lib*-free-devel` packages above, **not** `ffmpeg-free-devel`. `ffmpeg-free-devel` is a metapackage with no `pkgconfig()` provides of its own — it pulls in the four packages plus `libavdevice`, `libavfilter`, and `libswscale` devel, none of which `kurono` uses.*
-
-*Warning: `pkgconfig(libavformat)` is also provided by RPM Fusion's `ffmpeg-devel`. **Do not install that one.** It mismatches the `ffmpeg-free` runtime libraries already on a stock Fedora system, and `-free` is what encodes the LGPL-only constraint this project relies on. If both are ever installed, `pkg-config` will resolve to whichever registered last — verify with `pkg-config --modversion libavformat` and check it reports a `-free` build.*
-
-*Note: ffmpeg 5.1 is a hard floor. `AVChannelLayout` landed in 5.1 and replaced the older `channels` / `channel_layout` fields, and no compatibility shim is planned. This covers Fedora 38+, Debian 13, Ubuntu 24.04+, and current Arch. Ubuntu 22.04 ships ffmpeg 4.4 and will not build.*
-
-**Vendored sources**, placed in `vendor/` and never edited — upgrades are wholesale replacements:
-
-| File | Pin | URL |
-|---|---|---|
-| `vendor/miniaudio.h` | `0.11.25` | `https://raw.githubusercontent.com/mackron/miniaudio/0.11.25/miniaudio.h` |
-| `vendor/termbox2.h` | `v2.5.0` | `https://raw.githubusercontent.com/termbox/termbox2/v2.5.0/termbox2.h` |
-
-Every miniaudio and termbox2 API claim in `DESIGN.md` was verified against these exact revisions — do not vendor `master`.
+![Full-text search: the query and its ranked results, updating as you type.](./assets/search.png)
 
 ---
 
-## II. Build
+## How it works
 
-**Clone and build:**
+Three threads, and the split between them is the whole design.
 
-```bash
-git clone <REPO_URL> kurono
-cd kurono
-make
-```
+**The UI thread** owns the terminal and nothing else. It waits in `epoll` on four things at once: your keystrokes, window resizes and signals via `signalfd`, a repaint timer via `timerfd`, and a pipe the audio engine writes to. It never blocks on audio, so the interface stays responsive while a track is opening, a disk is spinning up, or a scan is running.
 
-**Verify:**
+**The decoder thread** runs ffmpeg: demux, decode, resample to one session format, and push the resulting float frames into a ring buffer. It works about two seconds ahead of what you're hearing.
 
-```bash
-./kurono --version
-```
+**The audio callback** is the one the sound card drives, and it is the reason the rest is shaped this way. It runs on a deadline measured in milliseconds, miss it and you hear a click. So it never allocates, never takes a lock, never makes a system call, and never waits for anything. It pops frames from the ring, applies the volume, copies a block off for the visualiser, and returns. When the decoder hasn't kept up it plays silence rather than blocking, and records the fact for later.
 
-### 1. Build targets
+The ring between them is single-producer, single-consumer and lock-free: one atomic load and one atomic store per crossing, no mutex anywhere in the audio path. Playback position comes from counting frames actually consumed by the sound card, never from asking the decoder, because the decoder is always two seconds into the future.
 
-| Target | Flags | Use |
-|---|---|---|
-| `make` | `-g` | Default. Debug symbols, no optimization. |
-| `make release` | `-O2 -DNDEBUG` | Optimized, assertions stripped. What `install` uses. |
-| `make debug` | `-Og -fno-omit-frame-pointer` | Readable stack traces under a debugger. |
-| `make asan` | `-fsanitize=address,undefined` | Memory error detection. |
-| `make tsan` | `-fsanitize=thread` | Data race detection. The important one here. |
-| `make clean` | | Remove objects, dependency files and binaries. |
-| `make install` | | Build `release` and install to `$PREFIX/bin` (default `~/.local/bin`). |
-| `make check` | | The three grep-based invariants: `check-layering`, `check-flush`, `check-theme`. |
-| `make analyze` | | `-fanalyzer` over every source. Produces no binary. |
-| `make ring-stress` | `-fsanitize=thread` | Build `tools/ring_stress`, the SPSC producer/consumer harness. |
-| `make queue-test` | | Build `tools/queue_test`. |
-| `make keymap-test` | | Build `tools/keymap_test`. |
-| `make fts-query-test` | | Build `tools/fts_query_test`. Links `sqlite3` for the real FTS5 parser. |
+**The library** is a SQLite database in your cache directory, built by walking the music tree with `taglib`. It's a derived cache and nothing else, it is never written inside your music directory, and if it is ever corrupted or points at a different music root, `kurono` deletes it and rebuilds. Your files are treated as read-only, with the playlist directory as the sole exception.
 
-*Note: object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.*
+---
 
-### 2. Command-line flags
+## Requirements
 
-`kurono` with no arguments is the player. Everything else is diagnostic.
+* Linux, `gcc`, GNU `make`, `pkg-config`
+* ffmpeg 5.1 or newer, SQLite 3, TagLib
 
-| Flag | Does |
+| Library | Purpose |
 |---|---|
-| `--version` | Print the version and exit. |
-| `--paths` | Print the resolved music roots, database path and playlist directory, then exit. What to run first when the wrong tree is being indexed. |
-| `--scan` | Scan and index the music tree, then exit. No TUI, no device. |
-| `--play FILE` | Play one file headless — a real sink and decoder wired through the engine, no terminal UI. |
-| `--play FILE --seek MS` | The same, seeking once to `MS` as soon as the track is open. |
-| `--play FILE --seek-stress N` | `N` randomised seeks in a row. This is the flush-handshake driver, and it is what to run under `make tsan`. |
-| `--play FILE --seek-paused MS` | Seek while paused, which is the case where the ring and the device disagree about what has been consumed. |
+| ffmpeg ≥ 5.1 (`libavformat`, `libavcodec`, `libavutil`, `libswresample`) | Demux, decode, resample |
+| `sqlite3` | Library index and FTS5 search |
+| `taglib_c` | Tag reading during the scan |
 
-*Five further flags — `--tone`, `--decode`, `--dev-latency`, `--search`, `--dirs` — existed during development and were deleted once the phases that needed them were done. An entry point into the middle of a program with nothing exercising it does not stay correct.*
+Two more are vendored into `vendor/` as single headers, so there's nothing to install for them:
 
-*Note: `CFLAGS` includes `-D_POSIX_C_SOURCE=200809L`. This is not optional — under strict `-std=c11` the POSIX `strdup` is undeclared, and gcc then assumes it returns `int`, truncating the pointer on 64-bit builds.*
+| File | Pinned at | Purpose |
+|---|---|---|
+| `vendor/miniaudio.h` | [`0.11.25`](https://github.com/mackron/miniaudio/blob/0.11.25/miniaudio.h) | Device output (PipeWire / PulseAudio / ALSA / JACK) |
+| `vendor/termbox2.h` | [`v2.5.0`](https://github.com/termbox/termbox2/blob/v2.5.0/termbox2.h) | Terminal rendering |
 
-*Note: every target must pass `-DTB_OPT_ATTR_W=32` when compiling the translation unit that includes `vendor/termbox2.h`. `termbox2` defaults `TB_OPT_ATTR_W` to 16, which silently drops `TB_OUTPUT_TRUECOLOR` support. `ui/tui.c` carries `_Static_assert(TB_OPT_ATTR_W == 32, ...)` so a dropped flag is a build failure, not a degraded runtime.*
+Vendored headers are never edited, upgrades are wholesale replacements at a new pin.
 
 ---
 
-## III. Install
+## Install
 
-Installs to `~/.local/bin` by default, which needs no `sudo`.
-
-**Install:**
+**Fedora:**
 
 ```bash
+sudo dnf install gcc make pkgconf-pkg-config \
+                 libavformat-free-devel libavcodec-free-devel \
+                 libavutil-free-devel libswresample-free-devel \
+                 sqlite-devel taglib-devel
+```
+
+**Debian / Ubuntu:**
+
+```bash
+sudo apt install build-essential pkg-config \
+                 libavformat-dev libavcodec-dev libavutil-dev \
+                 libswresample-dev libsqlite3-dev libtag1-dev
+```
+
+**Arch:**
+
+```bash
+sudo pacman -S base-devel ffmpeg sqlite taglib
+```
+
+**Then build and install:**
+
+```bash
+git clone git@gitlab.com:tri282/kurono.git
+cd kurono
 make install
 ```
 
-**Verify — from a directory that is not the repo:**
+That installs to `~/.local/bin`, so it needs no `sudo`. Check it worked:
 
 ```bash
 cd ~ && kurono --version
 ```
 
-If the shell reports `kurono: command not found`, `~/.local/bin` is not on your `PATH`. **Add it:**
+If your shell says `kurono: command not found`, `~/.local/bin` isn't on your `PATH`:
 
 ```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
-**Uninstall:**
+To build without installing, just `make`, and run `./kurono` from the repo. To remove it, `make uninstall`.
+
+**If the build can't find a library**, check what `pkg-config` sees, it is the single source of truth here, and the `Makefile` never hardcodes library or include paths:
 
 ```bash
-make uninstall
+pkg-config --modversion libavformat libavcodec libavutil libswresample sqlite3 taglib_c
 ```
+
+Six version strings and no errors means you're set. Anything missing prints `No package 'X' found` and names exactly what's absent.
+
+> **ffmpeg 5.1 is a hard floor.** `AVChannelLayout` arrived in 5.1, and there's no compatibility shim. Fedora 38+, Debian 13, Ubuntu 24.04+ and current Arch are all fine. Ubuntu 22.04 ships ffmpeg 4.4 and will not build.
+
+> **On Fedora, install the four `lib*-free-devel` packages listed above, not `ffmpeg-free-devel`**, that one is a metapackage pulling in three more devel packages `kurono` doesn't use. And if you have RPM Fusion enabled, don't install its `ffmpeg-devel`: it also provides `pkgconfig(libavformat)`, it mismatches the `ffmpeg-free` runtime libraries already on a stock Fedora system, and whichever registered last is the one `pkg-config` will hand you. Verify with `pkg-config --modversion libavformat` and check it reports a `-free` build.
 
 ---
 
-## IV. Configuration
+## Configuration
 
-v1 is configured entirely through environment variables. There is no config file yet.
+Everything is environment variables today. A config file is coming in v2; `KURONO_CONFIG` is already reserved for it.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -174,55 +136,43 @@ v1 is configured entirely through environment variables. There is no config file
 | `KURONO_PLAYLIST_DIR` | first music root + `/playlists` | Where playlists are read from and written to |
 | `KURONO_NO_SCAN` | unset | If set, skip the startup scan entirely |
 | `KURONO_TRACE` | unset | If set to `1`, write an audio-path trace log to `$XDG_STATE_HOME/kurono/trace.log` |
-| `KURONO_CONFIG` | `$XDG_CONFIG_HOME/kurono/config.toml` | Reserved. Unused in v1. |
+| `KURONO_CONFIG` | `$XDG_CONFIG_HOME/kurono/config.toml` | Reserved. Unused today. |
 
-**Diagnosing an audio dropout.** Every run prints one line on exit — underruns, dropped trace records, and how close the decode buffer came to empty:
-
-```txt
-kurono: 0 underruns, 0 trace records dropped, pcm_ring low-water 1.87 s
-```
-
-If that line shows underruns, `KURONO_TRACE=1` writes the full per-event log to `$XDG_STATE_HOME/kurono/trace.log` (falling back to `~/.local/state`). The audio thread cannot format text, so it records fixed-size records that the UI thread renders — which is why tracing costs nothing when you are not reading it.
-
-**Point it at your library:**
+**Point it at your music:**
 
 ```bash
 export KURONO_MUSIC_DIR="$HOME/Music"
 ```
 
-**More than one location** — separate them with `:`, as in `PATH`:
+**More than one location**, separate them with `:`, as in `PATH`:
 
 ```bash
 export KURONO_MUSIC_DIR="$HOME/Music:/mnt/archive/flac"
 ```
 
-Roots are scanned in order, and that is the order they appear in the Directory view. A root that does not exist is reported rather than silently skipped, so an unmounted disk is visible instead of looking like an empty library. A directory name containing `:` cannot be used — the same limitation `PATH` has.
+Roots are scanned in order, and that's the order they appear in the Directory view. A root that doesn't exist is reported rather than quietly skipped, so an unmounted disk looks like an unmounted disk instead of an empty library. A directory whose name contains `:` can't be used, the same limitation `PATH` has.
 
-Symlinking a second location into your music directory does **not** work: the scanner skips symlinked directories entirely, deliberately, to avoid escaping the tree. Use multiple roots instead.
+Symlinking a second location into your music directory does **not** work: the scanner skips symlinked directories deliberately, so it can't escape the tree it was pointed at. Use multiple roots instead.
 
 **Skip directories by name:**
 
-```bash
+```bashv
 export KURONO_IGNORE_DIRS=".stversions,.Trash-1000"
 ```
 
-Matched against the directory's own name anywhere in the tree, exactly and case-sensitively — not against the full path.
+These are matched against a directory's own name, anywhere in the tree, exactly and case-sensitively. Not paths, not patterns, `.Trash-1000` matches, `.Trash-*` and `/mnt/music/.Trash-1000` match nothing. An ignored directory is never descended into, so its whole subtree is skipped rather than scanned and filtered.
 
-The index is written to `$XDG_CACHE_HOME/kurono/library.db`, falling back to `~/.cache/kurono/library.db`. It is never written inside the music tree — the music directory is treated as read-only, with the playlist directory as the sole exception.
+The index lives at `$XDG_CACHE_HOME/kurono/library.db`, falling back to `~/.cache/kurono/library.db`. Deleting it is always safe, the next launch rebuilds it.
 
-**Verify the cache location is writable:**
-
-```bash
-mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/kurono" && echo ok
-```
+**Something wrong?** `kurono --paths` prints the music roots, database path and playlist directory it actually resolved, then exits. That's the first thing to run when the wrong tree is being indexed.
 
 ---
 
-## V. Usage
+## Usage
 
-On first launch, `kurono` scans the music tree and builds the index, printing progress to `stderr` before the interface starts. Subsequent launches compare `mtime` and size per file and skip unchanged tracks, making rescans effectively instant.
+Run `kurono`. On first launch it scans your music tree and builds the index, printing progress before the interface starts. Every launch after that skips everything unchanged, which usually makes it instant.
 
-### 1. Layout
+### Layout
 
 ```txt
 +--------------------------------------------------------------+
@@ -236,15 +186,15 @@ On first launch, `kurono` scans the music tree and builds the index, printing pr
 +--------------------------------------------------------------+
 ```
 
-The leftmost field of the status bar is the current input mode, `vim`-style. It reads `-- NORMAL --` while browsing and changes to `-- SEARCH --`, `-- HELP --` or `-- MENU --` while one of those is open.
+The leftmost field of the status bar is the current input mode, `vim`-style. It reads `-- NORMAL --` while browsing, and changes to `-- SEARCH --`, `-- HELP --` or `-- MENU --` while one of those is open.
 
-Directory, Artists, and Album Artists are the same browser widget fed by different queries, not separate screens.
+Directory, Artists and Album Artists are the same browser fed by different queries, not separate screens, which is why they behave identically.
 
-*Note: a crash (`SIGSEGV`, `SIGABRT`, a failed assertion) can leave the terminal in raw mode with the alternate screen active — this is a known, accepted tradeoff (see `DESIGN.md` §IV.9.c), not a bug to report. Run `reset` to restore the terminal.*
+![The queue pane open over the browser, editable while playback continues.](./assets/queue.png)
 
-### 2. Default keybindings
+### Keybindings
 
-Arrow keys navigate; letters act. Every binding resolves through a table to an action, so a config file can remap all of them later without touching the input path.
+Arrows navigate, letters act. Every key resolves through a table to a named action, which is what will make them remappable from a config file without touching the input path.
 
 | Key | Action |
 |---|---|
@@ -268,29 +218,43 @@ Arrow keys navigate; letters act. Every binding resolves through a table to an a
 | `M` | Mute / unmute |
 | `/` | Search |
 | `s` | Toggle shuffle |
-| `r` | Cycle repeat — off, all, one |
+| `r` | Cycle repeat, off, all, one |
 | `tab` | Cycle view |
 | `1` / `2` / `3` | Directories / Artists / Album Artists |
 | `ctrl+r` | Rescan the library |
 | `R` | Retry the audio device after a loss |
-| `h` | Help — the key list, generated from the bindings themselves |
+| `h` | Help, the key list, generated from the bindings themselves |
 | `m` | Settings menu |
 | `esc` | Close the open overlay or cancel a search |
 | `q` / `ctrl+c` | Close the open overlay, or quit when none is open |
 
-*The queue pane is a mode of its own. While it is open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport — play/pause, seek, volume, mute, next/previous, shuffle, repeat — works there too, as does rescan (`ctrl-r`). View switching (`tab`, `1`/`2`/`3`) does not; close the pane with `esc` or `v` first.*
+*The queue pane is a mode of its own. While it's open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport, play/pause, seek, volume, mute, next/previous, shuffle, repeat, there too, as does rescan (`ctrl-r`). View switching (`tab`, `1`/`2`/`3`) doesn't; close the pane with `esc` or `v` first.*
 
-`h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help; a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
+`h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help, a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
 
-*Note: the `shift+arrow` bindings depend on the terminal emulator sending `CSI 1;2X` for a modified arrow. xterm, foot, kitty, ghostty and alacritty do, and `tmux` passes it through. `,` `.` `H` `L` are bound to the same seeks as an emulator-independent fallback.*
+![The help overlay, generated from the binding tables rather than hand-written.](./assets/help.png)
+
+### If audio drops out
+
+Every run prints one line on exit, underruns, dropped trace records, and how close the decode buffer came to empty:
+
+```txt
+kurono: 0 underruns, 0 trace records dropped, pcm_ring low-water 1.87 s
+```
+
+If that shows underruns, `KURONO_TRACE=1` writes a full per-event log to `$XDG_STATE_HOME/kurono/trace.log` (falling back to `~/.local/state`). The audio thread can't format text, so it records fixed-size events that the UI thread renders later, which is why tracing costs nothing when you aren't reading it.
 
 ---
 
-## VI. Terminal support
+## Terminal support
 
-Cover art rendering (post-v1) is chosen by runtime terminal query, not by `$TERM`.
+Any terminal with truecolor works, `kurono` requests `TB_OUTPUT_TRUECOLOR`. The interface needs at least **60x15**; below that it draws `terminal too small` and nothing else, and picks the layout back up as soon as you resize. Three columns are comfortable from about 100 wide.
 
-| Terminal | Kitty graphics | Sixel | Renderer used |
+The `shift+arrow` seek bindings depend on your emulator sending `CSI 1;2X` for a modified arrow. xterm, foot, kitty, ghostty and alacritty all do, and `tmux` passes it through. If yours doesn't, `,` `.` `H` `L` are bound to the same seeks as an emulator-independent fallback.
+
+Cover art is a v2 feature, and it'll pick a renderer by querying the terminal at runtime rather than trusting `$TERM`:
+
+| Terminal | Kitty graphics | Sixel | Renderer |
 |---|---|---|---|
 | kitty | yes | no | kitty protocol |
 | ghostty | yes | yes | kitty protocol |
@@ -298,13 +262,64 @@ Cover art rendering (post-v1) is chosen by runtime terminal query, not by `$TERM
 | foot | no | yes | sixel |
 | alacritty | no | no | halfblock |
 
-Halfblock is always available and is the fallback whenever detection is inconclusive.
+Halfblock always works and is the fallback whenever detection is inconclusive. Both graphics protocols need passthrough sequences under `tmux` and behave inconsistently there, so `kurono` drops to halfblock when it detects `tmux`.
 
-*Warning: both graphics protocols need passthrough sequences under `tmux` and behave inconsistently there. When `tmux` is detected, `kurono` drops to halfblock.*
+*If a crash ever leaves your terminal in raw mode with the alternate screen active, run `reset`.*
 
 ---
 
-## VII. Project layout
+## Building
+
+```bash
+make            # default build, debug symbols, no optimization
+make release    # -O2 -DNDEBUG, what `make install` uses
+make clean
+```
+
+### Build targets
+
+| Target | Flags | Use |
+|---|---|---|
+| `make` | `-g` | Default. Debug symbols, no optimization. |
+| `make release` | `-O2 -DNDEBUG` | Optimized, assertions stripped. What `install` uses. |
+| `make debug` | `-Og -fno-omit-frame-pointer` | Readable stack traces under a debugger. |
+| `make asan` | `-fsanitize=address,undefined` | Memory error detection. |
+| `make tsan` | `-fsanitize=thread` | Data race detection. The important one here. |
+| `make clean` | | Remove objects, dependency files and binaries. |
+| `make install` | | Build `release` and install to `$PREFIX/bin` (default `~/.local/bin`). |
+| `make check` | | The three grep-based invariants: `check-layering`, `check-flush`, `check-theme`. |
+| `make analyze` | | `-fanalyzer` over every source. Produces no binary. |
+| `make ring-stress` | `-fsanitize=thread` | Build `tools/ring_stress`, the SPSC producer/consumer harness. |
+| `make queue-test` | | Build `tools/queue_test`. |
+| `make keymap-test` | | Build `tools/keymap_test`. |
+| `make testsrc-test` | | Build `tools/testsrc_test`. |
+| `make fts-query-test` | | Build `tools/fts_query_test`. Links `sqlite3` for the real FTS5 parser. |
+
+Object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.
+
+`asan` and `tsan` are mutually exclusive builds, they use separate object trees, so switching between them needs no `clean`.
+
+### Command-line flags
+
+`kurono` with no arguments is the player. Everything else is diagnostic.
+
+| Flag | Does |
+|---|---|
+| `--version` | Print the version and exit. |
+| `--paths` | Print the resolved music roots, database path and playlist directory, then exit. |
+| `--scan` | Scan and index the music tree, then exit. No TUI, no device. |
+| `--play FILE` | Play one file headless, a real sink and decoder through the engine, no terminal UI. |
+| `--play FILE --seek MS` | The same, seeking once to `MS` as soon as the track is open. |
+| `--play FILE --seek-stress N` | `N` randomised seeks in a row. The flush-handshake driver, and what to run under `make tsan`. |
+| `--play FILE --seek-paused MS` | Seek while paused, the case where the ring and the device disagree about what has been consumed. |
+
+### Notes for contributors
+
+`CFLAGS` includes `-D_POSIX_C_SOURCE=200809L`, which is not optional: under strict `-std=c11` the POSIX `strdup` is undeclared, gcc then assumes it returns `int`, and the pointer is truncated on 64-bit builds.
+
+Every target must pass `-DTB_OPT_ATTR_W=32` when compiling the translation unit that includes `vendor/termbox2.h`. `termbox2` defaults it to 16, which silently drops truecolor. `ui/tui.c` carries a `_Static_assert` on it so a dropped flag is a build failure rather than a degraded runtime.
+
+### Project layout
 
 ```txt
 kurono/
@@ -322,26 +337,30 @@ kurono/
 └── Makefile
 ```
 
-`tools/` holds what `DESIGN.md` §XII.2 calls the testable tier: `ring_stress`
-(SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test` and
-`fts_query_test`. Each links against exactly the one source file it tests, and
-each is pure enough to run with no device, no terminal and no music.
+`tools/` holds the parts pure enough to test without a device, a terminal or any music: `ring_stress` (the SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test` and `fts_query_test`. Each links against exactly the one source file it exercises.
 
-*`DESIGN.md`, `CLAUDE.md`, `plans/`, `notes/` and `commits/` are local working
-documents and are gitignored — a clone will not have them. `DESIGN.md` in
-particular is where the thread model, the audio-callback contract and the seek
-handshake are written down, and none of the three is evident from the headers
-alone.*
+Third-party use is confined on purpose, all ffmpeg lives in `audio/decoder.c`, all miniaudio in `audio/sink.c`, all SQLite in `library/db.c`, all termbox2 in `ui/tui.c`. `ui/` may call `library/` and `audio/`; neither ever calls back into `ui/`, they emit events instead. `make check` enforces this with grep, so a violation fails the build rather than being noticed in review.
 
 ---
 
-## VIII. Scope
+## License
 
-Deliberately absent, and not planned:
+Copyright (C) 2026 Tri Minh Do.
 
-* **No MPD protocol, no daemon, no client/server split.** Single process.
-* **No mouse support.**
-* **No network features** — no streaming, no scrobbling, no online metadata lookup.
-* **No tag editing.** The music tree is read-only apart from the playlist directory.
-* **No transcoding.**
-* **Linux only.** `epoll`, `inotify`, `signalfd`, and `timerfd` are used directly, with no portable fallback.
+`kurono` is free software under the **GNU General Public License, version 3 or
+later**. See [`LICENSE`](LICENSE) for the full text.
+
+You may run, study, modify and share it freely. If you distribute a modified
+version, you must publish your source under the same terms, using it
+privately, however you like, carries no obligation.
+
+Third-party components and their own terms are listed in
+[`THIRD-PARTY.md`](THIRD-PARTY.md). One is worth knowing about up front:
+`kurono` requires an **LGPL** build of ffmpeg (the `libav*-free` packages on
+Fedora), not a `--enable-gpl` one.
+
+---
+
+## Status
+
+v1 is complete and what's described above works. **v2 is underway**, cover art, a spectrum visualiser, playlists, a config file, an EQ, exact lossy gapless, and moving the scan to the background.
