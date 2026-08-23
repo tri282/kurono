@@ -62,17 +62,35 @@ workflow:
     - make fts-query-test && ./tools/fts_query_test
 
     # The SPSC ring under ThreadSanitizer, both modes, time-boxed
+    # Built on both distros
     - make ring-stress
-    - ./tools/ring_stress 20
-    # --latest runs longer than the default mode deliberately. The class
-    # of bug it finds is duration- and contention-dependent: the harness
-    # defect fixed on 2026-08-22 passed --latest 20 on an idle machine
-    # every time and failed on both CI runners, which are contended
-    - ./tools/ring_stress --latest 60
+    # ...but only RUN where the TSan runtime works. Debian 13 ships
+    # libtsan2 from gcc 14, whose shadow-memory layout assumes a
+    # narrower address space than the runner host's ASLR entropy
+    # provides, so it aborts before main
+
+    # setarch -R would disable ASLR for the process and is the usual
+    # workaround. So the stress runs on Fedora only.
+    - |
+      if [ "$RUN_TSAN_STRESS" = "1" ]; then
+        ./tools/ring_stress 20
+        # --latest runs longer than the default mode deliberately. The
+        # class of bug it finds is duration- and contention-dependent:
+        # the harness defect fixed on 2026-08-22 passed --latest 20 on an
+        # idle machine every time and failed on both CI runners, which
+        # are contended. A short run proves less than it looks like it does.
+        ./tools/ring_stress --latest 60
+      else
+        echo "skipping ring_stress runs: TSan runtime unusable on this image"
+      fi
 
 build:fedora:
   extends: .build_and_test
   image: fedora:latest
+  variables:
+    # The one image whose TSan runtime works on the runner host. See the
+    # ring_stress block above.
+    RUN_TSAN_STRESS: "1"
   before_script:
     # The four lib*-free-devel packages, NOT ffmpeg-free-devel: that is a
     # metapackage pulling in three more devel packages kurono does not
