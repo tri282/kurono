@@ -6,7 +6,13 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Text too long for its column now ends in `…` instead of stopping mid-word as
+  if it were complete. Applies everywhere text is drawn into a bounded width:
+  browser columns, the queue pane, search results, the header and the help
+  overlay. Very narrow fields still cut silently, where the marker would take
+  more of the field than the text.
 
 ## [1.0.0] — 2026-08-21
 

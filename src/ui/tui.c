@@ -76,6 +76,14 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
    fits "-- SEARCH --" exactly. */
 #define MODE_FIELD_W 12
 
+/* Below this budget the ellipsis is more of the field than the content
+   is, so a narrow field truncates silently the way it always did. Four
+   columns is the narrowest field in the program that still carries a
+   word, and draw_text is genuinely called with budgets this small --
+   column 1 at TUI_MIN_W is around fourteen usable columns and the
+   overlay's key column is fourteen. */
+#define ELLIPSIS_MIN_W 4
+
 /* The help overlay's box, and the margin it needs around itself. An
    overlay that would not fit refuses to open rather than drawing a
    clipped box (amendment 04 decision 9). */
@@ -238,9 +246,57 @@ tui_compute_layout(void)
  * skipped rather than drawn -- termbox would substitute U+FFFD for it
  * anyway, and a replacement glyph in a filename is noise.
  *
+ * A string too long for its budget spends its last column on U+2026, so
+ * a truncated name reads as truncated instead of as a short one. Three
+ * ASCII dots would cost three columns of content and this program's
+ * narrowest real field is around fourteen. Below ELLIPSIS_MIN_W the
+ * marker is suppressed and the cut is silent as it always was: in four
+ * columns the ellipsis is more of the field than the content.
+ *
+ * The marker lands on the first column the walk left free rather than on
+ * the last column of the budget. Those differ exactly when the drop rule
+ * above fired -- a wide glyph refused at the edge leaves a column
+ * behind, and placing the marker at the far edge instead would open a
+ * visible gap between the content and it.
+ *
  * Takes the position, the column budget, the slot and the string (NULL
  * draws nothing); returns nothing.
  */
+/*
+ * text_width: display width of a UTF-8 string in terminal columns, by
+ * the same codepoint walk and the same wcwidth rule draw_text uses --
+ * a non-printable character occupies nothing. The two must not disagree:
+ * draw_text asks this whether the content overflows its budget, and an
+ * answer measured a different way would put an ellipsis on a string that
+ * fits, or omit one from a string that does not.
+ *
+ * Takes the string (NULL is zero); returns the column count.
+ */
+static int
+text_width(const char * str)
+{
+  int          width = 0;
+  const char * p     = str;
+
+  if (str == NULL) {
+    return 0;
+  }
+  while (*p != '\0') {
+    uint32_t uni = 0;
+    int      len = tb_utf8_char_to_unicode(&uni, p);
+    if (len <= 0) {
+      break;
+    }
+    p += len;
+
+    int cw = wcwidth((wchar_t) uni);
+    if (cw > 0) {
+      width += cw;
+    }
+  }
+  return width;
+} /* text_width */
+
 static void
 draw_text(int x, int y, int w, StyleSlot slot, const char * str)
 {
@@ -250,9 +306,19 @@ draw_text(int x, int y, int w, StyleSlot slot, const char * str)
   uintattr_t fg = style_fg(&g_theme, slot);
   uintattr_t bg = style_bg(&g_theme, slot);
 
+  /* One column is reserved for the marker before the walk starts, so the
+     drop rule below measures against the same budget the content will
+     actually get. */
+  int budget = w;
+  int mark   = 0;
+  if (w >= ELLIPSIS_MIN_W && text_width(str) > w) {
+    budget = w - 1;
+    mark   = 1;
+  }
+
   int          col = 0;
   const char * p   = str;
-  while (*p != '\0' && col < w) {
+  while (*p != '\0' && col < budget) {
     uint32_t uni = 0;
     int      len = tb_utf8_char_to_unicode(&uni, p);
     if (len <= 0) {
@@ -268,12 +334,16 @@ draw_text(int x, int y, int w, StyleSlot slot, const char * str)
     /* A wide character that would straddle the right edge is dropped,
        not half-drawn. Half of a glyph is worse than a space, and the
        cell it would spill into belongs to the separator. */
-    if (col + cw > w) {
+    if (col + cw > budget) {
       break;
     }
 
     tb_set_cell(x + col, y, uni, fg, bg);
     col += cw;
+  }
+
+  if (mark) {
+    tb_set_cell(x + col, y, 0x2026 /* HORIZONTAL ELLIPSIS */, fg, bg);
   }
 } /* draw_text */
 
