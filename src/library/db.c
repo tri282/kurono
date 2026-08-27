@@ -503,6 +503,12 @@ prepare_all_statements(Db * db)
      so it selects exactly the paths under ?1. It still uses
      idx_tracks_parent: SQLite plans this as a MULTI-INDEX OR over two
      covering-index lookups. */
+  /* Precondition, documented in db.h and checked in
+     tools/fts_query_test.c: ?1 carries no trailing slash and is not
+     bare "/". Both build a doubled separator that no stored path can
+     match, and the range returns zero rows rather than an error. Not
+     normalised here -- an allocation per query for a spelling no caller
+     produces (v1.0.1 #9). */
   PREP(query_dirs, "SELECT DISTINCT parent_dir FROM tracks "
                     "WHERE parent_dir = ?1 "
                     "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
@@ -564,6 +570,8 @@ prepare_all_statements(Db * db)
      query_tracks_in_dir the right statement for an enqueue: their
      tracks live in CD1/, CD2/ subdirectories and the non-recursive
      query returns only whatever loose files sit beside them. */
+  /* Same prefix range as query_dirs above, so the same precondition on
+     ?1: no trailing slash, not bare "/". Both are checked together. */
   PREP(query_tracks_under_dir, "SELECT * FROM tracks "
                                 "WHERE parent_dir = ?1 "
                                 "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "

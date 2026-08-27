@@ -311,6 +311,15 @@ tools/keymap_test: build/default/tools/keymap_test.o build/default/ui/keymap.o \
 # `./tools/fts_query_test --pure` skips it. The object gets its own rule
 # rather than the tools/%.o pattern above because it is the only one
 # here that includes a pkg-config-provided header.
+#
+# db.o joins the link for the same reason sqlite3 does: the prefix-range
+# precondition (v1.0.1 #9) is a property of a real prepared statement
+# against a real engine, and a comment asserting it cannot fail. db.o's
+# only symbol outside libc and sqlite3 is kurono_die, which lives in
+# main.c and would drag the whole program in -- so the test binary
+# defines its own, the first test double for a program symbol in this
+# tree. See the stub's comment in tools/fts_query_test.c for why that is
+# sound here and what it does not cover.
 # Pure, dependency-free (DESIGN.md XII.2's testable tier), and that is
 # the whole point of what it tests: audio/testsrc.c is the file that
 # lets the ring, the callback and the boundary path run with no ffmpeg,
@@ -322,7 +331,8 @@ tools/testsrc_test: build/default/tools/testsrc_test.o build/default/audio/tests
 
 fts-query-test: tools/fts_query_test
 
-tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library/query.o
+tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library/query.o \
+                     build/default/library/db.o
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(shell pkg-config --libs sqlite3)
 
 build/default/tools/fts_query_test.o: tools/fts_query_test.c

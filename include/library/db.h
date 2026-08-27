@@ -233,7 +233,18 @@ int db_tracks_sweep(Db * db, int64_t gen);
  * path segmentation). The matching is a prefix range rather than a
  * GLOB pattern, so '[', '*' and '?' in a directory name are ordinary
  * characters -- see the comment on the prepared statement in db.c for
- * what the pattern form got wrong. Always returns 0: a
+ * what the pattern form got wrong.
+ *
+ * PRECONDITION: `parent` carries no trailing slash and is not bare "/".
+ * Both spellings return zero rows rather than an error, because the
+ * range builds "//" against paths that cannot contain it. Nothing in
+ * the tree produces either -- the browser rebuilds paths as
+ * parent + "/" + name, and column 1 at multi-root level lists the roots
+ * instead of querying "/" -- so this is documented and checked
+ * (tools/fts_query_test.c, test_prefix_range_precondition) rather than
+ * normalised here, which would cost an allocation per query for a
+ * spelling no caller produces. db_query_tracks_under_dir below carries
+ * the identical range and the identical precondition. Always returns 0: a
  * database error degrades to zero results rather than being reported,
  * the same never-fatal-query policy db_query_search documents below,
  * applied uniformly to every query in this file rather than only to
@@ -293,6 +304,13 @@ int db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, si
  * CD1/, CD2/ subdirectories, so the non-recursive query returns only
  * the loose files beside them. Same degrade policy and same
  * db_track_rows_free as every other row query here.
+ *
+ * PRECONDITION: as db_query_dirs above -- `dir` carries no trailing
+ * slash and is not bare "/". The range is byte-identical, so the gap
+ * is too, and both are checked together in
+ * tools/fts_query_test.c (test_prefix_range_precondition). A fix
+ * applied to one statement and not the other is the failure that pair
+ * of checks exists to catch.
  */
 int db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t * out_n);
 

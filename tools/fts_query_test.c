@@ -19,11 +19,45 @@
 
 #include "../include/library/query.h"
 
+#include "../include/library/db.h"
+
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <sqlite3.h>
+
+/*
+ * kurono_die: test double for main.c's fatal path. Takes a printf
+ * format and its arguments, never returns.
+ *
+ * db.o is linked here for test_prefix_range_precondition below, and
+ * kurono_die is its only undefined symbol outside libc and sqlite3.
+ * The real one lives in main.c, which would pull the entire program --
+ * termbox2, the engine, ffmpeg -- into a test binary that needs none of
+ * it. This is the first test double for a program symbol in this tree.
+ *
+ * What it does not cover: the real kurono_die restores the terminal
+ * before printing, and nothing here claims a terminal, so the two
+ * differ exactly where that difference cannot matter. No check below
+ * reaches a db_open failure path -- an in-memory database is never
+ * corrupt, never a newer schema version, and never a root mismatch --
+ * so reaching this function at all means a check is wrong, and the
+ * non-zero exit says so.
+ */
+_Noreturn void
+kurono_die(const char * fmt, ...)
+{
+  va_list ap;
+
+  va_start(ap, fmt);
+  fprintf(stderr, "kurono_die (test stub): ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+  exit(1);
+} /* kurono_die */
 
 static int g_failures = 0;
 
@@ -500,9 +534,121 @@ static void test_name_cmp(void)
 } /* test_name_cmp */
 
 /*
+ * test_prefix_range_precondition: the documented precondition on the
+ * two prefix-range statements (v1.0.1 #9). Takes nothing, returns
+ * nothing.
+ *
+ * db_query_dirs and db_query_tracks_under_dir both select with
+ * `parent_dir = ?1 OR (parent_dir > ?1 || '/' AND parent_dir < ?1 ||
+ * '0')`. That range is correct for a parent written without a trailing
+ * slash and is silently empty for two spellings nothing in the tree
+ * produces: a trailing slash ("/m/"), because the comparison then
+ * builds "/m//" and no stored path has the doubled separator; and bare
+ * "/", because it builds "//" and "/0" and every absolute path sorts
+ * below the first.
+ *
+ * Zero rows, not an error -- which is why this is a check and not a
+ * comment. The never-fatal-query policy (DESIGN.md XI.7) means a
+ * caller cannot tell the empty answer from the wrong question, so the
+ * only thing that can hold the line is an assertion that the two
+ * spellings really do behave as documented. If someone "fixes" the
+ * statement to accept them, these rows flip and say so.
+ *
+ * This asserts the precondition, it does not endorse it: the fix ruled
+ * for v1.0.1 is documentation plus this check, not normalisation
+ * inside db.c, which would cost an allocation per query for a spelling
+ * no caller produces (SCOPE.md #9).
+ */
+static void test_prefix_range_precondition(void)
+{
+  const char * roots[] = { "/m" };
+  Db *         db = NULL;
+  char **      names = NULL;
+  size_t       n = 0;
+  DbTrackRow * rows = NULL;
+  size_t       nrows = 0;
+  DbTrackWrite t;
+
+  db = db_open(":memory:", roots, 1, NULL);
+  if (db == NULL) {
+    CHECK(0, "db_open(:memory:) returned NULL, which its contract forbids");
+    return;
+  }
+
+  /* Two rows, one directly under the root and one nested, so a correct
+     query returns both parent_dir values and a broken one cannot pass
+     by returning the single row it happened to match. */
+  memset(&t, 0, sizeof(t));
+  t.path       = "/m/a.flac";
+  t.parent_dir = "/m";
+  t.scan_gen   = 1;
+  CHECK(db_track_upsert(db, &t) == 0, "upsert /m/a.flac failed");
+
+  memset(&t, 0, sizeof(t));
+  t.path       = "/m/sub/b.flac";
+  t.parent_dir = "/m/sub";
+  t.scan_gen   = 1;
+  CHECK(db_track_upsert(db, &t) == 0, "upsert /m/sub/b.flac failed");
+
+  /* The spelling every caller produces: rows come back. */
+  CHECK(db_query_dirs(db, "/m", &names, &n) == 0, "db_query_dirs(\"/m\") returned non-zero");
+  CHECK(n == 2, "db_query_dirs(\"/m\"): expected 2 parent_dir values, got %zu", n);
+  db_names_free(names, n);
+  names = NULL;
+  n     = 0;
+
+  /* Trailing slash: silently empty. */
+  CHECK(db_query_dirs(db, "/m/", &names, &n) == 0, "db_query_dirs(\"/m/\") returned non-zero");
+  CHECK(n == 0,
+        "db_query_dirs(\"/m/\"): precondition says zero rows, got %zu -- if the "
+        "statement was changed to accept a trailing slash, update db.h and "
+        "delete this check rather than loosening it",
+        n);
+  db_names_free(names, n);
+  names = NULL;
+  n     = 0;
+
+  /* Bare root: silently empty. */
+  CHECK(db_query_dirs(db, "/", &names, &n) == 0, "db_query_dirs(\"/\") returned non-zero");
+  CHECK(n == 0, "db_query_dirs(\"/\"): precondition says zero rows, got %zu", n);
+  db_names_free(names, n);
+  names = NULL;
+  n     = 0;
+
+  /* The sibling statement carries the byte-identical range shape, and
+     so the identical precondition. Checked here because a fix applied
+     to one and not the other is the failure this pair exists to catch. */
+  CHECK(db_query_tracks_under_dir(db, "/m", &rows, &nrows) == 0,
+        "db_query_tracks_under_dir(\"/m\") returned non-zero");
+  CHECK(nrows == 2, "db_query_tracks_under_dir(\"/m\"): expected 2 tracks, got %zu", nrows);
+  db_track_rows_free(rows, nrows);
+  rows  = NULL;
+  nrows = 0;
+
+  CHECK(db_query_tracks_under_dir(db, "/m/", &rows, &nrows) == 0,
+        "db_query_tracks_under_dir(\"/m/\") returned non-zero");
+  CHECK(nrows == 0,
+        "db_query_tracks_under_dir(\"/m/\"): precondition says zero rows, got %zu",
+        nrows);
+  db_track_rows_free(rows, nrows);
+  rows  = NULL;
+  nrows = 0;
+
+  CHECK(db_query_tracks_under_dir(db, "/", &rows, &nrows) == 0,
+        "db_query_tracks_under_dir(\"/\") returned non-zero");
+  CHECK(nrows == 0,
+        "db_query_tracks_under_dir(\"/\"): precondition says zero rows, got %zu",
+        nrows);
+  db_track_rows_free(rows, nrows);
+
+  db_close(db);
+} /* test_prefix_range_precondition */
+
+/*
  * main: runs the pure tests always and the FTS5 mode unless --pure is
- * given. Takes the usual argc/argv; returns 0 if every check passed, 1
- * otherwise.
+ * given -- the FTS5 mode now also covers the prefix-range precondition,
+ * which likewise needs a real engine. Takes the usual argc/argv;
+ * returns 0 if every check passed, 1 otherwise.
  */
 int main(int argc, char ** argv)
 {
@@ -518,6 +664,7 @@ int main(int argc, char ** argv)
 
   if (!pure_only) {
     test_against_fts5();
+    test_prefix_range_precondition();
   }
 
   if (g_failures != 0) {
