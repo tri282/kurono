@@ -13,6 +13,14 @@ Notable changes to `kurono`. Format based on
   browser columns, the queue pane, search results, the header and the help
   overlay. Very narrow fields still cut silently, where the marker would take
   more of the field than the text.
+- The header now keeps the view indicator visible while a track is playing;
+  the title takes the remaining width.
+- The search prompt no longer draws over the last row of a full column; it
+  shares the status bar with the mode indicator while searching. A status
+  message moves there too, for the same reason.
+- A status message now clears itself after three seconds, so the clock, volume
+  and shuffle/repeat indicators come back on their own. Sharing the status bar
+  with them made a message that never expired a readout that never returned.
 
 ## [1.0.0] — 2026-08-21
 
@@ -92,8 +100,6 @@ through those.
   unread.
 - With the queue pane open, view switching (`tab`, `1`/`2`/`3`) and search
   (`/`) are unbound. Close the pane with `esc` or `v` first.
-- The search prompt can overlap column 1 when that column is full.
-- Now-playing in the header can overwrite the view indicator.
 
 [Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...main
 [1.0.0]: https://gitlab.com/tri282/kurono/-/tags/v1.0.0

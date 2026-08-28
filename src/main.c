@@ -158,6 +158,10 @@ resolve_trace_log_path(void)
    main.c ignorant of that internal. */
 #define PLAYER_MAX_FIRED 8
 
+/* How long a status-bar message holds the right-hand field before the
+   clock, volume and shuffle/repeat summary comes back. */
+#define PLAYER_MESSAGE_MS 3000
+
 /* How often the ACT_RESCAN progress line repaints, in files. The scan
    blocks T1, so this is the only repaint happening for its duration --
    every file would mean one tb_present per file. */
@@ -535,6 +539,12 @@ typedef struct {
      notification name, a ladder attempt number), and phase 11 has no
      allocation story for transient UI strings yet. */
   char message[128];
+
+  /* When p->message was last written, CLOCK_MONOTONIC. The status bar's
+     right-hand field has one occupant at a time (v1.0.1 #13 moved the
+     message off the column row into it), so a message that never
+     expires is a clock and volume readout that never comes back. */
+  struct timespec msg_at;
   int  ui;                   /* 1 when this run drives the TUI (phase 11) */
 
   /* The library index. Opened at startup step 3 and closed at teardown
@@ -622,6 +632,7 @@ player_report(Player * p, const char * fmt, ...)
   va_start(ap, fmt);
   if (p->ui) {
     vsnprintf(p->message, sizeof p->message, fmt, ap);
+    clock_gettime(CLOCK_MONOTONIC, &p->msg_at);
     tui_mark_dirty();
   } else {
     vfprintf(stderr, fmt, ap);
@@ -629,6 +640,35 @@ player_report(Player * p, const char * fmt, ...)
   }
   va_end(ap);
 } /* player_report */
+
+/*
+ * player_message: the status-bar message if it is still current, NULL
+ * once it has aged out. Takes the Player, returns a borrowed pointer
+ * into p->message or NULL, and clears the buffer on expiry.
+ *
+ * The field it draws into is shared with the clock, the volume and the
+ * shuffle/repeat indicators, so the message is a transient: it says its
+ * piece and gives the field back. Expiry is evaluated at repaint rather
+ * than on a timer -- while playing the redraw timer already ticks at
+ * PLAYER_REDRAW_HZ and the field returns on time; idle, the last
+ * message outlives its window until the next keystroke repaints, which
+ * is the keystroke that made the user look at the bar anyway.
+ */
+static const char *
+player_message(Player * p)
+{
+  if (p->message[0] == '\0') {
+    return NULL;
+  }
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (elapsed_ms(&p->msg_at, &now) >= (double) PLAYER_MESSAGE_MS) {
+    p->message[0] = '\0';
+    return NULL;
+  }
+  return p->message;
+} /* player_message */
 
 /*
  * action_dispatch: the single entry point from ui/ into every other
@@ -2938,7 +2978,7 @@ scan_progress_statusbar(void * ctx, int done, int total, const char * path)
     return;
   }
 
-  snprintf(u->p->message, sizeof u->p->message, "scanning %d/%d", done, total);
+  player_report(u->p, "scanning %d/%d", done, total);
 
   TuiModel m;
   player_fill_model(u->p, &m);
@@ -3314,7 +3354,7 @@ player_fill_model(Player * p, TuiModel * out)
   TuiModel m;
   memset(&m, 0, sizeof m);
   m.now_playing = (p->now_name[0] != '\0') ? p->now_name : NULL;
-  m.message     = (p->message[0] != '\0') ? p->message : NULL;
+  m.message     = player_message(p);
   m.pos_ms      = (p->dev == DEV_READY && p->play != PLAY_STOPPED)
                       ? player_position_ms(p)
                       : -1;
@@ -3338,7 +3378,7 @@ player_fill_model(Player * p, TuiModel * out)
      one place that runs after every query. */
   if (p->br != NULL && browser_library_truncated(&p->brsrc[p->view])) {
     player_report(p, "out of memory, result truncated");
-    m.message = (p->message[0] != '\0') ? p->message : NULL;
+    m.message = player_message(p);
   }
   if (p->q != NULL) {
     m.shuffle = queue_shuffle(p->q);

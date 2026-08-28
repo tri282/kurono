@@ -76,6 +76,13 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
    fits "-- SEARCH --" exactly. */
 #define MODE_FIELD_W 12
 
+/* The view indicator's fixed field at the left of the header. Always
+   drawn, playing or idle: losing it the moment playback starts is the
+   defect this exists to fix (v1.0.1 #14), and it is worst on a narrow
+   terminal, which is where a drop-below-floor rule would drop it.
+   Fourteen columns fits "album artists" plus its separator. */
+#define VIEW_FIELD_W 14
+
 /* Below this budget the ellipsis is more of the field than the content
    is, so a narrow field truncates silently the way it always did. Four
    columns is the narrowest field in the program that still carries a
@@ -419,27 +426,33 @@ draw_header(const TuiModel * m)
      an implementation detail on row 0. The name of the row the user is
      inside says the same thing in the source's own words, and is
      already on hand from column 0. At the top level there is no such
-     row, and the view label alone is the honest answer. */
+     row, and the program name is the honest answer -- the view label is
+     not it, since it now has a field of its own below. */
   const char * what = "kurono";
   char         crumb[256];
 
   if (m->now_playing != NULL) {
     what = m->now_playing;
   } else if (m->browser != NULL) {
-    const char * view = (m->view >= 0 && m->view < BROWSER_VIEW_COUNT)
-                          ? g_view_label[m->view]
-                          : "";
     const BrowserRow * here =
       browser_parent_row(m->browser, browser_parent_cursor(m->browser));
 
     if (here != NULL) {
-      snprintf(crumb, sizeof crumb, "%s: %s", view, here->name);
-    } else {
-      snprintf(crumb, sizeof crumb, "%s", view);
+      snprintf(crumb, sizeof crumb, "%s", here->name);
+      what = crumb;
     }
-    what = crumb;
   }
-  draw_text(1, 0, g_layout.w - 2,
+
+  /* The view label gets its own fixed field so starting playback -- which
+     overwrites `what` above -- never erases it (v1.0.1 #14). Composed
+     independently of now_playing/browser state above. */
+  const char * view = (m->view >= 0 && m->view < BROWSER_VIEW_COUNT)
+                        ? g_view_label[m->view]
+                        : "";
+  draw_text(1, 0, VIEW_FIELD_W - 1, STYLE_HEADER, view);
+
+  int x = 1 + VIEW_FIELD_W;
+  draw_text(x, 0, g_layout.w - 1 - x,
             (m->now_playing != NULL) ? STYLE_PLAYING : STYLE_HEADER, what);
 } /* draw_header */
 
@@ -839,34 +852,38 @@ draw_statusbar(const TuiModel * m)
            (m->repeat == 2) ? "repeat one" : (m->repeat == 1) ? "repeat all" : "-",
            un);
 
-  int x = bar_x + PROGRESS_W + 2;
-  draw_text(x, y, g_layout.w - x, STYLE_STATUSBAR, right);
+  /* The right-hand field normally shows the clock/volume/shuffle/repeat
+     summary. Two things outrank it, and both are handled here rather
+     than on the row above the status bar: that row is body_h's last
+     row, shared with every column's last visible entry, and drawing
+     there is the overlap this fixes (v1.0.1 #13).
 
-  /* The message takes the row above the status bar rather than competing
-     with the clock for space. Errors get the error slot; anything else
-     is dim.
-
-     The search prompt takes the same row and outranks the message: while
-     the user is typing, what they have typed is the only thing on that
-     row that they are looking for. */
-  if (g_layout.body_h > 0) {
-    if (ui_mode() == MODE_SEARCH) {
-      /* The prompt takes the left half and the message the right, rather
-         than the prompt taking the row outright. Found by forcing an
-         allocation failure mid-search: the query's own truncation report
-         goes through player_report like every other one, so a prompt
-         that owns this row makes the one message that matters here the
-         one message that cannot be seen. */
-      int half = (g_layout.w - 2) / 2;
-      char prompt[SEARCH_MAX + 2];
-      snprintf(prompt, sizeof prompt, "/%s", g_search);
-      draw_text(1, y - 1, half, STYLE_NORMAL, prompt);
-      if (m->message != NULL) {
-        draw_text(1 + half, y - 1, g_layout.w - 1 - half, STYLE_DIM, m->message);
-      }
-    } else if (m->message != NULL) {
-      draw_text(1, y - 1, g_layout.w - 2, STYLE_DIM, m->message);
+     During a search, the prompt takes the left half of the field and
+     the message the right half -- found by forcing an allocation
+     failure mid-search: the query's own truncation report goes through
+     player_report like every other one, so a prompt that owns the
+     field outright makes the one message that matters here the one
+     message that cannot be seen. Outside search, a pending message
+     simply takes the whole field in place of the clock; there is
+     nothing else competing for it. */
+  int x     = bar_x + PROGRESS_W + 2;
+  int avail = g_layout.w - x;
+  if (ui_mode() == MODE_SEARCH) {
+    char prompt[SEARCH_MAX + 2];
+    snprintf(prompt, sizeof prompt, "/%s", g_search);
+    /* The split is for the message's sake, so it only happens when there
+       is one. At TUI_MIN_W the whole field is twenty columns and half of
+       it cannot hold a query worth reading -- an unconditional split
+       would spend the common case paying for the rare one. */
+    int half = (m->message != NULL) ? avail / 2 : avail;
+    draw_text(x, y, half, STYLE_NORMAL, prompt);
+    if (m->message != NULL) {
+      draw_text(x + half, y, avail - half, STYLE_DIM, m->message);
     }
+  } else if (m->message != NULL) {
+    draw_text(x, y, avail, STYLE_DIM, m->message);
+  } else {
+    draw_text(x, y, avail, STYLE_STATUSBAR, right);
   }
 } /* draw_statusbar */
 
