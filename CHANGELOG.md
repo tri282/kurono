@@ -6,6 +6,8 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-28
+
 ### Fixed
 
 - Text too long for its column now ends in `…` instead of stopping mid-word as
@@ -101,5 +103,6 @@ through those.
 - With the queue pane open, view switching (`tab`, `1`/`2`/`3`) and search
   (`/`) are unbound. Close the pane with `esc` or `v` first.
 
-[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...main
+[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.0.1...main
+[1.0.1]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...v1.0.1
 [1.0.0]: https://gitlab.com/tri282/kurono/-/tags/v1.0.0
