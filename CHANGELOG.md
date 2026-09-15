@@ -6,6 +6,13 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
+### Fixed
+
+- A track whose file changed on disk (retagged, re-muxed, or just touched)
+  now keeps its library id across a rescan instead of getting a new one. A
+  queued track could previously lose its title and duration in the queue
+  pane after a rescan, or be reported as "no library entry" when jumped to.
+
 ## [1.0.1] — 2026-08-28
 
 ### Fixed

@@ -87,8 +87,8 @@ typedef struct {
  * migrations from schema_version on an old one, and reconcile the
  * `music_dirs` meta key against `roots`/`nroots` (the config-resolved
  * music roots, in any order -- db_open sorts its own copy before
- * joining and comparing, per amendment 01). PRAGMA journal_mode=WAL,
- * synchronous=NORMAL, and foreign_keys=ON are set before anything else.
+ * joining and comparing, per amendment 01). PRAGMA journal_mode=WAL and
+ * synchronous=NORMAL are set before anything else.
  *
  * Every failure mode in DESIGN.md XI.4 is handled here and does not
  * surface as an error return:
@@ -203,11 +203,10 @@ int db_track_unchanged(Db * db, const char * path, int64_t mtime, int64_t size);
 int db_track_touch(Db * db, const char * path, int64_t gen);
 
 /*
- * db_track_upsert: INSERT OR REPLACE the row described by *t
- * (DESIGN.md V.5 step 5). A REPLACE on the `path` UNIQUE constraint
- * deletes and reinserts the row, which the tracks_ai/tracks_ad triggers
- * turn into a delete+insert in tracks_fts too -- the correct behaviour
- * for a row whose indexed columns may have changed. Returns 0 on
+ * db_track_upsert: INSERT the row described by *t, or UPDATE it in place
+ * on a `path` conflict (DESIGN.md V.5 step 5). `id` is stable across a
+ * rescan of a file whose mtime, size, or tags changed -- anything
+ * holding the id (the queue, jump-to-playing) survives it. Returns 0 on
  * success, -1 on error.
  */
 int db_track_upsert(Db * db, const DbTrackWrite * t);

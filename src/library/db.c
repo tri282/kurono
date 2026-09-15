@@ -487,10 +487,18 @@ prepare_all_statements(Db * db)
   PREP(track_unchanged, "SELECT 1 FROM tracks WHERE path = ?1 AND mtime = ?2 AND size = ?3 LIMIT 1");
   PREP(track_touch, "UPDATE tracks SET scan_gen = ?1 WHERE path = ?2");
   PREP(track_upsert,
-       "INSERT OR REPLACE INTO tracks "
+       "INSERT INTO tracks "
        "(path, parent_dir, mtime, size, title, artist, album, album_artist, genre, "
        " year, track_no, disc_no, duration_ms, bitrate, sample_rate, channels, codec, scan_gen) "
-       "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)");
+       "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) "
+       "ON CONFLICT(path) DO UPDATE SET "
+       "  parent_dir = excluded.parent_dir, mtime = excluded.mtime, size = excluded.size, "
+       "  title = excluded.title, artist = excluded.artist, album = excluded.album, "
+       "  album_artist = excluded.album_artist, genre = excluded.genre, year = excluded.year, "
+       "  track_no = excluded.track_no, disc_no = excluded.disc_no, "
+       "  duration_ms = excluded.duration_ms, bitrate = excluded.bitrate, "
+       "  sample_rate = excluded.sample_rate, channels = excluded.channels, "
+       "  codec = excluded.codec, scan_gen = excluded.scan_gen");
   PREP(tracks_sweep, "DELETE FROM tracks WHERE scan_gen < ?1");
   /* A prefix RANGE, not a pattern. The obvious form here is a GLOB
      against the parent joined with a slash and a star, and it is wrong:
@@ -610,7 +618,6 @@ db_open(const char * db_path, const char * const * roots, size_t nroots, int * o
 
     sqlite3_exec(db->conn, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(db->conn, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
-    sqlite3_exec(db->conn, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
 
     DbOpenState state = init_schema(db->conn);
 
@@ -668,6 +675,9 @@ db_close(Db * db)
   sqlite3_finalize(db->query_tracks_under_dir);
   sqlite3_finalize(db->query_track_by_id);
   sqlite3_finalize(db->query_search);
+
+  /* Refresh sqlite_stat1 for the query planner before close. */
+  sqlite3_exec(db->conn, "PRAGMA optimize;", NULL, NULL, NULL);
 
   sqlite3_close_v2(db->conn);
   free(db);

@@ -534,6 +534,88 @@ static void test_name_cmp(void)
 } /* test_name_cmp */
 
 /*
+ * test_upsert_preserves_id: assertion for S1 (design.md 4A.1). A
+ * rescanned track's `id` must survive an mtime/size-only update and a
+ * tags-changed update alike -- otherwise anything holding the id (the
+ * queue, jump-to-playing) orphans on the next rescan. Reads the id back
+ * through db_query_tracks_in_dir/db_query_track_by_id rather than a
+ * dedicated accessor. Takes nothing, returns nothing.
+ */
+static void test_upsert_preserves_id(void)
+{
+  const char * roots[] = { "/music" };
+  Db *         db = NULL;
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+  DbTrackWrite t;
+  int64_t      id = 0;
+
+  db = db_open(":memory:", roots, 1, NULL);
+  if (db == NULL) {
+    CHECK(0, "db_open(:memory:) returned NULL, which its contract forbids");
+    return;
+  }
+
+  memset(&t, 0, sizeof(t));
+  t.path       = "/music/a.flac";
+  t.parent_dir = "/music";
+  t.mtime      = 1;
+  t.size       = 100;
+  t.title      = "Original Title";
+  t.artist     = "Artist";
+  t.scan_gen   = 1;
+  CHECK(db_track_upsert(db, &t) == 0, "first upsert failed");
+
+  CHECK(db_query_tracks_in_dir(db, "/music", &rows, &n) == 0,
+        "db_query_tracks_in_dir returned non-zero");
+  CHECK(n == 1, "expected 1 track after the first upsert, got %zu", n);
+  if (n == 1) {
+    id = rows[0].id;
+  }
+  db_track_rows_free(rows, n);
+  rows = NULL;
+  n    = 0;
+
+  /* mtime/size change, tags identical -- must keep the id. */
+  t.mtime = 2;
+  t.size  = 200;
+  CHECK(db_track_upsert(db, &t) == 0, "second upsert failed");
+
+  DbTrackRow row2 = { 0 };
+  CHECK(db_query_track_by_id(db, id, &row2) == 1,
+        "id did not survive an mtime/size-only rescan");
+  CHECK(row2.mtime == 2, "mtime was not updated by the second upsert");
+  db_track_row_free_fields(&row2);
+
+  /* Title changes too -- rules out "preserves id by refusing to update". */
+  t.title = "New Title";
+  CHECK(db_track_upsert(db, &t) == 0, "third upsert failed");
+
+  DbTrackRow row3 = { 0 };
+  CHECK(db_query_track_by_id(db, id, &row3) == 1,
+        "id did not survive a tags-changed rescan");
+  CHECK(row3.title != NULL && strcmp(row3.title, "New Title") == 0,
+        "title was not updated by the third upsert");
+  db_track_row_free_fields(&row3);
+
+  /* FTS must reflect the update too, not just the row -- a trigger this
+     change stopped firing would show up as a stale search index. */
+  char *       match = query_build_match("New Title");
+  DbTrackRow * srows = NULL;
+  size_t       sn = 0;
+  CHECK(match != NULL, "query_build_match(\"New Title\") returned NULL");
+  if (match != NULL) {
+    CHECK(db_query_search(db, match, &srows, &sn) == 0, "db_query_search returned non-zero");
+    CHECK(sn == 1 && srows != NULL && srows[0].id == id,
+          "FTS index was not updated to the new title");
+    db_track_rows_free(srows, sn);
+    free(match);
+  }
+
+  db_close(db);
+} /* test_upsert_preserves_id */
+
+/*
  * test_prefix_range_precondition: the documented precondition on the
  * two prefix-range statements (v1.0.1 #9). Takes nothing, returns
  * nothing.
@@ -665,6 +747,7 @@ int main(int argc, char ** argv)
   if (!pure_only) {
     test_against_fts5();
     test_prefix_range_precondition();
+    test_upsert_preserves_id();
   }
 
   if (g_failures != 0) {
