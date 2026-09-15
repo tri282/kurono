@@ -4,7 +4,7 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] — 2026-09-15
 
 ### Changed
 
@@ -129,7 +129,14 @@ through those.
   unread.
 - With the queue pane open, view switching (`tab`, `1`/`2`/`3`) and search
   (`/`) are unbound. Close the pane with `esc` or `v` first.
+- Holding a single-step cursor key at the end of a list runs off the end and
+  continues from the other side, because nothing distinguishes a held key from
+  repeated presses. Page keys clamp and can be used to stop at an end.
+- Search returns at most 200 rows, and a query matching more than that returns
+  the first 200 in scan order rather than the 200 most relevant. Narrowing the
+  query is the fix; anything matching under 200 rows is ranked normally.
 
-[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.0.1...main
+[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...main
+[1.1.0]: https://gitlab.com/tri282/kurono/-/compare/v1.0.1...v1.1.0
 [1.0.1]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...v1.0.1
 [1.0.0]: https://gitlab.com/tri282/kurono/-/tags/v1.0.0
