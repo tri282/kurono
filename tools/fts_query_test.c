@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <sqlite3.h>
 
@@ -477,6 +479,17 @@ static int cmp_name_qsort(const void * a, const void * b)
 } /* cmp_name_qsort */
 
 /*
+ * cmp_id_qsort: qsort(3) adapter ordering two `int64_t` track ids by
+ * value. Takes two elements by address, returns the usual -1/0/1.
+ */
+static int cmp_id_qsort(const void * a, const void * b)
+{
+  int64_t x = *(const int64_t *) a;
+  int64_t y = *(const int64_t *) b;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+} /* cmp_id_qsort */
+
+/*
  * test_name_cmp: query_name_cmp is the display ordering for every list
  * of names the user reads, and two properties of it are load-bearing.
  *
@@ -726,6 +739,719 @@ static void test_prefix_range_precondition(void)
   db_close(db);
 } /* test_prefix_range_precondition */
 
+/* Assertions for #10 (design.md 4.4, decide R5-R7): the inner-LIMIT
+   subquery, the fts5 prefix index, and the schema_version 1 -> 2
+   migration. The fixture is 20k rows with varying field lengths so a
+   one-character prefix matches most rows and a two-token query still
+   produces distinct bm25 scores (R7). */
+
+#define SEARCH_FIXTURE_N 20000
+
+static const char * const g_fixture_words[] = {
+  "a", "an", "aria", "alto", "amber", "anthem", "arpeggio", "autumnal",
+  "album", "azure", "the", "song", "sound", "silence", "symphony",
+  "stanza", "blue", "black", "bright", "night", "day", "dream", "echo",
+  "elegy", "ember", "one", "two", "three", "four", "love", "hope",
+  "wind", "storm",
+};
+#define FIXTURE_NWORDS (sizeof(g_fixture_words) / sizeof(g_fixture_words[0]))
+
+/* A handful of rare two-word combinations for test_search_order_preserved
+   to search among for one matching fewer than 200 of the fixture's rows. */
+static const char * const g_selective_candidates[] = {
+  "storm hope", "wind love", "ember dream", "elegy stanza",
+  "arpeggio autumnal", "azure amber", "aria alto", "anthem symphony",
+  "silence echo", "four three",
+};
+
+/*
+ * fixture_word: a deterministic, triangularly-skewed pick from
+ * g_fixture_words for row `i`, field slot `slot` -- rank 0 ("a") is
+ * FIXTURE_NWORDS times as likely as the last rank, giving both a broad
+ * one-character prefix match and a long tail of rare terms.
+ */
+static const char *
+fixture_word(size_t i, unsigned slot)
+{
+  unsigned n = (unsigned) FIXTURE_NWORDS;
+  unsigned sum = n * (n + 1) / 2;
+  unsigned h = ((unsigned) i * 2654435761u) ^ (slot * 40503u + 7u);
+  unsigned pool = h % sum;
+  unsigned rank, acc = 0;
+
+  for (rank = 0; rank < n; rank++) {
+    acc += n - rank;
+    if (pool < acc) {
+      return g_fixture_words[rank];
+    }
+  }
+  return g_fixture_words[n - 1];
+} /* fixture_word */
+
+/*
+ * fixture_field: join `nwords` words from fixture_word(i, slot..) with
+ * spaces into `buf`. Varying `nwords` per call is what gives the
+ * fixture's fields varying lengths.
+ */
+static void
+fixture_field(char * buf, size_t bufsize, size_t i, unsigned slot, unsigned nwords)
+{
+  unsigned w;
+
+  buf[0] = '\0';
+  for (w = 0; w < nwords; w++) {
+    if (w > 0) {
+      strncat(buf, " ", bufsize - strlen(buf) - 1);
+    }
+    strncat(buf, fixture_word(i, slot + w), bufsize - strlen(buf) - 1);
+  }
+} /* fixture_field */
+
+/*
+ * build_raw_fixture: an in-memory tracks/tracks_fts pair, schema
+ * identical to the current SQL_TRACKS_FTS_DDL (prefix included), with
+ * `n` fixture rows inserted through the tracks_ai trigger. Used where a
+ * raw sqlite3 * is needed for a statement db.h has no accessor for.
+ * Returns 0 and sets *out_conn on success, -1 on error.
+ */
+static int
+build_raw_fixture(sqlite3 ** out_conn, size_t n)
+{
+  sqlite3 *      conn = NULL;
+  sqlite3_stmt * ins = NULL;
+  char *         err = NULL;
+  size_t         i;
+
+  if (sqlite3_open(":memory:", &conn) != SQLITE_OK) {
+    if (conn != NULL) {
+      sqlite3_close(conn);
+    }
+    return -1;
+  }
+
+  if (sqlite3_exec(conn,
+      "CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, "
+      "title TEXT, artist TEXT, album TEXT, album_artist TEXT);"
+      "CREATE VIRTUAL TABLE tracks_fts USING fts5("
+      "  title, artist, album, album_artist,"
+      "  content='tracks', content_rowid='id',"
+      "  tokenize='unicode61 remove_diacritics 2',"
+      "  prefix='1 2 3');"
+      "CREATE TRIGGER tracks_ai AFTER INSERT ON tracks BEGIN"
+      "  INSERT INTO tracks_fts(rowid, title, artist, album, album_artist)"
+      "    VALUES (new.id, new.title, new.artist, new.album, new.album_artist);"
+      "END;",
+      NULL, NULL, &err) != SQLITE_OK) {
+    fprintf(stderr, "build_raw_fixture: schema failed: %s\n", err != NULL ? err : "?");
+    sqlite3_free(err);
+    sqlite3_close(conn);
+    return -1;
+  }
+
+  if (sqlite3_exec(conn, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+    sqlite3_close(conn);
+    return -1;
+  }
+  if (sqlite3_prepare_v2(conn,
+      "INSERT INTO tracks(path, title, artist, album, album_artist) VALUES (?1,?2,?3,?4,?5)",
+      -1, &ins, NULL) != SQLITE_OK) {
+    sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_close(conn);
+    return -1;
+  }
+
+  for (i = 0; i < n; i++) {
+    char path[64], title[128], artist[64], album[64], album_artist[64];
+
+    snprintf(path, sizeof(path), "/music/track%05zu.flac", i);
+    fixture_field(title, sizeof(title), i, 0, 1 + (unsigned) (i % 4));
+    fixture_field(artist, sizeof(artist), i, 10, 1 + (unsigned) ((i / 4) % 3));
+    fixture_field(album, sizeof(album), i, 20, 1 + (unsigned) ((i / 7) % 3));
+    fixture_field(album_artist, sizeof(album_artist), i, 30, 1 + (unsigned) ((i / 11) % 2));
+
+    sqlite3_reset(ins);
+    sqlite3_clear_bindings(ins);
+    sqlite3_bind_text(ins, 1, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 2, title, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 3, artist, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 4, album, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 5, album_artist, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(ins) != SQLITE_DONE) {
+      sqlite3_finalize(ins);
+      sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+      sqlite3_close(conn);
+      return -1;
+    }
+  }
+  sqlite3_finalize(ins);
+
+  if (sqlite3_exec(conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+    sqlite3_close(conn);
+    return -1;
+  }
+
+  *out_conn = conn;
+  return 0;
+} /* build_raw_fixture */
+
+/*
+ * build_db_fixture: the same `n` rows as build_raw_fixture, inserted
+ * through db_track_upsert on a real Db handle -- the production code
+ * path, exercised so db_query_search is checked as the caller actually
+ * calls it, not just as raw SQL. Same path/field generation as
+ * build_raw_fixture, so a fresh sequential id in one lines up with the
+ * other's rowid. Returns 0 and sets *out_db on success, -1 on error.
+ */
+static int
+build_db_fixture(Db ** out_db, size_t n)
+{
+  const char * roots[] = { "/music" };
+  Db *         db = db_open(":memory:", roots, 1, NULL);
+  size_t       i;
+
+  if (db == NULL) {
+    return -1;
+  }
+  if (db_begin(db) != 0) {
+    db_close(db);
+    return -1;
+  }
+
+  for (i = 0; i < n; i++) {
+    char         path[64], title[128], artist[64], album[64], album_artist[64];
+    DbTrackWrite t;
+
+    snprintf(path, sizeof(path), "/music/track%05zu.flac", i);
+    fixture_field(title, sizeof(title), i, 0, 1 + (unsigned) (i % 4));
+    fixture_field(artist, sizeof(artist), i, 10, 1 + (unsigned) ((i / 4) % 3));
+    fixture_field(album, sizeof(album), i, 20, 1 + (unsigned) ((i / 7) % 3));
+    fixture_field(album_artist, sizeof(album_artist), i, 30, 1 + (unsigned) ((i / 11) % 2));
+
+    memset(&t, 0, sizeof(t));
+    t.path = path;
+    t.parent_dir = "/music";
+    t.mtime = (int64_t) i;
+    t.size = 1000 + (int64_t) i;
+    t.title = title;
+    t.artist = artist;
+    t.album = album;
+    t.album_artist = album_artist;
+    t.scan_gen = 1;
+
+    if (db_track_upsert(db, &t) != 0) {
+      db_rollback(db);
+      db_close(db);
+      return -1;
+    }
+  }
+
+  if (db_commit(db) != 0) {
+    db_close(db);
+    return -1;
+  }
+
+  *out_db = db;
+  return 0;
+} /* build_db_fixture */
+
+static sqlite3 * g_search_fixture_raw = NULL;
+static Db *      g_search_fixture_db = NULL;
+
+/*
+ * search_fixture_raw / search_fixture_db: lazily build, then reuse, the
+ * shared 20k-row fixture across the #10 assertions below -- each is
+ * read-only against it. Return NULL on build failure.
+ */
+static sqlite3 *
+search_fixture_raw(void)
+{
+  if (g_search_fixture_raw == NULL) {
+    build_raw_fixture(&g_search_fixture_raw, SEARCH_FIXTURE_N);
+  }
+  return g_search_fixture_raw;
+} /* search_fixture_raw */
+
+static Db *
+search_fixture_db(void)
+{
+  if (g_search_fixture_db == NULL) {
+    build_db_fixture(&g_search_fixture_db, SEARCH_FIXTURE_N);
+  }
+  return g_search_fixture_db;
+} /* search_fixture_db */
+
+/*
+ * search_fixture_cleanup: release the shared fixture. Called once from
+ * main after every #10 assertion has run.
+ */
+static void
+search_fixture_cleanup(void)
+{
+  if (g_search_fixture_raw != NULL) {
+    sqlite3_close(g_search_fixture_raw);
+    g_search_fixture_raw = NULL;
+  }
+  if (g_search_fixture_db != NULL) {
+    db_close(g_search_fixture_db);
+    g_search_fixture_db = NULL;
+  }
+} /* search_fixture_cleanup */
+
+/*
+ * test_search_order_preserved: assertion 1 (design.md 5.3, decide R7).
+ * Finds a query among g_selective_candidates matching fewer than 200 of
+ * the fixture's rows, runs it through db_query_search (the real Db, the
+ * real production statement) and through the pre-phase-6 reference
+ * shape ("ORDER BY rank, f.rowid LIMIT 200", the tie-break R7 requires)
+ * against the raw fixture, and asserts identical ids in identical
+ * order. Also asserts the reference has at least two distinct bm25
+ * scores -- the precondition that keeps the DESC-sign mutant from being
+ * invisible on a tied fixture (R7).
+ */
+static void
+test_search_order_preserved(void)
+{
+  sqlite3 *    raw = search_fixture_raw();
+  Db *         db = search_fixture_db();
+  char *       match = NULL;
+  size_t       ci;
+  int64_t      ref_ids[200];
+  double       ref_ranks[200];
+  size_t       ref_n = 0;
+
+  if (raw == NULL || db == NULL) {
+    CHECK(0, "search fixture unavailable for order-preservation test");
+    return;
+  }
+
+  for (ci = 0; ci < sizeof(g_selective_candidates) / sizeof(g_selective_candidates[0]); ci++) {
+    sqlite3_stmt * probe = NULL;
+    int64_t        total = -1;
+
+    free(match);
+    match = query_build_match(g_selective_candidates[ci]);
+    if (match == NULL) {
+      continue;
+    }
+    if (sqlite3_prepare_v2(raw, "SELECT count(*) FROM tracks_fts WHERE tracks_fts MATCH ?1",
+                            -1, &probe, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(probe, 1, match, -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(probe) == SQLITE_ROW) {
+        total = sqlite3_column_int64(probe, 0);
+      }
+      sqlite3_finalize(probe);
+    }
+    if (total > 0 && total < 200) {
+      break;
+    }
+  }
+  CHECK(match != NULL, "no candidate query built");
+  if (match == NULL) {
+    return;
+  }
+
+  sqlite3_stmt * ref = NULL;
+  CHECK(sqlite3_prepare_v2(raw,
+      "SELECT t.rowid, rank FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
+      "WHERE tracks_fts MATCH ?1 ORDER BY rank, f.rowid LIMIT 200",
+      -1, &ref, NULL) == SQLITE_OK, "failed to prepare the reference statement");
+  if (ref != NULL) {
+    double distinct[200];
+    size_t ndistinct = 0;
+
+    sqlite3_bind_text(ref, 1, match, -1, SQLITE_TRANSIENT);
+    while (ref_n < 200 && sqlite3_step(ref) == SQLITE_ROW) {
+      size_t k;
+      int    seen = 0;
+
+      ref_ids[ref_n] = sqlite3_column_int64(ref, 0);
+      ref_ranks[ref_n] = sqlite3_column_double(ref, 1);
+      for (k = 0; k < ndistinct; k++) {
+        if (distinct[k] == ref_ranks[ref_n]) {
+          seen = 1;
+          break;
+        }
+      }
+      if (!seen && ndistinct < 200) {
+        distinct[ndistinct++] = ref_ranks[ref_n];
+      }
+      ref_n++;
+    }
+    sqlite3_finalize(ref);
+
+    CHECK(ref_n > 0 && ref_n < 200,
+          "candidate query matched %zu rows, want 1..199 -- fixture drifted", ref_n);
+    CHECK(ndistinct >= 2,
+          "reference query has only %zu distinct bm25 score(s); a sign-error "
+          "mutant is invisible on a tied fixture (decide R7)", ndistinct);
+  }
+
+  DbTrackRow * srows = NULL;
+  size_t       sn = 0;
+  CHECK(db_query_search(db, match, &srows, &sn) == 0, "db_query_search returned non-zero");
+  CHECK(sn == ref_n, "db_query_search returned %zu rows, reference returned %zu", sn, ref_n);
+  if (srows != NULL) {
+    size_t k;
+    for (k = 0; k < sn && k < ref_n; k++) {
+      CHECK(srows[k].id == ref_ids[k],
+            "row %zu: db_query_search id %lld, reference id %lld",
+            k, (long long) srows[k].id, (long long) ref_ids[k]);
+    }
+  }
+  db_track_rows_free(srows, sn);
+  free(match);
+} /* test_search_order_preserved */
+
+/*
+ * test_search_cap: assertion 2 (design.md 4.5/5.3). A query matching
+ * more than 200 of the fixture's rows still returns exactly 200 through
+ * db_query_search.
+ */
+static void
+test_search_cap(void)
+{
+  Db *           db = search_fixture_db();
+  sqlite3 *      raw = search_fixture_raw();
+  char *         match;
+  sqlite3_stmt * count_stmt = NULL;
+  int64_t        total = -1;
+  DbTrackRow *   rows = NULL;
+  size_t         n = 0;
+
+  if (db == NULL || raw == NULL) {
+    CHECK(0, "search fixture unavailable for the >200 cap test");
+    return;
+  }
+
+  match = query_build_match("a");
+  CHECK(match != NULL, "query_build_match(\"a\") returned NULL");
+  if (match == NULL) {
+    return;
+  }
+
+  if (sqlite3_prepare_v2(raw, "SELECT count(*) FROM tracks_fts WHERE tracks_fts MATCH ?1",
+                          -1, &count_stmt, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(count_stmt, 1, match, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+      total = sqlite3_column_int64(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+  }
+  CHECK(total > 200, "query \"a\"* matched %lld of %d fixture rows, want > 200 "
+        "-- fixture drifted", (long long) total, SEARCH_FIXTURE_N);
+
+  CHECK(db_query_search(db, match, &rows, &n) == 0, "db_query_search returned non-zero");
+  CHECK(n == 200, "db_query_search returned %zu rows for a >200-match query, want 200", n);
+
+  /* Which 200, not just how many: the shipped statement caps inside the
+     subquery, so a >200-match query returns the 200 lowest rowids ranked
+     among themselves (design.md 4.5). Ranking before the cap would return
+     the global top 200 instead -- same count, different rows, and 110-200x
+     the cost at scale. Counting alone cannot tell the two apart. */
+  if (n == 200) {
+    sqlite3_stmt * want_stmt = NULL;
+    int64_t        want[200];
+    int64_t        got[200];
+    size_t         i = 0;
+
+    for (i = 0; i < n; i++) {
+      got[i] = rows[i].id;
+    }
+    qsort(got, n, sizeof got[0], cmp_id_qsort);
+
+    if (sqlite3_prepare_v2(raw,
+          "SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1 ORDER BY rowid LIMIT 200",
+          -1, &want_stmt, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(want_stmt, 1, match, -1, SQLITE_TRANSIENT);
+      for (i = 0; i < 200 && sqlite3_step(want_stmt) == SQLITE_ROW; i++) {
+        want[i] = sqlite3_column_int64(want_stmt, 0);
+      }
+      sqlite3_finalize(want_stmt);
+      CHECK(i == 200, "reference query returned %zu rowids, want 200", i);
+
+      for (i = 0; i < 200; i++) {
+        CHECK(got[i] == want[i],
+              "cap row %zu: got id %lld, want %lld -- the 200 rows are not the "
+              "lowest-rowid matches, so the LIMIT is not inside the subquery",
+              i, (long long) got[i], (long long) want[i]);
+      }
+    } else {
+      CHECK(0, "failed to prepare the lowest-rowid reference query");
+    }
+  }
+
+  db_track_rows_free(rows, n);
+  free(match);
+} /* test_search_cap */
+
+/*
+ * test_search_latency: assertion 3 (design.md 4.4/5.3, decide R7). Times
+ * the pre-phase-6 statement shape against the current PREP(query_search,
+ * ...) text, both against the same connection and the same
+ * prefix-indexed schema, so the ratio isolates the statement shape
+ * rather than the index. Best of five. Prints both figures and their
+ * ratio for CHANGELOG.md. Gate >= 2.0 against a healthy measured ~4.0x
+ * at this fixture size (decide R5/R7).
+ */
+static void
+test_search_latency(void)
+{
+  sqlite3 *      conn = search_fixture_raw();
+  char *         match;
+  sqlite3_stmt * old_stmt = NULL;
+  sqlite3_stmt * new_stmt = NULL;
+  double         old_best = -1.0, new_best = -1.0;
+  double         ratio;
+  int            rep;
+
+  if (conn == NULL) {
+    CHECK(0, "search fixture unavailable for the latency test");
+    return;
+  }
+
+  match = query_build_match("a");
+  CHECK(match != NULL, "query_build_match(\"a\") returned NULL");
+  if (match == NULL) {
+    return;
+  }
+
+  CHECK(sqlite3_prepare_v2(conn,
+      "SELECT t.* FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
+      "WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT 200",
+      -1, &old_stmt, NULL) == SQLITE_OK, "failed to prepare the old-shape statement");
+  CHECK(sqlite3_prepare_v2(conn,
+      "SELECT t.* FROM tracks t "
+      "JOIN (SELECT rowid AS rid, rank AS r FROM tracks_fts "
+      "       WHERE tracks_fts MATCH ?1 LIMIT 200) x ON t.id = x.rid "
+      "ORDER BY x.r, x.rid",
+      -1, &new_stmt, NULL) == SQLITE_OK, "failed to prepare the new-shape statement");
+
+  if (old_stmt == NULL || new_stmt == NULL) {
+    if (old_stmt != NULL) {
+      sqlite3_finalize(old_stmt);
+    }
+    if (new_stmt != NULL) {
+      sqlite3_finalize(new_stmt);
+    }
+    free(match);
+    return;
+  }
+
+  for (rep = 0; rep < 5; rep++) {
+    struct timespec t0, t1;
+    double          elapsed;
+
+    sqlite3_reset(old_stmt);
+    sqlite3_clear_bindings(old_stmt);
+    sqlite3_bind_text(old_stmt, 1, match, -1, SQLITE_TRANSIENT);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (sqlite3_step(old_stmt) == SQLITE_ROW) { }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    elapsed = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (old_best < 0.0 || elapsed < old_best) {
+      old_best = elapsed;
+    }
+
+    sqlite3_reset(new_stmt);
+    sqlite3_clear_bindings(new_stmt);
+    sqlite3_bind_text(new_stmt, 1, match, -1, SQLITE_TRANSIENT);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (sqlite3_step(new_stmt) == SQLITE_ROW) { }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    elapsed = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (new_best < 0.0 || elapsed < new_best) {
+      new_best = elapsed;
+    }
+  }
+  sqlite3_finalize(old_stmt);
+  sqlite3_finalize(new_stmt);
+  free(match);
+
+  ratio = (new_best > 0.0) ? old_best / new_best : 0.0;
+  printf("fts_query_test: search latency old=%.3fms new=%.3fms ratio=%.2fx\n",
+         old_best * 1000.0, new_best * 1000.0, ratio);
+
+  /* If this fails on CI with no db.c change, demote to a printed figure
+     -- do not re-tune the gate upward (decide R7). */
+  CHECK(ratio >= 2.0, "search latency ratio %.2fx, want >= 2.0x (old=%.3fms new=%.3fms)",
+        ratio, old_best * 1000.0, new_best * 1000.0);
+} /* test_search_latency */
+
+/*
+ * test_fts_prefix_index: assertion 4 (decide R7). A fresh database's
+ * tracks_fts carries prefix='1 2 3' -- checked by reopening the file
+ * db_open just created with a raw connection, since db.h exposes no
+ * generic SQL accessor and none is added for a test's convenience.
+ */
+static void
+test_fts_prefix_index(void)
+{
+  char         path[] = "/tmp/kurono_fts_prefix_XXXXXX";
+  int          fd = mkstemp(path);
+  const char * roots[] = { "/music" };
+  Db *         db;
+  sqlite3 *    raw = NULL;
+
+  if (fd < 0) {
+    CHECK(0, "mkstemp failed for the prefix-index fixture");
+    return;
+  }
+  close(fd);
+  unlink(path); /* db_open must create the file itself */
+
+  db = db_open(path, roots, 1, NULL);
+  CHECK(db != NULL, "db_open(%s) returned NULL", path);
+  if (db != NULL) {
+    db_close(db);
+  }
+
+  CHECK(sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK,
+        "failed to reopen %s read-only", path);
+  if (raw != NULL) {
+    sqlite3_stmt * st = NULL;
+
+    if (sqlite3_prepare_v2(raw, "SELECT sql FROM sqlite_master WHERE name = 'tracks_fts'",
+                            -1, &st, NULL) == SQLITE_OK) {
+      CHECK(sqlite3_step(st) == SQLITE_ROW, "tracks_fts not found in sqlite_master");
+      if (st != NULL) {
+        const char * ddl = (const char *) sqlite3_column_text(st, 0);
+        CHECK(ddl != NULL && strstr(ddl, "prefix='1 2 3'") != NULL,
+              "tracks_fts DDL missing prefix='1 2 3': %s", ddl != NULL ? ddl : "(null)");
+      }
+      sqlite3_finalize(st);
+    } else {
+      CHECK(0, "failed to prepare the sqlite_master query");
+    }
+    sqlite3_close(raw);
+  }
+
+  unlink(path);
+} /* test_fts_prefix_index */
+
+/*
+ * test_schema_migrate: assertion 5 (decide R7/R8). A version-1 database
+ * (tracks_fts recreated by hand without prefix, schema_version forced
+ * back to '1') is opened through the real db_open/migrate path and must
+ * come out at schema_version 2, with prefix='1 2 3' in the DDL and the
+ * original track's id intact -- the id check is what tells a migration
+ * apart from an unlink-and-rebuild, which would also produce correct
+ * DDL but a fresh id. Runs on a real temp file (mkstemp), the one test
+ * in this binary that cannot be :memory:.
+ */
+static void
+test_schema_migrate(void)
+{
+  char         path[] = "/tmp/kurono_schema_migrate_XXXXXX";
+  int          fd = mkstemp(path);
+  const char * roots[] = { "/music" };
+  int64_t      id = 0;
+  Db *         db;
+  DbTrackWrite t;
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+
+  if (fd < 0) {
+    CHECK(0, "mkstemp failed for the migration fixture");
+    return;
+  }
+  close(fd);
+  unlink(path);
+
+  /* A fresh (version-2) database, then downgraded in place to look like
+     a version-1 database migrate has never seen. */
+  db = db_open(path, roots, 1, NULL);
+  CHECK(db != NULL, "db_open(%s) returned NULL", path);
+  if (db == NULL) {
+    unlink(path);
+    return;
+  }
+
+  memset(&t, 0, sizeof(t));
+  t.path = "/music/a.flac";
+  t.parent_dir = "/music";
+  t.mtime = 1;
+  t.size = 100;
+  t.title = "Migrate Me";
+  t.scan_gen = 1;
+  CHECK(db_track_upsert(db, &t) == 0, "upsert into the fixture database failed");
+
+  CHECK(db_query_tracks_in_dir(db, "/music", &rows, &n) == 0, "db_query_tracks_in_dir failed");
+  CHECK(n == 1, "expected 1 track before downgrade, got %zu", n);
+  if (n == 1) {
+    id = rows[0].id;
+  }
+  db_track_rows_free(rows, n);
+  db_close(db);
+
+  /* Downgrade: recreate tracks_fts without prefix (undoing phase 6's
+     schema) and force schema_version back to '1' -- what a real
+     v1.0.1-era file looks like. */
+  {
+    sqlite3 * raw = NULL;
+
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK, "failed to reopen %s for downgrade", path);
+    if (raw != NULL) {
+      char * err = NULL;
+      int    rc = sqlite3_exec(raw,
+          "DROP TABLE tracks_fts;"
+          "CREATE VIRTUAL TABLE tracks_fts USING fts5("
+          "  title, artist, album, album_artist,"
+          "  content='tracks', content_rowid='id',"
+          "  tokenize='unicode61 remove_diacritics 2');"
+          "INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');"
+          "UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+          NULL, NULL, &err);
+      CHECK(rc == SQLITE_OK, "downgrade failed: %s", err != NULL ? err : "?");
+      sqlite3_free(err);
+      sqlite3_close(raw);
+    }
+  }
+
+  /* The real path: db_open must run migrate and land on schema_version 2. */
+  db = db_open(path, roots, 1, NULL);
+  CHECK(db != NULL, "db_open(%s) returned NULL after downgrade", path);
+  if (db != NULL) {
+    char *      version = db_meta_get(db, "schema_version");
+    DbTrackRow  row = { 0 };
+
+    CHECK(version != NULL && strcmp(version, "2") == 0,
+          "schema_version after migration is %s, want 2", version != NULL ? version : "(null)");
+    free(version);
+
+    CHECK(db_query_track_by_id(db, id, &row) == 1,
+          "track id %lld did not survive the migration -- a rebuild, not a migration",
+          (long long) id);
+    db_track_row_free_fields(&row);
+
+    db_close(db);
+  }
+
+  {
+    sqlite3 * raw2 = NULL;
+
+    CHECK(sqlite3_open_v2(path, &raw2, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK,
+          "failed to reopen %s to check the DDL", path);
+    if (raw2 != NULL) {
+      sqlite3_stmt * st = NULL;
+
+      if (sqlite3_prepare_v2(raw2, "SELECT sql FROM sqlite_master WHERE name = 'tracks_fts'",
+                              -1, &st, NULL) == SQLITE_OK) {
+        CHECK(sqlite3_step(st) == SQLITE_ROW, "tracks_fts not found after migration");
+        if (st != NULL) {
+          const char * ddl = (const char *) sqlite3_column_text(st, 0);
+          CHECK(ddl != NULL && strstr(ddl, "prefix='1 2 3'") != NULL,
+                "post-migration tracks_fts DDL missing prefix='1 2 3': %s",
+                ddl != NULL ? ddl : "(null)");
+        }
+        sqlite3_finalize(st);
+      }
+      sqlite3_close(raw2);
+    }
+  }
+
+  unlink(path);
+} /* test_schema_migrate */
+
 /*
  * main: runs the pure tests always and the FTS5 mode unless --pure is
  * given -- the FTS5 mode now also covers the prefix-range precondition,
@@ -748,6 +1474,12 @@ int main(int argc, char ** argv)
     test_against_fts5();
     test_prefix_range_precondition();
     test_upsert_preserves_id();
+    test_search_order_preserved();
+    test_search_cap();
+    test_search_latency();
+    test_fts_prefix_index();
+    test_schema_migrate();
+    search_fixture_cleanup();
   }
 
   if (g_failures != 0) {

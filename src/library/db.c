@@ -15,7 +15,20 @@
  * migration is a switch on the integer with one case per step, no
  * migration table.
  */
-#define KURONO_SCHEMA_VERSION 1
+#define KURONO_SCHEMA_VERSION 2
+
+/*
+ * SQL_TRACKS_FTS_DDL: the tracks_fts virtual table definition, shared
+ * between SQL_SCHEMA (fresh databases) and migrate's case 1 (existing
+ * version-1 databases) so the two cannot drift apart.
+ */
+#define SQL_TRACKS_FTS_DDL \
+  "CREATE VIRTUAL TABLE tracks_fts USING fts5(\n" \
+  "  title, artist, album, album_artist,\n" \
+  "  content='tracks', content_rowid='id',\n" \
+  "  tokenize='unicode61 remove_diacritics 2',\n" \
+  "  prefix='1 2 3'\n" \
+  ");\n"
 
 /*
  * DESIGN.md VII.1, transcribed verbatim: the nineteen-column tracks
@@ -50,11 +63,7 @@
   "CREATE INDEX idx_tracks_artist       ON tracks(artist);\n" \
   "CREATE INDEX idx_tracks_parent       ON tracks(parent_dir);\n" \
   "CREATE INDEX idx_tracks_scan_gen     ON tracks(scan_gen);\n" \
-  "CREATE VIRTUAL TABLE tracks_fts USING fts5(\n" \
-  "  title, artist, album, album_artist,\n" \
-  "  content='tracks', content_rowid='id',\n" \
-  "  tokenize='unicode61 remove_diacritics 2'\n" \
-  ");\n" \
+  SQL_TRACKS_FTS_DDL \
   "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);\n" \
   "CREATE TRIGGER tracks_ai AFTER INSERT ON tracks BEGIN\n" \
   "  INSERT INTO tracks_fts(rowid, title, artist, album, album_artist)\n" \
@@ -278,23 +287,44 @@ apply_schema(sqlite3 * conn)
  * migrate: forward migration from `from_version` to KURONO_SCHEMA_VERSION,
  * as a switch with one case per step and intentional fallthrough between
  * them -- the ruled mechanism (plan.md VII gap 9), no migration table.
- * There are no forward steps yet: KURONO_SCHEMA_VERSION is 1, so this is
- * only reachable for a from_version no version-1-or-later kurono has
- * ever written, and is treated as an error rather than guessed past.
- * Returns 0 on success, -1 on error.
+ * The whole function, switch and schema_version write alike, runs inside
+ * one transaction: a failure between the DROP and the CREATE must not
+ * leave the database on no tracks_fts and schema_version still at the
+ * old value, which would re-enter this same case and fail on the DROP
+ * forever. Returns 0 on success, -1 on error (transaction rolled back).
  */
 static int
 migrate(sqlite3 * conn, int from_version)
 {
+  if (sqlite3_exec(conn, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+    return -1;
+  }
+
   switch (from_version) {
+    case 1:
+      if (sqlite3_exec(conn, "DROP TABLE tracks_fts;", NULL, NULL, NULL) != SQLITE_OK ||
+          sqlite3_exec(conn, SQL_TRACKS_FTS_DDL, NULL, NULL, NULL) != SQLITE_OK ||
+          sqlite3_exec(conn, "INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');",
+                       NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
+      }
+      break;
+    /* case 2: next migration step slots in here. */
     default:
       fprintf(stderr, "kurono: cannot migrate database from unknown schema_version %d\n", from_version);
+      sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
       return -1;
   }
 
   char version_str[16];
   snprintf(version_str, sizeof(version_str), "%d", KURONO_SCHEMA_VERSION);
-  return meta_set_raw(conn, "schema_version", version_str);
+  if (meta_set_raw(conn, "schema_version", version_str) != 0) {
+    sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+    return -1;
+  }
+
+  return (sqlite3_exec(conn, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK) ? 0 : -1;
 } /* migrate */
 
 /*
@@ -585,9 +615,18 @@ prepare_all_statements(Db * db)
                                 "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
                                 "ORDER BY path COLLATE NOCASE");
   PREP(query_track_by_id, "SELECT * FROM tracks WHERE id = ?1");
+  /* LIMIT sits inside the subquery, so FTS5 scores only the 200 rows it
+     returns rather than every match before the outer LIMIT trims it --
+     a subquery carrying LIMIT is never flattened into the join, so the
+     bound is structural (DESIGN.md V.6). x.rid is a tie-break: bm25
+     ties are common and FTS5's own tie order is unspecified. */
   PREP(query_search,
-       "SELECT t.* FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
-       "WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT 200");
+       "SELECT t.* FROM tracks t "
+       "JOIN (SELECT rowid AS rid, rank AS r "
+       "        FROM tracks_fts "
+       "       WHERE tracks_fts MATCH ?1 "
+       "       LIMIT 200) x ON t.id = x.rid "
+       "ORDER BY x.r, x.rid");
 
 #undef PREP
 } /* prepare_all_statements */

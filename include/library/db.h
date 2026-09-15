@@ -323,17 +323,22 @@ int db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows,
 int db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row);
 
 /*
- * db_query_search: SELECT t.* FROM tracks_fts f JOIN tracks t ON
- * t.id = f.rowid WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT 200
- * (DESIGN.md V.6 step 3), using the one statement prepared once at open
- * and reused for every keystroke (DESIGN.md V.6 step 4). `match_string`
- * must already be the escaped/quoted form phase 15's transform
- * produces -- db.c binds it as a parameter and never concatenates it.
- * A residual SQLITE_ERROR from MATCH on a malformed string is reported
- * as zero rows (return 0, *out_n = 0), not as an error -- DESIGN.md V.6
- * warns this must never be treated as fatal. Always returns 0; every
- * other query function in this file applies the same policy uniformly
- * rather than singling search out (DESIGN.md XI.7).
+ * db_query_search: SELECT t.* FROM tracks t JOIN (SELECT rowid AS rid,
+ * rank AS r FROM tracks_fts WHERE tracks_fts MATCH ?1 LIMIT 200) x ON
+ * t.id = x.rid ORDER BY x.r, x.rid (DESIGN.md V.6 step 3), using the one
+ * statement prepared once at open and reused for every keystroke
+ * (DESIGN.md V.6 step 4). `match_string` must already be the
+ * escaped/quoted form phase 15's transform produces -- db.c binds it as
+ * a parameter and never concatenates it. LIMIT 200 sits inside the
+ * subquery, so it bounds both the rows returned and the rows bm25
+ * scores; a match set over 200 rows is truncated by rowid before
+ * ranking, not by rank, so the returned 200 are not always the global
+ * top 200 by relevance. A residual SQLITE_ERROR from MATCH on a
+ * malformed string is reported as zero rows (return 0, *out_n = 0), not
+ * as an error -- DESIGN.md V.6 warns this must never be treated as
+ * fatal. Always returns 0; every other query function in this file
+ * applies the same policy uniformly rather than singling search out
+ * (DESIGN.md XI.7).
  */
 int db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size_t * out_n);
 

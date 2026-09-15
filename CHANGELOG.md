@@ -18,8 +18,16 @@ Notable changes to `kurono`. Format based on
   end rather than wrapping. Accepted cost: holding the arrow key down at the
   end of a list now runs off the end and continues from the top, since
   nothing distinguishes a held key from repeated presses.
+- Search results beyond the 200-row cap are no longer the library-wide top
+  200 by relevance; they are the first 200 matches in scan order, ranked
+  among themselves. Every query whose matches fit within 200 — the common
+  case, including every two-token search — is unaffected.
+
 ### Fixed
 
+- Search latency on a broad first keystroke: roughly 53 ms down to roughly
+  1.5 ms at 100,000 tracks, measured on disk. Selective queries were already
+  fast and are unchanged.
 - A track whose file changed on disk (retagged, re-muxed, or just touched)
   now keeps its library id across a rescan instead of getting a new one. A
   queued track could previously lose its title and duration in the queue
