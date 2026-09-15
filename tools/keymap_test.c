@@ -17,8 +17,10 @@
    by every row-level check rather than by one special case. */
 
 #include "../include/ui/keymap.h"
+#include "../include/ui/listgeom.h"
 #include "../include/ui/theme.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -573,6 +575,107 @@ test_theme_degrade(void)
 } /* test_theme_degrade */
 
 /*
+ * test_list_scroll_for: invariant, centring, and end behaviour of
+ * list_scroll_for (include/ui/listgeom.h) over n in [0,40], viewport
+ * in [1,20], cursor in [0,n). Takes nothing, returns nothing.
+ */
+static void
+test_list_scroll_for(void)
+{
+  for (size_t n = 0; n <= 40; n++) {
+    for (int vp = 1; vp <= 20; vp++) {
+      size_t h = (size_t) vp;
+      for (size_t cursor = 0; cursor < (n == 0 ? 1 : n); cursor++) {
+        if (n == 0) {
+          continue;
+        }
+        size_t scroll = list_scroll_for(cursor, n, vp);
+
+        CHECK(scroll <= cursor, "n=%zu vp=%d cursor=%zu: scroll %zu > cursor",
+              n, vp, cursor, scroll);
+        CHECK(cursor < scroll + h, "n=%zu vp=%d cursor=%zu: cursor not in viewport",
+              n, vp, cursor);
+        if (n <= h) {
+          CHECK(scroll == 0, "n=%zu vp=%d cursor=%zu: scroll != 0 when n <= viewport",
+                n, vp, cursor);
+        } else {
+          CHECK(scroll + h <= n, "n=%zu vp=%d cursor=%zu: scroll + viewport > n",
+                n, vp, cursor);
+        }
+
+        if (n > h && cursor >= h / 2 && cursor <= n - 1 - h / 2) {
+          CHECK(cursor - scroll == h / 2,
+                "n=%zu vp=%d cursor=%zu: not centred (scroll=%zu)", n, vp, cursor, scroll);
+        }
+        if (n > h && cursor < h / 2) {
+          CHECK(scroll == 0, "n=%zu vp=%d cursor=%zu: left end not scroll=0", n, vp, cursor);
+        }
+        if (n > h && cursor > n - 1 - h / 2) {
+          CHECK(scroll == n - h, "n=%zu vp=%d cursor=%zu: right end not scroll=n-h", n, vp, cursor);
+        }
+      }
+    }
+  }
+} /* test_list_scroll_for */
+
+/*
+ * test_list_cursor_move: range, wrap-at-|delta|==1, and clamp-otherwise
+ * behaviour of list_cursor_move (include/ui/listgeom.h), for n in [0,8]
+ * and a representative set of deltas including both int extremes.
+ * Takes nothing, returns nothing.
+ */
+static void
+test_list_cursor_move(void)
+{
+  static const int deltas[] = {
+    INT_MIN, -1000, -13, -2, -1, 0, 1, 2, 13, 1000, INT_MAX
+  };
+  size_t n_deltas = sizeof(deltas) / sizeof(deltas[0]);
+
+  for (size_t n = 0; n <= 8; n++) {
+    for (size_t cursor = 0; cursor < (n == 0 ? 1 : n); cursor++) {
+      for (size_t di = 0; di < n_deltas; di++) {
+        int delta = deltas[di];
+        size_t r = list_cursor_move((n == 0) ? 0 : cursor, n, delta);
+
+        if (n == 0) {
+          CHECK(r == 0, "n=0: result %zu != 0", r);
+          continue;
+        }
+        CHECK(r < n, "n=%zu cursor=%zu delta=%d: result %zu out of range",
+              n, cursor, delta, r);
+
+        if (n == 1) {
+          CHECK(r == 0, "n=1 delta=%d: result %zu != 0", delta, r);
+        }
+
+        if (delta == 1 && cursor == n - 1) {
+          CHECK(r == 0, "n=%zu cursor=%zu delta=+1: did not wrap to 0", n, cursor);
+        }
+        if (delta == -1 && cursor == 0) {
+          CHECK(r == n - 1, "n=%zu cursor=0 delta=-1: did not wrap to n-1", n);
+        }
+
+        if (delta != 1 && delta != -1) {
+          long long want = (long long) cursor + (long long) delta;
+          long long last = (long long) n - 1;
+          if (want < 0) want = 0;
+          if (want > last) want = last;
+          CHECK((long long) r == want,
+                "n=%zu cursor=%zu delta=%d: got %zu, want %lld",
+                n, cursor, delta, r, want);
+        }
+      }
+    }
+  }
+
+  /* The page-up case design.md pins: a large negative delta on a short
+     listing clamps to 0 rather than wrapping to the far end. */
+  CHECK(list_cursor_move(1, 4, -12) == 0, "n=4 cursor=1 delta=-12 must be 0");
+  CHECK(list_cursor_move(0, 5, -12) == 0, "n=5 cursor=0 delta=-12 must be 0 (not 3)");
+} /* test_list_cursor_move */
+
+/*
  * main: runs every check, returns 0 when all passed and 1 otherwise.
  */
 int
@@ -589,6 +692,8 @@ main(void)
   test_key_names_are_named();
   test_theme_slots();
   test_theme_degrade();
+  test_list_scroll_for();
+  test_list_cursor_move();
 
   size_t n = 0;
   (void) keymap_table(MODE_NORMAL, &n);

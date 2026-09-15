@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "../../include/ui/browser.h"
+#include "../../include/ui/listgeom.h"
 
 #include "../../include/library/db.h"
 #include "../../include/library/query.h"
@@ -1235,26 +1236,7 @@ clamp(Browser * b)
     b->cursor = b->n - 1;
   }
 
-  size_t v = (size_t) vp;
-
-  /* A listing that fits never scrolls. Without this the branch below
-     could leave a non-zero scroll after the row count shrank, showing
-     blank lines under a short listing. */
-  if (b->n <= v) {
-    b->scroll = 0;
-    return;
-  }
-
-  if (b->cursor < b->scroll) {
-    b->scroll = b->cursor;               /* scrolled off the top */
-  } else if (b->cursor >= b->scroll + v) {
-    b->scroll = b->cursor - v + 1;       /* scrolled off the bottom */
-  }
-
-  /* Never leave blank rows below the last entry. */
-  if (b->scroll + v > b->n) {
-    b->scroll = b->n - v;
-  }
+  b->scroll = list_scroll_for(b->cursor, b->n, vp);
 } /* clamp */
 
 /*
@@ -1414,10 +1396,8 @@ browser_reload(Browser * b)
 } /* browser_reload */
 
 /*
- * browser_cursor_move: see include/ui/browser.h. Clamps at both ends.
- * The arithmetic is done signed and in one place so that a large
- * negative delta on a short listing cannot wrap through zero -- the
- * failure that would look like "page up jumps to the bottom".
+ * browser_cursor_move: see include/ui/browser.h. Wraps on |delta| == 1,
+ * clamps otherwise.
  */
 void
 browser_cursor_move(Browser * b, int delta)
@@ -1426,17 +1406,7 @@ browser_cursor_move(Browser * b, int delta)
     return;
   }
 
-  long long cur  = (long long) b->cursor;
-  long long want = cur + (long long) delta;
-
-  if (want < 0) {
-    want = 0;
-  }
-  if (want > (long long) b->n - 1) {
-    want = (long long) b->n - 1;
-  }
-
-  b->cursor = (size_t) want;
+  b->cursor = list_cursor_move(b->cursor, b->n, delta);
   clamp(b);
 } /* browser_cursor_move */
 
@@ -1494,7 +1464,6 @@ browser_descend(Browser * b)
   free(b->cwd);
   b->cwd    = target;
   b->cursor = 0;
-  b->scroll = 0;
   clamp(b);
   return 1;
 } /* browser_descend */
@@ -1545,7 +1514,6 @@ browser_ascend(Browser * b)
   free(b->cwd);
   b->cwd    = parent;
   b->cursor = 0;
-  b->scroll = 0;
 
   for (size_t i = 0; i < b->n; i++) {
     if (strcmp(b->rows[i].key, leaving) == 0) {
@@ -1660,7 +1628,6 @@ browser_goto(Browser * b, const char * parent_key, const char * row_key)
       free(b->cwd);
       b->cwd    = target;
       b->cursor = 0;
-      b->scroll = 0;
       clamp(b);
       return -1;
     }
@@ -1676,7 +1643,6 @@ browser_goto(Browser * b, const char * parent_key, const char * row_key)
     b->cwd = target;
   }
   b->cursor = at;
-  b->scroll = 0; /* clamp scrolls the cursor back into view */
   clamp(b);
   return 0;
 } /* browser_goto */

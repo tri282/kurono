@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "../../include/ui/listgeom.h"
 #include "../../include/ui/queueview.h"
 
 #include "../../include/library/db.h"
@@ -176,21 +177,7 @@ queueview_cursor(void)
 void
 queueview_cursor_move(int delta)
 {
-  if (g_count == 0) {
-    g_cursor = 0;
-    return;
-  }
-
-  if (delta < 0) {
-    size_t back = (size_t) -delta;
-    g_cursor = (back >= g_cursor) ? 0 : g_cursor - back;
-    return;
-  }
-
-  g_cursor += (size_t) delta;
-  if (g_cursor >= g_count) {
-    g_cursor = g_count - 1;
-  }
+  g_cursor = list_cursor_move(g_cursor, g_count, delta);
 } /* queueview_cursor_move */
 
 /*

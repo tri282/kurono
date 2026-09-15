@@ -6,6 +6,18 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
+### Changed
+
+- The cursor now stays centred in every list — the browser's main column,
+  the queue pane, and search results — instead of riding to the edge of the
+  viewport and pinning there. The first and last half-viewport are the
+  exception: there are no rows past the ends to centre against, so the
+  cursor rides out of the centre there, same as most terminal file managers.
+- A single step up or down at the top or bottom of a list now wraps to the
+  other end, instead of stopping there. A page up/down still clamps at the
+  end rather than wrapping. Accepted cost: holding the arrow key down at the
+  end of a list now runs off the end and continues from the top, since
+  nothing distinguishes a held key from repeated presses.
 ### Fixed
 
 - A track whose file changed on disk (retagged, re-muxed, or just touched)

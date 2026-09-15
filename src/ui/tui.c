@@ -37,6 +37,7 @@
 #include <wchar.h>
 
 #include "../../include/ui/keymap.h"
+#include "../../include/ui/listgeom.h"
 #include "../../include/ui/theme.h"
 #include "../../include/ui/tui.h"
 
@@ -517,29 +518,6 @@ draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
 } /* draw_column */
 
 /*
- * scroll_for: the scroll offset that keeps `cursor` visible in a column
- * of `n` rows. Takes both plus the viewport height, returns the offset.
- *
- * Only the derived columns need this: the main column's offset is the
- * widget's, which is already consistent with its cursor and must not be
- * recomputed here -- two places deciding what is visible is how they
- * come to disagree.
- */
-static size_t
-scroll_for(size_t cursor, size_t n, int height)
-{
-  size_t h = (height > 0) ? (size_t) height : 1;
-
-  if (n <= h || cursor < h / 2) {
-    return 0;
-  }
-  if (cursor > n - 1 - h / 2) {
-    return (n > h) ? n - h : 0;
-  }
-  return cursor - h / 2;
-} /* scroll_for */
-
-/*
  * draw_body: the three columns, the separators between them, and the
  * reserved cover pane. Takes the model, returns nothing.
  *
@@ -566,7 +544,7 @@ draw_body(const TuiModel * m)
     size_t vn     = browser_preview_count(m->browser);
 
     draw_column(0, browser_parent_row, m->browser, pn, pcur,
-                scroll_for(pcur, pn, g_layout.body_h), 0, 1, STYLE_COUNT);
+                list_scroll_for(pcur, pn, g_layout.body_h), 0, 1, STYLE_COUNT);
 
     if (n == 0) {
       /* DESIGN.md XI.5: an empty index is a first-run state, not an
@@ -602,7 +580,7 @@ draw_body(const TuiModel * m)
         }
         g_search_draw = m->search_rows;
         draw_column(2, search_row_at, NULL, m->search_n, g_search_cursor,
-                    scroll_for(g_search_cursor, m->search_n, g_layout.body_h),
+                    list_scroll_for(g_search_cursor, m->search_n, g_layout.body_h),
                     1, 0, STYLE_SEARCH_MATCH);
         g_search_draw = NULL;
       } else {
@@ -614,7 +592,7 @@ draw_body(const TuiModel * m)
     } else if (ui_mode() == MODE_QUEUE) {
       if (m->queue_n > 0 && m->queue_rows != NULL) {
         size_t qc = (m->queue_cursor < m->queue_n) ? m->queue_cursor : m->queue_n - 1;
-        size_t scroll = scroll_for(qc, m->queue_n, g_layout.body_h);
+        size_t scroll = list_scroll_for(qc, m->queue_n, g_layout.body_h);
 
         g_search_draw = m->queue_rows;   /* the same (rows, index) adapter */
         draw_column(2, search_row_at, NULL, m->queue_n, qc, scroll, 1, 0,
@@ -985,17 +963,13 @@ search_key(const struct tb_event * ev, Action a)
       return 1;
 
     case ACT_CURSOR_UP:
-      if (g_search_cursor > 0) {
-        g_search_cursor--;
-      }
+      g_search_cursor = list_cursor_move(g_search_cursor, g_search_shown, -1);
       return 1;
 
     case ACT_CURSOR_DOWN:
       /* Clamped against what the last draw showed; the draw clamps again
          against what it is about to show. */
-      if (g_search_shown > 0 && g_search_cursor + 1 < g_search_shown) {
-        g_search_cursor++;
-      }
+      g_search_cursor = list_cursor_move(g_search_cursor, g_search_shown, 1);
       return 1;
 
     case ACT_QUIT:

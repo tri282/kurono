@@ -209,9 +209,14 @@ void      browser_destroy(Browser * b);
 int browser_reload(Browser * b);
 
 /*
- * Cursor movement. All of these clamp; none can move the cursor out of
- * range or leave the scroll offset inconsistent with it. A delta past
- * either end stops at that end rather than wrapping.
+ * Cursor movement. None can move the cursor out of range or leave the
+ * scroll offset inconsistent with it. browser_cursor_move treats a
+ * delta of exactly +1 or -1 as a wrap -- past the last row goes to the
+ * first, and back past the first goes to the last -- and clamps any
+ * larger delta at the end it would otherwise cross, so a page move
+ * never reads as "page up jumps to the bottom" (the formula is
+ * include/ui/listgeom.h's, shared with the queue pane and search
+ * results). browser_cursor_home/_end are absolute and do not wrap.
  */
 void browser_cursor_move(Browser * b, int delta);
 void browser_cursor_home(Browser * b);

@@ -51,10 +51,13 @@ size_t             queueview_count(void);
    check queueview_count() before acting on it. */
 size_t queueview_cursor(void);
 
-/* queueview_cursor_move: move by `delta` rows, clamped at both ends
-   rather than wrapping -- the browser's columns behave the same way and
-   a queue that wraps under a held key is a queue you cannot stop at the
-   end of. */
+/* queueview_cursor_move: move by `delta` rows. A delta of exactly +1 or
+   -1 wraps at either end, matching the browser's columns and search
+   results (include/ui/listgeom.h); a larger delta -- a page move --
+   clamps at the end it would cross rather than wrapping past it.
+   Accepted cost: termbox2 does not distinguish a held key from repeated
+   presses, so holding the single-step key at the end of the queue now
+   runs off the end and continues from the top instead of stopping. */
 void queueview_cursor_move(int delta);
 
 /* queueview_cursor_set: put the cursor at `idx`, clamped to the last
