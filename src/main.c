@@ -6,6 +6,7 @@
 #include "../include/audio/decoder.h"
 #include "../include/audio/engine.h"
 #include "../include/audio/sink.h"
+#include "../include/audio/testsrc.h"
 #include "../include/audio/trace.h"
 #include "../include/library/db.h"
 #include "../include/library/query.h"
@@ -203,18 +204,25 @@ resolve_trace_log_path(void)
    fence that did run still reports a number instead of timing out. */
 #define FLUSH_FENCE_WAIT_MS 400
 
+/* Amendment 10: --fault's source runs this far past the fault point
+   before EOF, so a fault that never fires ends the run with a failure
+   verdict instead of hanging. */
+#define FAULT_EOF_MARGIN_MS 5000
+
 /*
  * PlayMode: which driver --play runs after EV_STREAM_INFO confirms the
  * track is open. PLAY_PLAIN and PLAY_SEEK_ONCE are the two shapes
  * --play already had. The other two exist to drive the two phase-7
  * verify rows the 1 Hz poll loop cannot reach on its own
- * (status/kurono/STATUS.md, "Phase 7 verify debt").
+ * (status/kurono/STATUS.md, "Phase 7 verify debt"). PLAY_FAULT
+ * (amendment 10) is reachable only via --null-sink --fault.
  */
 typedef enum {
   PLAY_PLAIN,
   PLAY_SEEK_ONCE,
   PLAY_SEEK_STRESS,
-  PLAY_SEEK_PAUSED
+  PLAY_SEEK_PAUSED,
+  PLAY_FAULT
 } PlayMode;
 
 /*
@@ -3196,6 +3204,8 @@ player_handle_engine_event(Player * p, const Event * ev)
           break;
         case PLAY_PLAIN:
           break;
+        case PLAY_FAULT:
+          break;
       }
       break;
 
@@ -3205,7 +3215,10 @@ player_handle_engine_event(Player * p, const Event * ev)
        through to, so the same event advances instead of ending the run.
        Neither branch is the other's special case -- --play must keep
        reporting a failed file through its exit status, because that is
-       what every sanitiser invocation in the verify tables reads. */
+       what every sanitiser invocation in the verify tables reads.
+       PLAY_FAULT (amendment 10) is the one exception: it routes
+       EV_DECODE_ERROR through the TUI's arm so the failure-reporting
+       path runs headless too. */
     case EV_OPEN_FAILED:
       if (!p->ui) {
         player_report(p, "open failed (error %d)", ev->averror);
@@ -3217,16 +3230,23 @@ player_handle_engine_event(Player * p, const Event * ev)
       break;
 
     case EV_DECODE_ERROR:
-      if (!p->ui) {
+      if (!p->ui && p->mode != PLAY_FAULT) {
         player_report(p, "decode error (error %d)", ev->averror);
         p->status  = 1;
         p->running = 0;
         break;
       }
       player_track_failed(p, "decode error", ev->averror);
+      if (p->mode == PLAY_FAULT) {
+        p->running = 0; /* headless has no queue: the skip lands on end of queue */
+      }
       break;
 
     case EV_EOF: {
+      if (p->mode == PLAY_FAULT) {
+        player_report(p, "fault: EOF before the fault fired");
+        p->status = 1;
+      }
       /* A track that reached EOF played, whatever happened earlier in
          the run, so the failure streak is broken here as well as by the
          one-second rule in player_track_failed. Amendment 06 rule 3: at
@@ -3879,9 +3899,18 @@ player_start(Player * p, const char * who, int * have_device)
      The source is constructed here and handed over, rather than built
      inside the engine: that is what makes DESIGN.md VI's doubles
      substitutable (phase 18). This is the production path, so it is the
-     real decoder; a harness passes a testsrc_create instead. The engine
-     owns it from this call on, including on failure. */
-  p->e = engine_create(&p->fmt, decoder_create(&p->fmt), &p->sink);
+     real decoder; a harness passes a testsrc_create instead --
+     PLAY_FAULT (amendment 10) is that harness. The engine owns the
+     source from this call on, including on failure. */
+  AudioSource src;
+  if (p->mode == PLAY_FAULT) {
+    long fault_frames = (long) (p->mode_arg * (int64_t) p->fmt.sample_rate / 1000);
+    src = testsrc_create(&p->fmt, TESTSRC_FAULT,
+                         p->mode_arg + FAULT_EOF_MARGIN_MS, fault_frames);
+  } else {
+    src = decoder_create(&p->fmt);
+  }
+  p->e = engine_create(&p->fmt, src, &p->sink);
   if (p->e == NULL) {
     fprintf(stderr, "kurono: %s: engine_create failed\n", who);
     p->sink.close(p->sink.self);
@@ -3929,7 +3958,8 @@ player_start(Player * p, const char * who, int * have_device)
  *
  * Takes the file path, the PlayMode, its argument (a seek target in
  * ms for PLAY_SEEK_ONCE and PLAY_SEEK_PAUSED, a seek count for
- * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN), and null_sink (amendment
+ * PLAY_SEEK_STRESS, the fault point in ms for PLAY_FAULT, ignored for
+ * PLAY_PLAIN), and null_sink (amendment
  * 10: nonzero selects NullSink over the miniaudio backend in
  * player_start step 5); returns 0 on a clean EOF or a clean signalled
  * exit, 1 on any open/decode failure or a failed end-of-run verdict.
@@ -4283,9 +4313,13 @@ main(int argc, char * argv[])
       status = run_play(argv[2], PLAY_SEEK_STRESS, (int64_t) atoll(argv[a + 1]), ns);
     } else if (argc == a + 2 && strcmp(argv[a], "--seek-paused") == 0) {
       status = run_play(argv[2], PLAY_SEEK_PAUSED, (int64_t) atoll(argv[a + 1]), ns);
+    } else if (ns && argc == a + 2 && strcmp(argv[a], "--fault") == 0) {
+      status = run_play(argv[2], PLAY_FAULT, (int64_t) atoll(argv[a + 1]), ns);
     } else {
       fprintf(stderr, "kurono: usage: --play FILE [--null-sink] [--seek MS | "
-                      "--seek-stress N | --seek-paused MS]\n");
+                      "--seek-stress N | --seek-paused MS]\n"
+                      "kurono: usage: --play FILE --null-sink --fault MS   "
+                      "(FILE ignored)\n");
       status = 1;
     }
 
@@ -4298,7 +4332,9 @@ main(int argc, char * argv[])
   } else {
     fprintf(stderr, "kurono: usage: kurono [--version | --paths | --scan | "
                     "--play FILE [--null-sink] [--seek MS | --seek-stress N | "
-                    "--seek-paused MS]]\n");
+                    "--seek-paused MS]]\n"
+                    "kurono: usage: --play FILE --null-sink --fault MS   "
+                    "(FILE ignored)\n");
     status = 1;
   }
 

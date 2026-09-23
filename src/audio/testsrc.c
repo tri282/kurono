@@ -124,8 +124,10 @@ testsrc_read_impl(void * self, float * dst, long frames)
 
   long n = frames;
 
-  /* Clip to EOF, and let a fault that lands mid-block still be a fault
-     on the next call rather than being swallowed by the EOF return. */
+  /* Clip to EOF only. A fault point inside this block is not clipped
+     to: a short read is EOF to the engine, so the block is returned
+     whole and the fault fires on the next read, up to one block late
+     (amendment 10 D-16). */
   uint64_t total = frames_total(t);
   if (total > 0) {
     if (t->frames_done >= total) {
@@ -134,12 +136,6 @@ testsrc_read_impl(void * self, float * dst, long frames)
     uint64_t left = total - t->frames_done;
     if ((uint64_t) n > left) {
       n = (long) left;
-    }
-  }
-  if (t->kind == TESTSRC_FAULT && t->fault_after >= 0) {
-    uint64_t until = (uint64_t) t->fault_after - t->frames_done;
-    if ((uint64_t) n > until) {
-      n = (long) until;
     }
   }
 

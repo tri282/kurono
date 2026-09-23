@@ -42,7 +42,8 @@ typedef enum {
      discontinuity at a seek or a track boundary is visible in a
      recording rather than a matter of opinion. */
   TESTSRC_SINE,
-  /* Decodes normally for `fault_after_frames`, then returns a negative
+  /* Decodes normally for at least `fault_after_frames` (whole blocks,
+     so up to one read's worth more), then returns a negative
      AVERROR-shaped value from read() forever.
      
      This is the one that exists for a specific unreachable branch:

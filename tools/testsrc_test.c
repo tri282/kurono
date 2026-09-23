@@ -131,10 +131,11 @@ test_endless_never_ends(void)
   s.destroy(s.self);
 } /* test_endless_never_ends */
 
-/* test_fault_is_negative_and_sticky: the injector must produce frames
-   up to its fault point, then a negative return, and must never
-   recover -- the branch it exists to reach is the one that has to
-   survive a source that stays broken. Takes nothing, returns nothing. */
+/* test_fault_is_negative_and_sticky: the injector must produce whole
+   blocks up to and past its fault point, then a negative return, and
+   must never recover -- the branch it exists to reach is the one that
+   has to survive a source that stays broken. Takes nothing, returns
+   nothing. */
 static void
 test_fault_is_negative_and_sticky(void)
 {
@@ -149,11 +150,11 @@ test_fault_is_negative_and_sticky(void)
   long n = s.read(s.self, g_buf, BUFFRAMES);
   CHECK(n == BUFFRAMES, "the first block is before the fault, got %ld", n);
 
-  /* The fault lands mid-block: the read must stop at the fault point
-     rather than overshoot it. */
+  /* The fault lands mid-block: the block must still come back whole,
+     since a short read is EOF to the engine and would hide the fault
+     (amendment 10 D-16). */
   n = s.read(s.self, g_buf, BUFFRAMES);
-  CHECK(n == 1500 - BUFFRAMES, "expected %ld frames up to the fault, got %ld",
-        1500 - BUFFRAMES, n);
+  CHECK(n == BUFFRAMES, "the block spanning the fault must be whole, got %ld", n);
 
   for (int i = 0; i < 3; i++) {
     CHECK(s.read(s.self, g_buf, BUFFRAMES) < 0,
@@ -163,6 +164,27 @@ test_fault_is_negative_and_sticky(void)
   s.close(s.self);
   s.destroy(s.self);
 } /* test_fault_is_negative_and_sticky */
+
+/* test_fault_at_zero_is_immediate: --fault 0 is a legal harness
+   argument (amendment 10), so a fault point of zero must fault on the
+   very first read, with no frames produced. Takes nothing, returns
+   nothing. */
+static void
+test_fault_at_zero_is_immediate(void)
+{
+  SessionFormat f = fmt48();
+  AudioSource s = testsrc_create(&f, TESTSRC_FAULT, 0, 0);
+  if (s.self == NULL) {
+    CHECK(0, "testsrc_create returned a null source");
+    return;
+  }
+  CHECK(s.open(s.self, "ignored", NULL) == 0, "open must succeed");
+  CHECK(s.read(s.self, g_buf, BUFFRAMES) < 0,
+        "a fault at frame 0 must fault on the first read");
+
+  s.close(s.self);
+  s.destroy(s.self);
+} /* test_fault_at_zero_is_immediate */
 
 /* test_seek_moves_position: seek is the only position this source has,
    so a seek forward must shorten what is left before EOF by exactly
@@ -269,6 +291,7 @@ main(void)
   test_eof_is_exact();
   test_endless_never_ends();
   test_fault_is_negative_and_sticky();
+  test_fault_at_zero_is_immediate();
   test_seek_moves_position();
   test_closed_source_reads_eof();
   test_retarget_changes_the_clock();
