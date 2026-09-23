@@ -281,7 +281,8 @@ nullsink-test: tools/nullsink_test
 
 tools/nullsink_test: CFLAGS += -fsanitize=thread
 tools/nullsink_test: build/tsan/tools/nullsink_test.o build/tsan/audio/sink.o \
-                     build/tsan/audio/ring.o build/tsan/audio/trace.o
+                     build/tsan/audio/ring.o build/tsan/audio/trace.o \
+                     build/tsan/audio/engine.o
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lpthread -lm -ldl
 
 # Pure, dependency-free (DESIGN.md III.2, XII.2 testable tier): no

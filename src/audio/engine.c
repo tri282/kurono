@@ -130,18 +130,22 @@ struct Engine {
   Command cmd_q[CMD_QUEUE_CAP];
   int cmd_head, cmd_tail, cmd_count;
 
-  /* The park handshake of DESIGN.md IV.8.b step 1, guarded by cmd_mtx
-     and announced on cmd_cond. Set by T2 in park() once it has stopped
-     writing to pcm_ring, cleared by T2 in unpark() before it resumes;
-     waited on by T1 in engine_park_sync. It lives under the command
-     mutex rather than beside `state` because the point is the
-     release/acquire edge the mutex supplies -- `state` is relaxed on
-     both sides and gives none, which is exactly why observing
-     ENG_PAUSED is not a substitute (see engine_park_sync). Starts at 1:
-     T2 begins parked with no track (DESIGN.md IV.9.a step 7), so the
-     flag is truthful from creation and a ladder that runs before
-     anything has played returns immediately instead of hanging. */
+  /* T2's parked state, guarded by cmd_mtx. Set by T2 in park() once it
+     has stopped writing to pcm_ring, cleared by T2 in unpark() before it
+     resumes; read by engine_device_reflush as a precondition. Not the
+     handshake: T2 keeps it set while servicing a play or seek popped from
+     its idle wait, which is why engine_park_sync waits on pause_ack
+     instead (amendment 11). Under the command mutex rather than beside
+     `state` for the release/acquire edge; `state` is relaxed on both
+     sides. Starts at 1: T2 begins parked with no track (DESIGN.md IV.9.a
+     step 7). */
   int parked;
+
+  /* Amendment 11: engine_park_sync's handshake. park_ticket is T1's
+     counter (T1 only); pause_ack is the last ticket T2 has handled,
+     written by T2 and waited on by T1, both under cmd_mtx. */
+  uint64_t park_ticket;
+  uint64_t pause_ack;
 
   pthread_mutex_t evt_mtx;
   Event evt_q[EVT_QUEUE_CAP];
@@ -613,6 +617,14 @@ handle_command(Engine * e, const Command * cmd, int * quit)
       if (e->has_track) {
         park(e, ENG_PAUSED);
       }
+      if (cmd->ticket != 0) {
+        /* Acknowledged whether or not T2 was already parked: the ack says
+           every earlier command has finished (amendment 11). */
+        pthread_mutex_lock(&e->cmd_mtx);
+        e->pause_ack = cmd->ticket;
+        pthread_cond_broadcast(&e->cmd_cond);
+        pthread_mutex_unlock(&e->cmd_mtx);
+      }
       break;
 
     case CMD_RESUME:
@@ -1064,10 +1076,14 @@ engine_park_sync(Engine * e)
     return;
   }
 
-  engine_pause(e);
+  Command cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.kind   = CMD_PAUSE;
+  cmd.ticket = ++e->park_ticket;
+  cmd_push(e, &cmd);
 
   pthread_mutex_lock(&e->cmd_mtx);
-  while (!e->parked) {
+  while (e->pause_ack < cmd.ticket) {
     pthread_cond_wait(&e->cmd_cond, &e->cmd_mtx);
   }
   pthread_mutex_unlock(&e->cmd_mtx);

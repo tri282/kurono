@@ -65,6 +65,7 @@ typedef struct {
   int64_t     track_id;
   int64_t     arg_ms;
   float       gain;
+  uint64_t    ticket;   /* CMD_PAUSE from engine_park_sync only; 0 otherwise (amendment 11) */
 } Command;
 
 /*
@@ -250,6 +251,13 @@ void engine_set_gain(Engine * e, float gain);
  * it is the mutex that supplies the release/acquire edge. On return, T1
  * is guaranteed to see every ring write T2 completed, including the case
  * of a T2 blocked in a slow read that a state spin would have missed.
+ *
+ * What T1 waits for is T2's acknowledgement of this call's own CMD_PAUSE
+ * (a ticket, amendment 11), not the parked flag: T2 keeps `parked` set
+ * while it services a play or seek popped from its idle wait, so a flag
+ * wait returned while that command was still resetting pcm_ring. Commands
+ * are FIFO with one consumer and T1 is the only producer, so the ack means
+ * every command queued before this call has completed and nothing follows.
  *
  * Idempotent and safe when T2 is already parked or was never started;
  * the wait is unbounded by design, because a bounded one would reopen

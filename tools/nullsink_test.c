@@ -2,19 +2,24 @@
 
 /* tools/nullsink_test.c -- standalone test binary for NullSink in
    src/audio/sink.c (amendment 10, E3 and E4). Links sink.c, ring.c and
-   trace.c under TSan; no engine, no device, no kurono process. T1 is
-   the only pcm_ring producer, NullSink's T4 the only consumer.
+   trace.c under TSan; no device, no kurono process. Modes (a) and (b):
+   T1 is the only pcm_ring producer, NullSink's T4 the only consumer.
+   Mode (c) links engine.c for the park handshake (amendment 11).
 
    Usage: nullsink_test [seconds]   (live-producer mode, default 10) */
 
+#include "../include/audio/engine.h"
 #include "../include/audio/format.h"
 #include "../include/audio/ring.h"
 #include "../include/audio/sink.h"
 #include "../include/audio/trace.h"
 
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static int g_failures = 0;
@@ -36,6 +41,8 @@ static int g_failures = 0;
 #define MAX_CHANNELS      2u   /* f32 stereo is pinned (format.h) */
 #define LIVE_SEED         12345u
 #define LIVE_DRY_PERIODS  5u   /* underruns per starve phase before refilling */
+#define PARK_HOLD_MS      100  /* mode (c): park_sync must still be waiting after this */
+#define PARK_LIMIT_MS     2000 /* mode (c): bound on every other wait */
 
 static float g_buf[MAX_BLOCK_FRAMES * MAX_CHANNELS]; /* silence */
 
@@ -187,7 +194,176 @@ test_live_conservation(AudioSink * s, const SessionFormat * f, double seconds)
          periods - p0, sink_underrun_count() - u0, dry, written, late);
 } /* test_live_conservation */
 
-/* main: open NullSink, run mode (a) then mode (b), tear down in
+/* Gate: mode (c)'s AudioSource. open() and seek() block until the test
+   opens the gate, so T2 can be held inside do_play or do_seek while its
+   parked flag still reads 1. read() is endless silence. */
+typedef struct {
+  pthread_mutex_t mtx;
+  pthread_cond_t  cond;
+  int             inside; /* T2 is blocked in open or seek */
+  int             open;   /* gate open: open and seek return */
+} Gate;
+
+static Gate g_gate = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
+
+/* gate_block: park the calling thread (T2) until the gate opens. Takes
+   nothing, returns nothing. */
+static void
+gate_block(void)
+{
+  pthread_mutex_lock(&g_gate.mtx);
+  g_gate.inside = 1;
+  pthread_cond_broadcast(&g_gate.cond);
+  while (!g_gate.open) {
+    pthread_cond_wait(&g_gate.cond, &g_gate.mtx);
+  }
+  g_gate.inside = 0;
+  pthread_mutex_unlock(&g_gate.mtx);
+} /* gate_block */
+
+/* gate_set: close (0) or open (1) the gate. Takes the new state,
+   returns nothing. */
+static void
+gate_set(int open)
+{
+  pthread_mutex_lock(&g_gate.mtx);
+  g_gate.open = open;
+  pthread_cond_broadcast(&g_gate.cond);
+  pthread_mutex_unlock(&g_gate.mtx);
+} /* gate_set */
+
+/* gate_wait_inside: wait up to PARK_LIMIT_MS for T2 to block in the
+   gate. Takes nothing, returns 1 if it did, 0 on timeout. */
+static int
+gate_wait_inside(void)
+{
+  struct timespec dl;
+  clock_gettime(CLOCK_REALTIME, &dl);
+  dl.tv_sec += PARK_LIMIT_MS / 1000;
+  pthread_mutex_lock(&g_gate.mtx);
+  int rc = 0;
+  while (!g_gate.inside && rc == 0) {
+    rc = pthread_cond_timedwait(&g_gate.cond, &g_gate.mtx, &dl);
+  }
+  int inside = g_gate.inside;
+  pthread_mutex_unlock(&g_gate.mtx);
+  return inside;
+} /* gate_wait_inside */
+
+/* gsrc_open: AudioSource.open, blocking in the gate. Takes self (unused),
+   the path (ignored) and the info to fill, returns 0. */
+static int
+gsrc_open(void * self, const char * path, StreamInfo * out_info)
+{
+  (void) self;
+  (void) path;
+  gate_block();
+  if (out_info != NULL) {
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->sample_rate = 48000;
+    out_info->channels    = 2;
+    snprintf(out_info->codec, sizeof(out_info->codec), "gate");
+  }
+  return 0;
+} /* gsrc_open */
+
+/* gsrc_read: AudioSource.read, endless silence. Takes self (unused), the
+   destination and the frame count, returns the frame count. */
+static long
+gsrc_read(void * self, float * dst, long frames)
+{
+  (void) self;
+  memset(dst, 0, (size_t) frames * MAX_CHANNELS * sizeof(float));
+  return frames;
+} /* gsrc_read */
+
+/* gsrc_seek: AudioSource.seek, blocking in the gate. Takes self (unused)
+   and the target, returns 0. */
+static int
+gsrc_seek(void * self, int64_t ms)
+{
+  (void) self;
+  (void) ms;
+  gate_block();
+  return 0;
+} /* gsrc_seek */
+
+/* gsrc_nop: AudioSource.close and destroy; nothing to release. Takes
+   self (unused), returns nothing. */
+static void
+gsrc_nop(void * self)
+{
+  (void) self;
+} /* gsrc_nop */
+
+static atomic_int g_park_done;
+
+/* park_thread: call engine_park_sync from a second thread so the test
+   can observe whether it returns. Takes the Engine, returns NULL. */
+static void *
+park_thread(void * arg)
+{
+  engine_park_sync((Engine *) arg);
+  atomic_store_explicit(&g_park_done, 1, memory_order_release);
+  return NULL;
+} /* park_thread */
+
+/* park_held: start park_thread while T2 is held in the gate, check it
+   is still waiting after PARK_HOLD_MS, open the gate, and check it then
+   returns with T2 paused. Takes the Engine and a label, returns nothing. */
+static void
+park_held(Engine * e, const char * what)
+{
+  pthread_t th;
+  atomic_store_explicit(&g_park_done, 0, memory_order_relaxed);
+  CHECK(pthread_create(&th, NULL, park_thread, e) == 0, "%s: pthread_create", what);
+  sleep_ns(PARK_HOLD_MS * 1000000L);
+  CHECK(atomic_load_explicit(&g_park_done, memory_order_acquire) == 0,
+        "%s: engine_park_sync returned while T2 was inside the command", what);
+  gate_set(1);
+  for (int i = 0; i < PARK_LIMIT_MS
+       && !atomic_load_explicit(&g_park_done, memory_order_acquire); i++) {
+    sleep_ns(1000000L);
+  }
+  CHECK(atomic_load_explicit(&g_park_done, memory_order_acquire) == 1,
+        "%s: engine_park_sync did not return after the command finished", what);
+  pthread_join(th, NULL);
+  CHECK(engine_state(e) == ENG_PAUSED, "%s: T2 not paused after park_sync", what);
+} /* park_held */
+
+/* test_park_ack: mode (c), amendment 11. Holds T2 inside a play and then
+   a seek it popped while parked, and checks engine_park_sync waits for
+   each to finish instead of returning on the stale parked flag. The sink
+   is open but not started, so no T4 runs. Takes the open sink and its
+   format, returns nothing. */
+static void
+test_park_ack(AudioSink * s, const SessionFormat * f)
+{
+  AudioSource src = { gsrc_open, gsrc_read, gsrc_seek, gsrc_nop, NULL, gsrc_nop, &g_gate };
+  Engine *    e   = engine_create(f, src, s);
+  if (e == NULL) {
+    CHECK(0, "engine_create failed");
+    return;
+  }
+  CHECK(engine_start(e) == 0, "engine_start failed");
+
+  gate_set(0);
+  engine_play(e, "gate", 1);
+  CHECK(gate_wait_inside(), "T2 never entered open()");
+  park_held(e, "play");
+
+  gate_set(0);
+  engine_seek(e, 1000);
+  CHECK(gate_wait_inside(), "T2 never entered seek()");
+  park_held(e, "seek");
+
+  engine_quit(e);
+  engine_join(e);
+  engine_destroy(e);
+  printf("park: play and seek held inside the gate\n");
+} /* test_park_ack */
+
+/* main: open NullSink, run modes (a), (b) and (c), tear down in
    IV.9.b order. Takes an optional mode (b) duration in seconds as
    argv[1], returns 0 if every check passed, 1 otherwise. */
 int
@@ -214,6 +390,7 @@ main(int argc, char ** argv)
 
   test_e4(&s, &f);
   test_live_conservation(&s, &f, seconds);
+  test_park_ack(&s, &f);
 
   s.close(s.self);
   sink_free_rings();
