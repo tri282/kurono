@@ -337,6 +337,63 @@ sink_cb_alive(void)
   return atomic_load_explicit(&g_cb_alive, memory_order_relaxed) ? 1 : 0;
 } /* sink_cb_alive */
 
+/* session_arm: arm a fresh sink lifetime at session rate r, shared by
+   both AudioSink backends (amendment 10). Frees any previous rings,
+   allocates pcm_ring and viz_ring sized from r, resets gain to unity and
+   every callback-side counter, and registers g_frames_consumed and r
+   with audio/trace.c. Caller guarantees neither ring has a live toucher.
+   Takes the session rate, returns 0, or -1 with neither ring allocated. */
+static int
+session_arm(uint32_t r)
+{
+  /* A reopen from the device-loss ladder (DESIGN.md IV.8.b step 3)
+     arrives here with the previous device lifetime's rings still
+     allocated, and the negotiated rate may differ, so they are sized
+     afresh rather than reused. Freeing first is what keeps that from
+     leaking both buffers on every reopen. Legal at this exact point and
+     nowhere else: the ladder parks T2 synchronously before step 2
+     (engine_park_sync), and step 2's ma_device_uninit has already joined
+     T3 -- both touchers of pcm_ring are provably gone, the same
+     condition IV.9.b step 6 requires. ring_free is idempotent, so the
+     first-open path pays one pair of free(NULL) calls. */
+  sink_free_rings();
+
+  size_t pcm_bytes = (size_t) PCM_LEAD_SECONDS * r * SINK_CHANNELS * sizeof(float);
+  if (ring_init(&g_pcm_ring, pcm_bytes) != 0) {
+    return -1;
+  }
+  if (ring_init(&g_viz_ring, VIZ_RING_BYTES) != 0) {
+    ring_free(&g_pcm_ring);
+    return -1;
+  }
+  atomic_store_explicit(&g_rings_ready, true, memory_order_release);
+
+  union {
+    uint32_t bits;
+    float    f;
+  } unity;
+  unity.f = 1.0f;
+  atomic_store_explicit(&g_gain_bits, unity.bits, memory_order_relaxed);
+
+  atomic_store_explicit(&g_flushing, false, memory_order_release);
+  atomic_store_explicit(&g_frames_consumed, 0, memory_order_release);
+  atomic_store_explicit(&g_cb_seq, 0, memory_order_release);
+  atomic_store_explicit(&g_underrun_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_device_event, -1, memory_order_release);
+  g_ring_low_best = SIZE_MAX; /* fresh device lifetime -- see its declaration */
+
+  /* Register g_frames_consumed and R with audio/trace.c (trace.h: "call
+     once, from sink.c ... once R is known"). Must happen before
+     ma_device_start (sink_start_impl, called separately) -- T3 does not
+     exist as a running consumer of these until then, but trace_emit is
+     reachable from the very first pre-fill invocation on T1
+     (DESIGN.md IV.1), so both registrations belong here, at the end of
+     open, not deferred to start. */
+  trace_set_frame_counter(&g_frames_consumed);
+  trace_set_sample_rate(r);
+  return 0;
+} /* session_arm */
+
 /* sink_open_impl: AudioSink.open. Opens the device once at the
    negotiated native rate (DESIGN.md II.2, sampleRate = 0), reads back
    the session format into *inout_fmt, and allocates pcm_ring/viz_ring
@@ -401,55 +458,11 @@ sink_open_impl(void * self, SessionFormat * inout_fmt,
   inout_fmt->internal_format   = (int) g_device.playback.internalFormat;
   inout_fmt->internal_channels = (uint32_t) g_device.playback.internalChannels;
 
-  /* A reopen from the device-loss ladder (DESIGN.md IV.8.b step 3)
-     arrives here with the previous device lifetime's rings still
-     allocated, and the negotiated rate may differ, so they are sized
-     afresh rather than reused. Freeing first is what keeps that from
-     leaking both buffers on every reopen. Legal at this exact point and
-     nowhere else: the ladder parks T2 synchronously before step 2
-     (engine_park_sync), and step 2's ma_device_uninit has already joined
-     T3 -- both touchers of pcm_ring are provably gone, the same
-     condition IV.9.b step 6 requires. ring_free is idempotent, so the
-     first-open path pays one pair of free(NULL) calls. */
-  sink_free_rings();
-
-  size_t pcm_bytes = (size_t) PCM_LEAD_SECONDS * r * SINK_CHANNELS * sizeof(float);
-  if (ring_init(&g_pcm_ring, pcm_bytes) != 0) {
+  if (session_arm(r) != 0) {
     ma_device_uninit(&g_device);
     ma_context_uninit(&g_context);
     return -1;
   }
-  if (ring_init(&g_viz_ring, VIZ_RING_BYTES) != 0) {
-    ring_free(&g_pcm_ring);
-    ma_device_uninit(&g_device);
-    ma_context_uninit(&g_context);
-    return -1;
-  }
-  atomic_store_explicit(&g_rings_ready, true, memory_order_release);
-
-  union {
-    uint32_t bits;
-    float    f;
-  } unity;
-  unity.f = 1.0f;
-  atomic_store_explicit(&g_gain_bits, unity.bits, memory_order_relaxed);
-
-  atomic_store_explicit(&g_flushing, false, memory_order_release);
-  atomic_store_explicit(&g_frames_consumed, 0, memory_order_release);
-  atomic_store_explicit(&g_cb_seq, 0, memory_order_release);
-  atomic_store_explicit(&g_underrun_count, 0, memory_order_relaxed);
-  atomic_store_explicit(&g_device_event, -1, memory_order_release);
-  g_ring_low_best = SIZE_MAX; /* fresh device lifetime -- see its declaration */
-
-  /* Register g_frames_consumed and R with audio/trace.c (trace.h: "call
-     once, from sink.c ... once R is known"). Must happen before
-     ma_device_start (sink_start_impl, called separately) -- T3 does not
-     exist as a running consumer of these until then, but trace_emit is
-     reachable from the very first pre-fill invocation on T1
-     (DESIGN.md IV.1), so both registrations belong here, at the end of
-     open, not deferred to start. */
-  trace_set_frame_counter(&g_frames_consumed);
-  trace_set_sample_rate(r);
 
   atomic_store_explicit(&g_device_open, true, memory_order_release);
   return 0;
