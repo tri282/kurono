@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 /*
- * audio/sink.c -- the AudioSink implementation over miniaudio, and the
- * project's rank-1 invariant: the data callback (DESIGN.md IV.2) and
- * the notification callback (DESIGN.md IV.3), both running on T3.
+ * audio/sink.c -- the two AudioSink backends, and the project's rank-1
+ * invariant: the data callback (DESIGN.md IV.2) and the notification
+ * callback (DESIGN.md IV.3). sink_get is the miniaudio backend, whose
+ * callbacks run on T3. sink_get_null is NullSink (amendment 10), which
+ * opens no device and calls the same data callback from its own thread,
+ * T4; the notification callback never runs under it. NullSink calls no
+ * ma_* function and uses ma_format_f32 only as a value.
  *
  * Every miniaudio type and every miniaudio call in the whole tree lives
  * in this one file (CLAUDE.md; DESIGN.md III.2, XII.4 item 6/checklist
@@ -42,7 +46,9 @@
 #include "../../include/audio/sink.h"
 #include "../../include/audio/trace.h"
 
+#include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -93,6 +99,18 @@
 #define TONE_DURATION_SECONDS 3
 #define TONE_AMPLITUDE        0.2f
 #define TONE_CHUNK_FRAMES     1024
+
+/* Amendment 10: NullSink, the deviceless backend. 900 frames at 48 kHz
+   is the period measured on this host's PulseAudio device (DESIGN.md
+   IV.9.a.i); the real backend negotiates its own and has no constant. */
+#define NULL_SINK_RATE          48000u
+#define NULL_SINK_PERIOD_FRAMES 900u
+#define NULL_SINK_PERIOD_NS \
+  ((long) ((uint64_t) NULL_SINK_PERIOD_FRAMES * 1000000000u / NULL_SINK_RATE))
+_Static_assert(((uint64_t) NULL_SINK_PERIOD_FRAMES * 1000000000u) % NULL_SINK_RATE == 0,
+               "NullSink period must be a whole number of nanoseconds");
+_Static_assert(NULL_SINK_PERIOD_NS < 1000000000L,
+               "one carry per period in null_sink_thread");
 
 /* ---------------------------------------------------------------------
  * Module state. Ownership per DESIGN.md IV.1: T3 exclusively owns
@@ -184,6 +202,19 @@ static int g_event_pipe_w = -1;
    the thread that may. */
 static SinkNotifyCallback g_on_notify   = NULL;
 static void *             g_notify_user = NULL;
+
+/* NullSink (amendment 10). T1 writes g_null_thread and both flags in
+   null_start_impl/null_stop_impl only (T1-only, D-5). g_null_started is
+   true strictly before T4 exists and false strictly after it is joined,
+   which is what keeps T2's IV.7.5 fence skip honest under NullSink. */
+static pthread_t   g_null_thread;
+static atomic_bool g_null_started = false;
+static atomic_bool g_null_quit    = false;
+
+/* T4-written, read by T1 only after pthread_join, which is the edge. */
+static uint64_t g_null_periods;
+static long     g_null_late_max_ns;
+static int      g_null_pace_ok = 1;
 
 /* apply_gain: multiply n interleaved f32 samples in buf by the current
    gain, in place. T3-only. One relaxed atomic load, one union
@@ -284,6 +315,73 @@ kurono_notification_callback(const ma_device_notification * n)
     (void) write(g_event_pipe_w, "\0", 1); /* O_NONBLOCK; EAGAIN ignored */
   }
 } /* kurono_notification_callback */
+
+/* timespec_diff_ns: a - b in nanoseconds. Takes two CLOCK_MONOTONIC
+   readings, returns the signed difference. */
+static int64_t
+timespec_diff_ns(const struct timespec * a, const struct timespec * b)
+{
+  return ((int64_t) a->tv_sec - (int64_t) b->tv_sec) * 1000000000
+         + ((int64_t) a->tv_nsec - (int64_t) b->tv_nsec);
+} /* timespec_diff_ns */
+
+/* null_sink_thread: T4. Calls kurono_data_callback once per period on
+   absolute CLOCK_MONOTONIC deadlines until stop, then records the
+   pacing verdict for sink_null_pacing. The callback is the only code
+   here bound by DESIGN.md IV.2; the sleep and the clock reads sit
+   between invocations, where miniaudio's own worker waits in ppoll.
+   Takes nothing used, returns NULL. */
+static void *
+null_sink_thread(void * arg)
+{
+  float           out[NULL_SINK_PERIOD_FRAMES * SINK_CHANNELS];
+  struct timespec t0, next, now;
+  uint64_t        n        = 0;
+  long            late_max = 0;
+
+  (void) arg;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  next = t0;
+  now  = t0;
+
+  while (!atomic_load_explicit(&g_null_quit, memory_order_acquire)) {
+    kurono_data_callback(NULL, out, NULL, NULL_SINK_PERIOD_FRAMES);
+    n++;
+
+    /* From the previous deadline, never from now: overshoot does not
+       accumulate, and a late wake catches up in a burst. */
+    next.tv_nsec += NULL_SINK_PERIOD_NS;
+    if (next.tv_nsec >= 1000000000L) {
+      next.tv_sec++;
+      next.tv_nsec -= 1000000000L;
+    }
+    /* clock_nanosleep returns the error number; errno is untouched. */
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR) {
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t late = timespec_diff_ns(&now, &next);
+    if (late > late_max) {
+      late_max = (long) late;
+    }
+  }
+
+  /* Amendment 10 E3 (D-14). The quit check precedes each invocation, so
+     after the sleep for deadline k, n == k and
+     drift == -floor(lateness_k / PERIOD_NS), which lies in
+     0 >= drift >= -floor(late_max / PERIOD_NS). Outside is a pacing
+     defect, not jitter. */
+  int64_t elapsed = timespec_diff_ns(&now, &t0);
+  int64_t drift   = (int64_t) n - elapsed / NULL_SINK_PERIOD_NS;
+  if (drift > 0 || drift < -(late_max / NULL_SINK_PERIOD_NS)) {
+    g_null_pace_ok = 0;
+  }
+
+  g_null_periods += n;
+  if (late_max > g_null_late_max_ns) {
+    g_null_late_max_ns = late_max;
+  }
+  return NULL;
+} /* null_sink_thread */
 
 /* sink_set_event_pipe: see include/audio/sink.h. */
 void
@@ -386,9 +484,9 @@ session_arm(uint32_t r)
      once, from sink.c ... once R is known"). Must happen before
      ma_device_start (sink_start_impl, called separately) -- T3 does not
      exist as a running consumer of these until then, but trace_emit is
-     reachable from the very first pre-fill invocation on T1
-     (DESIGN.md IV.1), so both registrations belong here, at the end of
-     open, not deferred to start. */
+     reachable from the very first pre-fill invocation, on T3, or on T4
+     under NullSink (amendment 10), so both registrations belong here, at
+     the end of open, not deferred to start. */
   trace_set_frame_counter(&g_frames_consumed);
   trace_set_sample_rate(r);
   return 0;
@@ -520,6 +618,94 @@ sink_close_impl(void * self)
   ma_context_uninit(&g_context);
 } /* sink_close_impl */
 
+/* null_open_impl: NullSink's AudioSink.open. T1 only (amendment 10
+   D-5). Opens no device: reports the fixed 48 kHz / 900-frame session
+   format in *inout_fmt, arms the rings and counters, and zeroes the
+   pacing stats. Ignores on_notify; nothing is ever raised. Returns 0,
+   or -1 if a sink is already open or the rings could not be allocated. */
+static int
+null_open_impl(void * self, SessionFormat * inout_fmt,
+               SinkNotifyCallback on_notify, void * user)
+{
+  (void) self;
+  (void) on_notify;
+  (void) user;
+
+  if (atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+    return -1; /* one sink per process, across both backends */
+  }
+
+  inout_fmt->sample_rate       = NULL_SINK_RATE;
+  inout_fmt->channels          = SINK_CHANNELS;
+  inout_fmt->period_frames     = NULL_SINK_PERIOD_FRAMES;
+  inout_fmt->internal_rate     = NULL_SINK_RATE;
+  inout_fmt->internal_format   = (int) ma_format_f32;
+  inout_fmt->internal_channels = SINK_CHANNELS;
+
+  if (session_arm(NULL_SINK_RATE) != 0) {
+    return -1;
+  }
+  g_null_periods     = 0;
+  g_null_late_max_ns = 0;
+  g_null_pace_ok     = 1;
+
+  atomic_store_explicit(&g_device_open, true, memory_order_release);
+  return 0;
+} /* null_open_impl */
+
+/* null_start_impl: NullSink's AudioSink.start. T1 only (amendment 10
+   D-5). Creates T4, whose first invocation is immediate. g_null_started
+   is set before the create. Returns 0 on success or if already started,
+   -1 if not open or if T4 could not be created. */
+static int
+null_start_impl(void * self)
+{
+  (void) self;
+  if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+    return -1;
+  }
+  if (atomic_load_explicit(&g_null_started, memory_order_acquire)) {
+    return 0;
+  }
+  atomic_store_explicit(&g_null_quit, false, memory_order_release);
+  atomic_store_explicit(&g_null_started, true, memory_order_release);
+  if (pthread_create(&g_null_thread, NULL, null_sink_thread, NULL) != 0) {
+    atomic_store_explicit(&g_null_started, false, memory_order_release);
+    return -1; /* the ladder's start-failure entry, as a failed ma_device_start */
+  }
+  return 0;
+} /* null_start_impl */
+
+/* null_stop_impl: NullSink's AudioSink.stop. T1 only (amendment 10
+   D-5). Synchronous: joins T4, so the callback is not running on return
+   (DESIGN.md IV.9.b step 2). Takes self (unused), returns 0. */
+static int
+null_stop_impl(void * self)
+{
+  (void) self;
+  if (!atomic_load_explicit(&g_null_started, memory_order_acquire)) {
+    return 0;
+  }
+  atomic_store_explicit(&g_null_quit, true, memory_order_release);
+  pthread_join(g_null_thread, NULL);
+  atomic_store_explicit(&g_null_started, false, memory_order_release); /* after the join: F6 */
+  return 0;
+} /* null_stop_impl */
+
+/* null_close_impl: NullSink's AudioSink.close. T1 only (amendment 10
+   D-5). Joins T4 if still running and clears g_device_open. Never frees
+   the rings (IV.9.b step 6 does, after T2's join) and never touches
+   g_event_pipe_w. Takes self (unused), returns nothing. */
+static void
+null_close_impl(void * self)
+{
+  if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+    return;
+  }
+  (void) null_stop_impl(self); /* no-op unless IV.9.b step 2 was skipped */
+  atomic_store_explicit(&g_device_open, false, memory_order_release);
+} /* null_close_impl */
+
 /* sink_free_rings: see include/audio/sink.h. */
 void
 sink_free_rings(void)
@@ -575,12 +761,26 @@ sink_get(AudioSink * out)
   out->self  = NULL;
 } /* sink_get */
 
-/* sink_is_started: see include/audio/sink.h. Pure atomic load, nothing
-   else -- checked against plan.md VII gap 2's three constraints. */
+/* sink_get_null: see include/audio/sink.h. */
+void
+sink_get_null(AudioSink * out)
+{
+  out->open  = null_open_impl;
+  out->start = null_start_impl;
+  out->stop  = null_stop_impl;
+  out->close = null_close_impl;
+  out->self  = NULL;
+} /* sink_get_null */
+
+/* sink_is_started: see include/audio/sink.h. Pure atomic load on either
+   backend, nothing else -- checked against plan.md VII gap 2's three
+   constraints. */
 int
 sink_is_started(const AudioSink * s)
 {
-  (void) s;
+  if (s != NULL && s->start == null_start_impl) {
+    return atomic_load_explicit(&g_null_started, memory_order_acquire) ? 1 : 0;
+  }
   if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
     return 0;
   }
@@ -595,6 +795,16 @@ sink_underrun_count(void)
 {
   return atomic_load_explicit(&g_underrun_count, memory_order_relaxed);
 } /* sink_underrun_count */
+
+/* sink_null_pacing: see include/audio/sink.h. Reads plain T4-written
+   statics; legal only after AudioSink.stop or close has joined T4. */
+int
+sink_null_pacing(uint64_t * periods, long * late_max_ns)
+{
+  *periods     = g_null_periods;
+  *late_max_ns = g_null_late_max_ns;
+  return g_null_pace_ok;
+} /* sink_null_pacing */
 
 /* sink_pcm_ring: see include/audio/sink.h. */
 Ring *

@@ -4,15 +4,18 @@
 #define KURONO_AUDIO_SINK_H
 
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "format.h"
 #include "ring.h"
 
 /*
  * AudioSink: anything that consumes PCM in the session format
- * (DESIGN.md VI). audio/sink.c is the only implementation and the only
- * file permitted to use miniaudio (CLAUDE.md; DESIGN.md III.2) -- no
- * miniaudio type appears in this header. AudioSink.open takes no data
+ * (DESIGN.md VI). audio/sink.c holds both implementations, the
+ * miniaudio backend (sink_get) and NullSink (sink_get_null, amendment
+ * 10, which uses no miniaudio type), and is the only file permitted to
+ * use miniaudio (CLAUDE.md; DESIGN.md III.2) -- no miniaudio type
+ * appears in this header. AudioSink.open takes no data
  * callback: sink.c owns the entire IV.2 callback body itself (plan.md
  * VII gap 3, closed 2026-08-07 -- SinkDataCallback does not exist).
  * AudioSink.stop is contractually synchronous: the callback is provably
@@ -33,20 +36,33 @@ typedef struct {
  * (DESIGN.md VI), so every field this implementation needs is a
  * process-wide static in sink.c and self is unused (NULL) -- kept in
  * the struct only for symmetry with AudioSource, whose interface this
- * mirrors. Takes the AudioSink to fill, returns nothing.
+ * mirrors. This is the miniaudio backend; see sink_get_null for the
+ * deviceless one. Takes the AudioSink to fill, returns nothing.
  */
 void sink_get(AudioSink * out);
 
 /*
- * sink_is_started: true iff the device is in ma_device_state_started.
- * A pure atomic load of ma_device.state and nothing else -- no
+ * sink_get_null: fill *out with the NullSink vtable (amendment 10). No
+ * device and no miniaudio context: start creates T4, which calls the
+ * same data callback once per 900-frame period at 48 kHz on absolute
+ * CLOCK_MONOTONIC deadlines, and stop joins it. Shares g_device_open
+ * with the miniaudio backend, so one sink per process holds across
+ * both. open, start, stop and close are T1 only (D-5). self is NULL.
+ * Takes the AudioSink to fill, returns nothing.
+ */
+void sink_get_null(AudioSink * out);
+
+/*
+ * sink_is_started: true iff the device is in ma_device_state_started,
+ * or, under NullSink, iff g_null_started is set (true strictly while T4
+ * can run, amendment 10). A pure atomic load and nothing else -- no
  * logging, no lazy reopen, no touching the device-event slot, no
  * caching. const-qualified so the no-mutation contract is in the type.
  * Safe to call from any thread; the intended callers are T1 (the
  * device-loss watchdog, phase 8) and T2 (the seek fence's fast path,
- * phase 7) -- never T3 (DESIGN.md IV.7.5, IV.8.a; plan.md VII gap 2,
- * closed 2026-08-08). Takes the AudioSink, returns 1 if started, 0
- * otherwise (including "never opened").
+ * phase 7) -- never T3, nor T4 under NullSink (DESIGN.md IV.7.5,
+ * IV.8.a; plan.md VII gap 2, closed 2026-08-08). Takes the AudioSink,
+ * returns 1 if started, 0 otherwise (including "never opened").
  */
 int sink_is_started(const AudioSink * s);
 
@@ -64,11 +80,23 @@ int sink_is_started(const AudioSink * s);
  * notice.
  *
  * Note the floor amendment 05 gave it: PulseAudio's ma_device_start
- * pre-fills by invoking the callback before uncorking, and pcm_ring
- * may still be empty then, so expect at most one per play transition.
- * Read it as "underruns beyond one per play". Takes nothing.
+ * pre-fills by invoking the callback on T3 before uncorking, and
+ * pcm_ring may still be empty then, so expect at most one per play
+ * transition. NullSink's first invocation is immediate on T4 and always
+ * underruns into an empty ring (amendment 10). Read it as "underruns
+ * beyond one per play". Takes nothing.
  */
 unsigned sink_underrun_count(void);
+
+/*
+ * sink_null_pacing: NullSink's pacing record (amendment 10 E3). T1
+ * only, and only after AudioSink.stop or close has joined T4. Fills
+ * *periods with the invocations since open and *late_max_ns with the
+ * worst wake lateness, and returns 1 if every start cycle's drift stayed
+ * in band, 0 otherwise. Meaningless for the miniaudio backend (returns
+ * 1 and zeros).
+ */
+int sink_null_pacing(uint64_t * periods, long * late_max_ns);
 
 /*
  * sink_cb_alive: 1 iff the data callback is currently executing, from
