@@ -108,7 +108,7 @@ OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
         check-theme check-deps ring-stress queue-test keymap-test \
-        testsrc-test fts-query-test install uninstall clean
+        testsrc-test fts-query-test nullsink-test install uninstall clean
 
 all: kurono
 
@@ -274,6 +274,16 @@ build/tsan/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
+# Amendment 10: NullSink under TSan with the test as producer. Links
+# sink.o, which pulls miniaudio's implementation in as dead code: no
+# ma_* call runs, and no pkg-config package is needed to link it.
+nullsink-test: tools/nullsink_test
+
+tools/nullsink_test: CFLAGS += -fsanitize=thread
+tools/nullsink_test: build/tsan/tools/nullsink_test.o build/tsan/audio/sink.o \
+                     build/tsan/audio/ring.o build/tsan/audio/trace.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lpthread -lm -ldl
+
 # Pure, dependency-free (DESIGN.md III.2, XII.2 testable tier): no
 # PKGS, no check-deps, no sanitiser by default -- the ASan+UBSan variant
 # in phase-9-queue.md III is invoked directly with gcc, not through this
@@ -349,7 +359,7 @@ uninstall:
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
 	       tools/queue_test tools/keymap_test tools/testsrc_test \
-	       tools/fts_query_test
+	       tools/fts_query_test tools/nullsink_test
 
 # The .d files written by DEPFLAGS above. A wildcard rather than a list
 # derived from SRCS: the tools' objects live under build/<mode>/tools/
