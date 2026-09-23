@@ -4,6 +4,23 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-09-23
+
+### Added
+
+- `--play FILE --null-sink` runs the headless playback diagnostics without an
+  audio device, so seeking and teardown can be checked under a sanitiser on a
+  machine with no sound server.
+- `--play FILE --null-sink --fault MS` simulates a decode error mid-track, to
+  check that a failing file is reported and skipped rather than fatal.
+
+### Fixed
+
+- Losing the audio device (unplugged, or the output stalling) at the moment a
+  track was starting or a paused track was seeking could let the recovery and
+  the decoder reset the same playback buffer at once, corrupting playback
+  state. Recovery now waits for the play or seek to finish first.
+
 ## [1.1.0] — 2026-09-15
 
 ### Changed
@@ -136,7 +153,8 @@ through those.
   the first 200 in scan order rather than the 200 most relevant. Narrowing the
   query is the fix; anything matching under 200 rows is ranked normally.
 
-[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...main
+[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.2.0...main
+[1.2.0]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...v1.2.0
 [1.1.0]: https://gitlab.com/tri282/kurono/-/compare/v1.0.1...v1.1.0
 [1.0.1]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...v1.0.1
 [1.0.0]: https://gitlab.com/tri282/kurono/-/tags/v1.0.0

@@ -294,6 +294,7 @@ make clean
 | `make keymap-test` | | Build `tools/keymap_test`. |
 | `make testsrc-test` | | Build `tools/testsrc_test`. |
 | `make fts-query-test` | | Build `tools/fts_query_test`. Links `sqlite3` for the real FTS5 parser. |
+| `make nullsink-test` | `-fsanitize=thread` | Build `tools/nullsink_test`, which drives the playback callback from a timer thread with no audio device. |
 
 Object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.
 
@@ -312,6 +313,8 @@ Object files carry `-MMD -MP`, so editing a header rebuilds exactly the translat
 | `--play FILE --seek MS` | The same, seeking once to `MS` as soon as the track is open. |
 | `--play FILE --seek-stress N` | `N` randomised seeks in a row. The flush-handshake driver, and what to run under `make tsan`. |
 | `--play FILE --seek-paused MS` | Seek while paused, the case where the ring and the device disagree about what has been consumed. |
+| `--play FILE --null-sink [...]` | Run the same diagnostics with no audio device: a timer thread stands in for the sound card. Combines with `--seek`, `--seek-stress` and `--seek-paused`. At exit it prints a frame-accounting and a pacing verdict, and fails if either is off. |
+| `--play FILE --null-sink --fault MS` | Simulate a decode error `MS` milliseconds in, using a synthetic source in place of `FILE` (required but ignored). Checks that a failing track is reported and skipped rather than fatal. |
 
 ### Notes for contributors
 
@@ -337,7 +340,7 @@ kurono/
 └── Makefile
 ```
 
-`tools/` holds the parts pure enough to test without a device, a terminal or any music: `ring_stress` (the SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test` and `fts_query_test`. Each links against exactly the one source file it exercises.
+`tools/` holds the parts pure enough to test without a device, a terminal or any music: `ring_stress` (the SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test`, `fts_query_test` and `nullsink_test`. Most link against exactly the one source file they exercise; `keymap_test`, `fts_query_test` and `nullsink_test` need a few more.
 
 Third-party use is confined on purpose, all ffmpeg lives in `audio/decoder.c`, all miniaudio in `audio/sink.c`, all SQLite in `library/db.c`, all termbox2 in `ui/tui.c`. `ui/` may call `library/` and `audio/`; neither ever calls back into `ui/`, they emit events instead. `make check` enforces this with grep, so a violation fails the build rather than being noticed in review.
 
