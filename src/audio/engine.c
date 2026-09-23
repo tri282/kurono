@@ -992,6 +992,15 @@ engine_join(Engine * e)
   e->thread_started = 0;
 } /* engine_join */
 
+/* engine_frames_account: see include/audio/engine.h. */
+void
+engine_frames_account(const Engine * e, uint64_t * written,
+                      uint64_t * in_ring)
+{
+  *written = e->write_frames;
+  *in_ring = ring_fill(e->pcm_ring) / (ENGINE_CHANNELS * sizeof(float));
+} /* engine_frames_account */
+
 /* engine_play: see include/audio/engine.h. */
 void
 engine_play(Engine * e, const char * path, int64_t track_id)

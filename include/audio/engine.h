@@ -175,6 +175,17 @@ int engine_start(Engine * e);
 void engine_join(Engine * e);
 
 /*
+ * engine_frames_account: T2's monotonic write-frame counter (frames
+ * written into pcm_ring since the last pcm_flush_and_resync) and the
+ * whole frames still in pcm_ring, for amendment 10 E2. Legal only after
+ * engine_join has returned, for the reason engine_destroy is: the fields
+ * are T2's and unsynchronised. Takes the Engine and two out-params,
+ * returns nothing.
+ */
+void engine_frames_account(const Engine * e, uint64_t * written,
+                           uint64_t * in_ring);
+
+/*
  * engine_play / engine_pause / engine_resume / engine_seek /
  * engine_stop / engine_quit / engine_set_gain: T1-side convenience
  * wrappers over the command channel (DESIGN.md IV.6's payload list).

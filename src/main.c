@@ -515,6 +515,7 @@ typedef struct {
   PlayMode     mode;
   int64_t      mode_arg;
   int          driven;       /* latches the one-shot driver */
+  int          null_sink;    /* amendment 10: set by run_play only; run_tui leaves 0 */
 
   /* Raised across the ladder's own device teardown and reopen. Step 2's
      ma_device_stop and step 6's ma_device_start each raise a
@@ -3437,11 +3438,22 @@ player_repaint(Player * p)
 static void
 shutdown_all(Player * p)
 {
+  /* Amendment 10 E2/E3. Read with T4 joined (step 2) and T2 joined
+     (step 5), before step 6 frees the ring; printed after step 8 with
+     cb_alive, for the same reason. NullSink runs only: on the real
+     backend browse-only resets g_frames_consumed without T2's counter. */
+  int      ns_run       = (p->null_sink && p->e != NULL);
+  int      ns_conserved = 1;
+  int      ns_paced     = 1;
+  uint64_t ns_w = 0, ns_c = 0, ns_f = 0, ns_periods = 0;
+  long     ns_late = 0;
+
   /* 1 */ atomic_store_explicit(&g_shutdown, true, memory_order_release);
 
   /* 2. Synchronous: on return T3 has finished its last invocation and
-        will not be called again. Both calls are no-ops when no device is
-        open, which is the browse-only and mid-ladder case. */
+        will not be called again (T4 under NullSink). Both calls are
+        no-ops when no device is open, which is the browse-only and
+        mid-ladder case. */
   p->sink.stop(p->sink.self);
 
   /* The four-line residual-risk-2 mitigation phase 5 adopted: step 2
@@ -3455,7 +3467,9 @@ shutdown_all(Player * p)
 
   /* 3. Joins T3. g_event_pipe_w must still be open through this call:
         step 2 fired a `stopped` notification from T3, which writes to
-        it. event_destroy closes it at step 9 and nowhere earlier. */
+        it. event_destroy closes it at step 9 and nowhere earlier. Under
+        NullSink, T4 was already joined in step 2's stop; this join is a
+        no-op (no T3 exists in a --null-sink process, D-13). */
   p->sink.close(p->sink.self);
 
   /* 4 and 5. Guarded because a startup that failed before engine_create
@@ -3466,8 +3480,15 @@ shutdown_all(Player * p)
     /* 5 */ engine_join(p->e); /* the only legal way to know T2 is done */
   }
 
-  /* 6. Both touchers of pcm_ring are now provably gone: T3 joined by
-        step 3, T2 by step 5. engine_destroy frees boundary_ring, whose
+  if (ns_run) {
+    engine_frames_account(p->e, &ns_w, &ns_f);
+    ns_c = atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
+    ns_conserved = (ns_w == ns_c + ns_f);
+    ns_paced     = sink_null_pacing(&ns_periods, &ns_late);
+  }
+
+  /* 6. Both touchers of pcm_ring are now provably gone: T3 (or T4) by
+        step 2/3, T2 by step 5. engine_destroy frees boundary_ring, whose
         only toucher is the joined T2, and closes whatever file the
         AudioSource still had open. */
   sink_free_rings();
@@ -3489,6 +3510,17 @@ shutdown_all(Player * p)
   if (cb_alive) {
     fprintf(stderr, "kurono: WARNING: data callback still alive after "
                     "AudioSink.stop returned (DESIGN.md IV.9.b step 2)\n");
+  }
+
+  if (ns_run) {
+    fprintf(stderr, "null-sink: write=%" PRIu64 " consumed=%" PRIu64
+                    " ring=%" PRIu64 " -- %s\n", ns_w, ns_c, ns_f,
+            ns_conserved ? "CONSERVED" : "NOT CONSERVED");
+    fprintf(stderr, "null-sink: %" PRIu64 " periods, max lateness %ld us -- %s\n",
+            ns_periods, ns_late / 1000, ns_paced ? "PACING OK" : "PACING FAIL");
+    if (!ns_conserved || !ns_paced) {
+      p->status = 1;
+    }
   }
 
   /* 9. UI state, then the config strings and the event loop -- which
@@ -3810,8 +3842,13 @@ player_start(Player * p, const char * who, int * have_device)
      notification callback set, but NOT ma_device_start. The pipe's write
      fd is cached first, because ma_device_init itself can raise a
      notification. pcm_ring and viz_ring are allocated inside this call,
-     sized from the negotiated format. */
-  sink_get(&p->sink);
+     sized from the negotiated format. Under NullSink (amendment 10) no
+     context or device is initialised; rings are allocated at 48 kHz. */
+  if (p->null_sink) {
+    sink_get_null(&p->sink);
+  } else {
+    sink_get(&p->sink);
+  }
   sink_set_event_pipe(event_pipe_write_fd(p->el));
   *have_device = (p->sink.open(p->sink.self, &p->fmt, player_on_notify, p) == 0);
   if (!*have_device) {
@@ -3875,8 +3912,9 @@ player_start(Player * p, const char * who, int * have_device)
 } /* player_start */
 
 /*
- * run_play: implements --play FILE [--seek MS | --seek-stress N |
- * --seek-paused MS] (plan.md VI.8, phase-7-engine.md I.9): DESIGN.md
+ * run_play: implements --play FILE [--null-sink] [--seek MS |
+ * --seek-stress N | --seek-paused MS] (plan.md VI.8, phase-7-engine.md
+ * I.9): DESIGN.md
  * IV.9.a's ten startup steps in order, the IV.9.a step 10 event loop with
  * the IV.8.a device-loss watchdog on its redraw tick and the IV.8.b
  * reopen ladder on its reconnect timer, and IV.9.b's teardown table on
@@ -3889,21 +3927,24 @@ player_start(Player * p, const char * who, int * have_device)
  * XI.2): the rings are allocated at the default session format, T2 is
  * created and parked anyway, and the run reports browse-only.
  *
- * Takes the file path, the PlayMode, and its argument (a seek target in
+ * Takes the file path, the PlayMode, its argument (a seek target in
  * ms for PLAY_SEEK_ONCE and PLAY_SEEK_PAUSED, a seek count for
- * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN); returns 0 on a clean EOF or
- * a clean signalled exit, 1 on any open/decode failure.
+ * PLAY_SEEK_STRESS, ignored for PLAY_PLAIN), and null_sink (amendment
+ * 10: nonzero selects NullSink over the miniaudio backend in
+ * player_start step 5); returns 0 on a clean EOF or a clean signalled
+ * exit, 1 on any open/decode failure or a failed end-of-run verdict.
  */
 static int
-run_play(const char * path, PlayMode mode, int64_t mode_arg)
+run_play(const char * path, PlayMode mode, int64_t mode_arg, int null_sink)
 {
   Player p;
   memset(&p, 0, sizeof p);
-  p.mode     = mode;
-  p.mode_arg = mode_arg;
-  p.dev      = DEV_READY;
-  p.running  = 1;
-  p.ui       = 0;
+  p.mode      = mode;
+  p.mode_arg  = mode_arg;
+  p.null_sink = null_sink;
+  p.dev       = DEV_READY;
+  p.running   = 1;
+  p.ui        = 0;
 
   int have_device = 0;
   if (player_start(&p, "--play", &have_device) != 0) {
@@ -3928,10 +3969,10 @@ run_play(const char * path, PlayMode mode, int64_t mode_arg)
      device is started here, by the play transition, through the one
      function that owns the edge ordering -- the same path the TUI
      takes, so the headless harness exercises the real policy rather
-     than a second transcription of it. T3 begins and immediately
-     underruns into silence, which is correct: the first invocation
-     happens on this thread, inside the start, from PulseAudio's
-     pre-fill. */
+     than a second transcription of it. The first invocation runs on T3
+     while this thread blocks inside the start, or on T4 immediately
+     after start returns under NullSink; either way it underruns into
+     an empty ring. */
   if (player_set_play_state(&p, PLAY_PLAYING) != 0) {
     /* The ladder has it now. Headless, that means the run ends when the
        ladder gives up; there is nothing to browse. */
@@ -4164,7 +4205,8 @@ run_scan(void)
  * (sink_run_tone, plan.md VI.8) with no event loop and no audio file,
  * --decode FILE by running the phase-6 decoder smoke test (run_decode,
  * plan.md VI.8) with no device, no ring, and no threads, --play FILE
- * [--seek MS | --seek-stress N | --seek-paused MS] by running the audio
+ * [--null-sink] [--seek MS | --seek-stress N | --seek-paused MS] by
+ * running the audio
  * spine headless (run_play, plan.md VI.8) -- a real sink and decoder
  * wired together through audio/engine.c's T2, now with DESIGN.md
  * IV.9.a's startup order, the IV.9.a step 10 event loop carrying the
@@ -4230,16 +4272,19 @@ main(int argc, char * argv[])
        --tone, --decode, --dev-latency, --search, --dirs -- had each
        served exactly one phase and were deleted rather than left to rot
        as untested entry points into the middle of the program. */
-    if (argc == 3) {
-      status = run_play(argv[2], PLAY_PLAIN, 0);
-    } else if (argc == 5 && strcmp(argv[3], "--seek") == 0) {
-      status = run_play(argv[2], PLAY_SEEK_ONCE, (int64_t) atoll(argv[4]));
-    } else if (argc == 5 && strcmp(argv[3], "--seek-stress") == 0) {
-      status = run_play(argv[2], PLAY_SEEK_STRESS, (int64_t) atoll(argv[4]));
-    } else if (argc == 5 && strcmp(argv[3], "--seek-paused") == 0) {
-      status = run_play(argv[2], PLAY_SEEK_PAUSED, (int64_t) atoll(argv[4]));
+    int ns = (argc >= 4 && strcmp(argv[3], "--null-sink") == 0);
+    int a  = 3 + ns; /* index of the mode flag, if any */
+
+    if (argc == a) {
+      status = run_play(argv[2], PLAY_PLAIN, 0, ns);
+    } else if (argc == a + 2 && strcmp(argv[a], "--seek") == 0) {
+      status = run_play(argv[2], PLAY_SEEK_ONCE, (int64_t) atoll(argv[a + 1]), ns);
+    } else if (argc == a + 2 && strcmp(argv[a], "--seek-stress") == 0) {
+      status = run_play(argv[2], PLAY_SEEK_STRESS, (int64_t) atoll(argv[a + 1]), ns);
+    } else if (argc == a + 2 && strcmp(argv[a], "--seek-paused") == 0) {
+      status = run_play(argv[2], PLAY_SEEK_PAUSED, (int64_t) atoll(argv[a + 1]), ns);
     } else {
-      fprintf(stderr, "kurono: usage: --play FILE [--seek MS | "
+      fprintf(stderr, "kurono: usage: --play FILE [--null-sink] [--seek MS | "
                       "--seek-stress N | --seek-paused MS]\n");
       status = 1;
     }
@@ -4252,7 +4297,7 @@ main(int argc, char * argv[])
 
   } else {
     fprintf(stderr, "kurono: usage: kurono [--version | --paths | --scan | "
-                    "--play FILE [--seek MS | --seek-stress N | "
+                    "--play FILE [--null-sink] [--seek MS | --seek-stress N | "
                     "--seek-paused MS]]\n");
     status = 1;
   }
