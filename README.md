@@ -376,9 +376,9 @@ version, you must publish your source under the same terms, using it
 privately, however you like, carries no obligation.
 
 Third-party components and their own terms are listed in
-[`THIRD-PARTY.md`](THIRD-PARTY.md). One is worth knowing about up front:
-`kurono` requires an **LGPL** build of ffmpeg (the `libav*-free` packages on
-Fedora), not a `--enable-gpl` one.
+[`THIRD-PARTY.md`](THIRD-PARTY.md). An LGPL or GPL build of ffmpeg are both
+compatible with `kurono`'s licence; Fedora's `libav*-free` packages are a GPL
+build.
 
 ---
 

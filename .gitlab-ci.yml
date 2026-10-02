@@ -97,9 +97,8 @@ build:fedora:
     # The four lib*-free-devel packages, NOT ffmpeg-free-devel: that is a
     # metapackage pulling in three more devel packages kurono does not
     # use. RPM Fusion's ffmpeg-devel would also satisfy
-    # pkgconfig(libavformat) and must not be used -- it is a
-    # --enable-gpl build, which conflicts with how kurono is licensed
-    # (see THIRD-PARTY.md).
+    # pkgconfig(libavformat) and must not be used -- its headers
+    # mismatch the ffmpeg-free runtime (see README install section).
     - dnf -y install gcc make pkgconf-pkg-config git
                      libavformat-free-devel libavcodec-free-devel
                      libavutil-free-devel libswresample-free-devel

@@ -59,20 +59,23 @@ Resolved by `pkg-config` at build time and not distributed with this source.
 
 | Library | License |
 |---|---|
-| ffmpeg — `libavformat`, `libavcodec`, `libavutil`, `libswresample` | LGPL-2.1-or-later |
+| ffmpeg — `libavformat`, `libavcodec`, `libavutil`, `libswresample` | LGPL-2.1-or-later, or GPL when built `--enable-gpl` (see below) |
 | TagLib (`taglib_c`) | LGPL-2.1-only **or** MPL-1.1 |
 | SQLite 3 | public domain |
 
-**On the ffmpeg build.** `kurono` requires an **LGPL** ffmpeg — on Fedora, the
-`libav*-free` packages. It uses no GPL-only ffmpeg component, so it must not
-be linked against a `--enable-gpl` build if the resulting binary is
-distributed under these terms alone. See the README's install section, which
-warns about this for a different reason (ABI mismatch); the licensing reason
-is the stronger one.
+**On the ffmpeg build.** ffmpeg's libraries are LGPL-2.1-or-later by default
+and GPL when the build is configured `--enable-gpl`. Distributions differ:
+Fedora's `libav*-free` packages are configured `--enable-gpl --enable-version3`
+and report `GPL version 3 or later`. Either licence is compatible with
+`kurono`'s GPL-3.0-or-later, and `kurono` uses no GPL-only ffmpeg component. A
+`--enable-nonfree` build is not redistributable and must not be used. The
+README's install section steers Fedora users away from RPM Fusion's
+`ffmpeg-devel` for an ABI reason, not a licensing one.
 
 **On LGPL compatibility with GPL-3.0.** Both LGPL-2.1-or-later and
 LGPL-2.1-only permit conveying the covered work under the GNU GPL (LGPL-2.1
-section 3), so linking them into a GPL-3.0 program is permitted.
+section 3), so linking them into a GPL-3.0 program is permitted. A GPL-3.0-or-later
+ffmpeg is compatible directly.
 
 **On static linking.** `kurono` links these dynamically, which satisfies
 LGPL-2.1 section 6 without further obligation. **A static build changes that:**
