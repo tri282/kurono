@@ -62,11 +62,10 @@
    frameCount * SINK_CHANNELS * sizeof(float) correct by construction. */
 #define SINK_CHANNELS 2u
 
-/* DESIGN.md IV.4 rule 6: "a single #define PCM_LEAD_SECONDS in
-   audio/engine.c". engine.c does not exist until phase 7 and sink.c is
-   the only owner of pcm_ring until then (nothing else allocates it in
-   this phase) -- defined here for now, to move verbatim into engine.c
-   when phase 7 lands. See phase-5.md "Deviations" for the full note. */
+/* DESIGN.md IV.4 rule 6. pcm_ring holds this many seconds of session-rate
+   audio, which ring_init rounds up to a power of two: 1 MiB, about 2.73 s
+   at 48 kHz and 2.97 s at 44.1 kHz. main.c's PLAYER_DRAIN_MAX_TICKS is
+   derived from it by hand and moves with it. */
 #define PCM_LEAD_SECONDS 2
 
 /* ~170 ms at 48 kHz f32 stereo -- more than the ~33 ms redraw tick

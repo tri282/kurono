@@ -11,11 +11,12 @@
  * Lock-free single-producer/single-consumer byte ring.
  *
  * SPSC ASSUMPTION (binding on every caller): at any instant there is
- * exactly one thread that may call ring_write()/ring_free_space() (the
- * producer) and exactly one thread that may call ring_read()/
- * ring_read_latest()/ring_fill() (the consumer). The producer role and
- * the consumer role may migrate between threads over the ring's
- * lifetime (DESIGN.md IV.4 rule 2 -- e.g. pcm_ring's consumer is T1
+ * exactly one thread that may call ring_write() (the producer) and
+ * exactly one thread that may call ring_read()/ring_read_latest() (the
+ * consumer). ring_fill() and ring_free_space() are advisory snapshots,
+ * callable from either side or from a purely observing thread. The
+ * producer role and the consumer role may migrate between threads over
+ * the ring's lifetime (DESIGN.md IV.4 rule 2 -- e.g. pcm_ring's consumer is T1
  * during ma_device_start's pre-fill and T3 thereafter), but the two
  * roles are never held concurrently by more than one thread each, and
  * every producer/consumer handoff must carry its own happens-before

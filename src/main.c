@@ -148,12 +148,11 @@ resolve_trace_log_path(void)
 
 /* Amendment 06 rule 7: the EOF drain is bounded, because an unbounded
    wait turns a wedged T3 into a hung player -- strictly worse than a
-   truncated track. PCM_LEAD_SECONDS (2, sink.c) plus a second of slack,
-   counted in ticks rather than read off a wall clock. It is a duplicate
-   of a sink.c-private constant on purpose: main.c has no business
-   including sink.c's internals for a bound whose exactness does not
-   matter. */
-#define PLAYER_DRAIN_MAX_TICKS (3 * PLAYER_REDRAW_HZ)
+   truncated track. pcm_ring holds PCM_LEAD_SECONDS (2, sink.c) of audio
+   rounded up to a power of two, so strictly under 2 * 2 s; plus a second
+   of slack: 2 * 2 + 1 = 5 s, in ticks. A literal, not derived: main.c
+   does not include sink.c's internals. Moves with PCM_LEAD_SECONDS. */
+#define PLAYER_DRAIN_MAX_TICKS (5 * PLAYER_REDRAW_HZ)
 
 /* Bounded by EVENT_MAX_EPOLL_EVENTS in event.c; a local constant keeps
    main.c ignorant of that internal. */

@@ -11,6 +11,10 @@ Notable changes to `kurono`. Format based on
 - The exit summary gains a second line with the decode buffer's
   steady-state headroom, so dropouts can be judged against real use rather
   than start-up.
+- At the end of the queue the player now waits up to 5 s rather than 3 s for
+  the buffer to drain before giving up on a stalled device. On 44.1 kHz
+  devices the old bound was within one redraw tick of the buffer's length
+  and could cut the last track short.
 
 ### Fixed
 
