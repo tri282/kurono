@@ -6,6 +6,12 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
+### Changed
+
+- The exit summary gains a second line with the decode buffer's
+  steady-state headroom, so dropouts can be judged against real use rather
+  than start-up.
+
 ### Fixed
 
 - Gapless playback of Ogg Vorbis files no longer leaves up to about 2 ms of
@@ -164,6 +170,9 @@ through those.
 - Search returns at most 200 rows, and a query matching more than that returns
   the first 200 in scan order rather than the 200 most relevant. Narrowing the
   query is the fix; anything matching under 200 rows is ranked normally.
+- The decode buffer is sized by a guess (about 2.7 s at 48 kHz). The exit
+  summary now reports the measured steady-state headroom; the figure and any
+  resulting change will be recorded once enough listening time exists.
 
 [Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.2.0...main
 [1.2.0]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...v1.2.0

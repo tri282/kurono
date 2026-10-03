@@ -187,6 +187,19 @@ void engine_frames_account(const Engine * e, uint64_t * written,
                            uint64_t * in_ring);
 
 /*
+ * engine_lead_stats: the steady-state headroom figures (#8). low is the
+ * lowest pcm_ring occupancy T2 saw after a read while the ring was in
+ * steady state, steady the frames written in that state, underruns the
+ * callback underruns inside it, cap pcm_ring's capacity, all in frames.
+ * Legal only after engine_join has returned, for the reason
+ * engine_frames_account is: the fields are T2's and unsynchronised.
+ * Takes the Engine and four out-params, returns 1 if steady state was
+ * ever sampled, 0 if no track ever filled the ring.
+ */
+int engine_lead_stats(const Engine * e, uint64_t * low, uint64_t * steady,
+                      unsigned * underruns, uint64_t * cap);
+
+/*
  * engine_play / engine_pause / engine_resume / engine_seek /
  * engine_stop / engine_quit / engine_set_gain: T1-side convenience
  * wrappers over the command channel (DESIGN.md IV.6's payload list).

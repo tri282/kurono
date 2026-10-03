@@ -236,11 +236,14 @@ Arrows navigate, letters act. Every key resolves through a table to a named acti
 
 ### If audio drops out
 
-Every run prints one line on exit, underruns, dropped trace records, and how close the decode buffer came to empty:
+Every run prints two lines on exit. The first counts underruns and dropped trace records, and says how close the decode buffer came to empty; the second says how much headroom the buffer kept during uninterrupted playback:
 
 ```txt
-kurono: 0 underruns, 0 trace records dropped, pcm_ring low-water 1.87 s
+kurono: 0 underruns, 0 trace records dropped, pcm_ring low-water n/a
+kurono: steady state 0h00m, headroom low 2.71 s of 2.73 s, 0 underruns
 ```
+
+The first line's low-water is reported only when the audio thread saw the buffer fall below about 0.1 s, so `n/a` is the healthy reading. The second line's headroom is the lowest the buffer fell during uninterrupted playback, out of its capacity, with starts and seeks excluded. If no track was long enough to fill the buffer it reads `steady state none (no track filled the buffer)`.
 
 If that shows underruns, `KURONO_TRACE=1` writes a full per-event log to `$XDG_STATE_HOME/kurono/trace.log` (falling back to `~/.local/state`). The audio thread can't format text, so it records fixed-size events that the UI thread renders later, which is why tracing costs nothing when you aren't reading it.
 

@@ -147,6 +147,17 @@ struct Engine {
   uint64_t park_ticket;
   uint64_t pause_ack;
 
+  /* Steady-state headroom (#8). T2-only and unsynchronised: read by
+     engine_lead_stats after engine_join, the engine_frames_account rule.
+     Armed when a write finds pcm_ring full; disarmed by park and by
+     engine_flush_begin, so start, seek and play refills are never
+     counted. lead_low is UINT64_MAX until the first armed sample. */
+  int      lead_armed;
+  unsigned lead_u0;        /* sink_underrun_count() at arm */
+  uint64_t lead_low;       /* min ring_fill after a read while armed, frames */
+  uint64_t lead_frames;    /* frames written while armed */
+  unsigned lead_underruns; /* underruns inside armed segments */
+
   pthread_mutex_t evt_mtx;
   Event evt_q[EVT_QUEUE_CAP];
   int evt_head, evt_tail, evt_count;
@@ -298,6 +309,18 @@ engine_poll_event(Engine * e, Event * out)
  * different file (DESIGN.md V.1 step 3).
  * ------------------------------------------------------------------- */
 
+/* lead_disarm: close the current steady-state segment, if one is open,
+   folding its underruns into lead_underruns. T2 only. Takes the Engine,
+   returns nothing. */
+static void
+lead_disarm(Engine * e)
+{
+  if (e->lead_armed) {
+    e->lead_underruns += sink_underrun_count() - e->lead_u0;
+    e->lead_armed = 0;
+  }
+} /* lead_disarm */
+
 /* engine_flush_begin: take ownership of pcm_ring's contents for T2 by
    raising g_flushing and fencing against any in-flight callback
    invocation. Called only from T2, only from do_play and do_seek. See
@@ -305,6 +328,8 @@ engine_poll_event(Engine * e, Event * out)
 static void
 engine_flush_begin(Engine * e)
 {
+  lead_disarm(e);
+
   atomic_bool * flushing = sink_flush_flag();
   const atomic_uint * cb_seq = sink_cb_seq();
 
@@ -491,6 +516,7 @@ engine_device_reflush(Engine * e, const SessionFormat * fmt)
 static void
 park(Engine * e, EngineState new_state)
 {
+  lead_disarm(e);
   sink_set_producer_active(0);
   atomic_store_explicit(&e->state, new_state, memory_order_relaxed);
 
@@ -802,6 +828,15 @@ engine_thread_main(void * arg)
 
     long n = e->src.read(e->src.self, chunk, READ_CHUNK_FRAMES);
 
+    /* Steady-state sample: during a refill gap only the consumer acts, so
+       this is the gap's minimum to within one period. */
+    if (e->lead_armed) {
+      uint64_t occ = (uint64_t) (ring_fill(e->pcm_ring) / (ENGINE_CHANNELS * sizeof(float)));
+      if (occ < e->lead_low) {
+        e->lead_low = occ;
+      }
+    }
+
     if (n < 0) {
       Event ev;
       memset(&ev, 0, sizeof(ev));
@@ -840,8 +875,15 @@ engine_thread_main(void * arg)
       size_t w = ring_write(e->pcm_ring, (const uint8_t *) chunk + off, bytes - off);
       off += w;
       e->write_frames += w / (ENGINE_CHANNELS * sizeof(float));
+      if (e->lead_armed) {
+        e->lead_frames += w / (ENGINE_CHANNELS * sizeof(float));
+      }
 
       if (off < bytes) {
+        if (!e->lead_armed) { /* pcm_ring is full: steady state from here */
+          e->lead_armed = 1;
+          e->lead_u0    = sink_underrun_count();
+        }
         /* pcm_ring is full. DESIGN.md IV.5: wait up to 10 ms on the
            command condvar, then re-check free space by looping back to
            ring_write above. */
@@ -942,6 +984,7 @@ engine_create(const SessionFormat * fmt, AudioSource src, AudioSink * sink)
   e->sample_rate  = fmt->sample_rate;
   e->event_pipe_w = -1;
   e->parked       = 1; /* T2 starts parked with no track, IV.9.a step 7 */
+  e->lead_low     = UINT64_MAX;
   atomic_store_explicit(&e->state, ENG_STOPPED, memory_order_relaxed);
 
   pthread_mutex_init(&e->cmd_mtx, NULL);
@@ -1012,6 +1055,18 @@ engine_frames_account(const Engine * e, uint64_t * written,
   *written = e->write_frames;
   *in_ring = ring_fill(e->pcm_ring) / (ENGINE_CHANNELS * sizeof(float));
 } /* engine_frames_account */
+
+/* engine_lead_stats: see include/audio/engine.h. */
+int
+engine_lead_stats(const Engine * e, uint64_t * low, uint64_t * steady,
+                  unsigned * underruns, uint64_t * cap)
+{
+  *low       = e->lead_low;
+  *steady    = e->lead_frames;
+  *underruns = e->lead_underruns;
+  *cap       = (uint64_t) (e->pcm_ring->cap / (ENGINE_CHANNELS * sizeof(float)));
+  return e->lead_low != UINT64_MAX;
+} /* engine_lead_stats */
 
 /* engine_play: see include/audio/engine.h. */
 void

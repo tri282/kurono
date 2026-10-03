@@ -1267,10 +1267,11 @@ search_confirm(size_t index)
  *
  * Idempotent, because two callers reach it: shutdown_all for a real run,
  * and main for every diagnostic mode that never built a Player. Takes
- * and returns nothing.
+ * the steady-state headroom line shutdown_all built (NULL or empty when
+ * there is none), returns nothing.
  */
 static void
-trace_report_and_shutdown(void)
+trace_report_and_shutdown(const char * lead_line)
 {
   static int done = 0;
   if (done) {
@@ -1282,6 +1283,12 @@ trace_report_and_shutdown(void)
   char summary[128];
   trace_summary_line(summary, sizeof summary);
   fprintf(stderr, "%s\n", summary);
+
+  /* The steady-state headroom line, built by shutdown_all once T2 was
+     joined; NULL or empty for every path that had no Engine. */
+  if (lead_line != NULL && lead_line[0] != '\0') {
+    fprintf(stderr, "%s\n", lead_line);
+  }
 
   /* The flush snapshot is not in trace_ring and so is not in the drained
      log (DESIGN.md IV.10, amendment 03). Rendered here for the same
@@ -3467,6 +3474,7 @@ shutdown_all(Player * p)
   int      ns_paced     = 1;
   uint64_t ns_w = 0, ns_c = 0, ns_f = 0, ns_periods = 0;
   long     ns_late = 0;
+  char     lead_line[128] = "";
 
   /* 1 */ atomic_store_explicit(&g_shutdown, true, memory_order_release);
 
@@ -3505,6 +3513,24 @@ shutdown_all(Player * p)
     ns_c = atomic_load_explicit(sink_frames_consumed(), memory_order_acquire);
     ns_conserved = (ns_w == ns_c + ns_f);
     ns_paced     = sink_null_pacing(&ns_periods, &ns_late);
+  }
+
+  /* Steady-state headroom (#8), read with T2 joined and before step 6
+     frees the ring whose capacity it reports. The rate is the exit-time
+     session rate. */
+  if (p->e != NULL && p->fmt.sample_rate > 0) {
+    uint64_t low = 0, steady = 0, cap = 0;
+    unsigned u   = 0;
+    double   r   = (double) p->fmt.sample_rate;
+    if (engine_lead_stats(p->e, &low, &steady, &u, &cap)) {
+      uint64_t s = steady / p->fmt.sample_rate;
+      snprintf(lead_line, sizeof lead_line,
+               "kurono: steady state %" PRIu64 "h%02" PRIu64 "m, headroom low %.2f s of %.2f s, %u underruns",
+               s / 3600, (s / 60) % 60, (double) low / r, (double) cap / r, u);
+    } else {
+      snprintf(lead_line, sizeof lead_line,
+               "kurono: steady state none (no track filled the buffer)");
+    }
   }
 
   /* 6. Both touchers of pcm_ring are now provably gone: T3 (or T4) by
@@ -3583,7 +3609,7 @@ shutdown_all(Player * p)
   event_destroy(p->el);
   p->el = NULL;
 
-  /* 10 */ trace_report_and_shutdown();
+  /* 10 */ trace_report_and_shutdown(lead_line);
 } /* shutdown_all */
 
 /*
@@ -4343,7 +4369,7 @@ main(int argc, char * argv[])
      the table puts it; the helper is idempotent, so this call is a no-op
      after that path ran. The other modes have no redraw tick and no pipe
      wakeup to drive trace_drain, so the drain here is their only one. */
-  trace_report_and_shutdown();
+  trace_report_and_shutdown(NULL);
 
   return status;
 } /* main */
