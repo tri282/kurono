@@ -16,6 +16,10 @@ tools/*
 # rule's own stated intent, which is how phase 11's PTY harness was lost
 # with its scratchpad and had to be written a second time.
 !tools/*.py
+# The fixture generator and its committed output (tools/gapless_test's
+# inputs). Without these two lines both are silently untracked.
+!tools/*.sh
+!tools/fixtures/
 
 # graphify knowledge graph output
 graphify-out/

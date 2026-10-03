@@ -108,7 +108,7 @@ OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
         check-theme check-deps ring-stress queue-test keymap-test \
-        testsrc-test fts-query-test nullsink-test install uninstall clean
+        testsrc-test fts-query-test nullsink-test gapless-test install uninstall clean
 
 all: kurono
 
@@ -350,6 +350,15 @@ build/default/tools/fts_query_test.o: tools/fts_query_test.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) $(PKG_CFLAGS) -c $< -o $@
 
+# The decoder's per-file frame count is the gapless boundary. Links
+# decoder.o and the four ffmpeg modules; the test includes no ffmpeg
+# header. Single-threaded, no sanitiser.
+gapless-test: tools/gapless_test
+
+tools/gapless_test: build/default/tools/gapless_test.o build/default/audio/decoder.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ \
+	  $(shell pkg-config --libs libavformat libavcodec libavutil libswresample) -lm
+
 install: release
 	install -d $(BINDIR)
 	install -m 755 kurono $(BINDIR)/kurono
@@ -360,7 +369,7 @@ uninstall:
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
 	       tools/queue_test tools/keymap_test tools/testsrc_test \
-	       tools/fts_query_test tools/nullsink_test
+	       tools/fts_query_test tools/nullsink_test tools/gapless_test
 
 # The .d files written by DEPFLAGS above. A wildcard rather than a list
 # derived from SRCS: the tools' objects live under build/<mode>/tools/
