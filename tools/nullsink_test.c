@@ -5,6 +5,7 @@
    trace.c under TSan; no device, no kurono process. Modes (a) and (b):
    T1 is the only pcm_ring producer, NullSink's T4 the only consumer.
    Mode (c) links engine.c for the park handshake (amendment 11).
+   Mode (d) links engine.c for the steady-state headroom rule.
 
    Usage: nullsink_test [seconds]   (live-producer mode, default 10) */
 
@@ -43,6 +44,8 @@ static int g_failures = 0;
 #define LIVE_DRY_PERIODS  5u   /* underruns per starve phase before refilling */
 #define PARK_HOLD_MS      100  /* mode (c): park_sync must still be waiting after this */
 #define PARK_LIMIT_MS     2000 /* mode (c): bound on every other wait */
+#define LEAD_SETTLE_MS    1000 /* mode (d): >= 1 s of steady state before and after the seeks */
+#define LEAD_SEEKS        10
 
 static float g_buf[MAX_BLOCK_FRAMES * MAX_CHANNELS]; /* silence */
 
@@ -363,7 +366,50 @@ test_park_ack(AudioSink * s, const SessionFormat * f)
   printf("park: play and seek held inside the gate\n");
 } /* test_park_ack */
 
-/* main: open NullSink, run modes (a), (b) and (c), tear down in
+/* test_lead_headroom: mode (d), the #8 arming rule. Engine + NullSink +
+   an endless fast source: play, settle, seek LEAD_SEEKS times, settle,
+   stop, join. Steady state must exist and its low must stay above half
+   the ring: every seek's empty-ring refill is excluded, so the only
+   dips left are one chunk and one period. Takes the open sink and its
+   format, returns nothing. */
+static void
+test_lead_headroom(AudioSink * s, const SessionFormat * f)
+{
+  AudioSource src = { gsrc_open, gsrc_read, gsrc_seek, gsrc_nop, NULL, gsrc_nop, &g_gate };
+  Engine *    e;
+  uint64_t    low = 0, steady = 0, cap = 0;
+  unsigned    u = 0;
+
+  gate_set(1);
+  e = engine_create(f, src, s);
+  if (e == NULL) {
+    CHECK(0, "lead: engine_create failed");
+    return;
+  }
+  CHECK(engine_start(e) == 0, "lead: engine_start failed");
+  CHECK(s->start(s->self) == 0, "lead: sink start failed");
+
+  engine_play(e, "lead", 2);
+  sleep_ns(LEAD_SETTLE_MS * 1000000L);
+  for (int i = 0; i < LEAD_SEEKS; i++) {
+    engine_seek(e, (int64_t) i * 100);
+  }
+  sleep_ns(LEAD_SETTLE_MS * 1000000L);
+
+  s->stop(s->self); /* IV.9.b step 2 before the join */
+  engine_quit(e);
+  engine_join(e);
+
+  int armed = engine_lead_stats(e, &low, &steady, &u, &cap);
+  CHECK(armed == 1, "lead: never armed");
+  CHECK(steady > 0, "lead: lead_frames == 0");
+  CHECK(low >= cap / 2, "lead: low %" PRIu64 " < cap/2 %" PRIu64, low, cap / 2);
+  printf("lead: low=%" PRIu64 " cap=%" PRIu64 " steady=%" PRIu64 " underruns=%u\n",
+         low, cap, steady, u);
+  engine_destroy(e);
+} /* test_lead_headroom */
+
+/* main: open NullSink, run modes (a) to (d), tear down in
    IV.9.b order. Takes an optional mode (b) duration in seconds as
    argv[1], returns 0 if every check passed, 1 otherwise. */
 int
@@ -391,6 +437,7 @@ main(int argc, char ** argv)
   test_e4(&s, &f);
   test_live_conservation(&s, &f, seconds);
   test_park_ack(&s, &f);
+  test_lead_headroom(&s, &f);
 
   s.close(s.self);
   sink_free_rings();
