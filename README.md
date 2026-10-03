@@ -388,4 +388,4 @@ build.
 
 ## Status
 
-v1 is complete and what's described above works. **v2 is underway**, cover art, a spectrum visualiser, playlists, a config file, an EQ, exact lossy gapless, and moving the scan to the background.
+v1 is complete and what's described above works. **v2 is underway**, cover art, a spectrum visualiser, playlists, a config file, an EQ, and moving the scan to the background.
