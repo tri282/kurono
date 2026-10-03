@@ -190,17 +190,24 @@ check_set(AudioSource * src, const char * dir, const Fixture * fx, int report)
   double corr_bnd = 0.0;
   long   lag_mid  = 0;
   long   lag_bnd  = 0;
+  double corr_bm  = 0.0;
+  long   lag_bm   = 0;
 
   if (pair && fx->expect != EXPECT_UNTRIMMED) {
     lag_mid = find_lag(len, exp_a / 2, T, &corr_mid);
     lag_bnd = find_lag(len, exp_a, T, &corr_bnd);
+    /* Report only: B's own head offset is lag_bm - (got_a - exp_a). */
+    lag_bm  = find_lag(len, exp_a + exp_b / 2, T, &corr_bm);
   }
 
   if (report) {
     double cmin = corr_mid < corr_bnd ? corr_mid : corr_bnd;
-    printf("%-11s %-6s %5u %6ld %6ld %+5ld %6ld %6ld %+5ld %+5ld %+5ld %6.3f %8lld\n",
+    if (pair && fx->expect != EXPECT_UNTRIMMED && corr_bm < cmin) {
+      cmin = corr_bm;
+    }
+    printf("%-11s %-6s %5u %6ld %6ld %+5ld %6ld %6ld %+5ld %+5ld %+5ld %+5ld %6.3f %8lld\n",
            fx->set, ia.codec, fx->rate, fx->n_a, got_a, got_a - exp_a,
-           fx->n_b, got_b, got_b - exp_b, lag_mid, lag_bnd, cmin,
+           fx->n_b, got_b, got_b - exp_b, lag_mid, lag_bnd, lag_bm, cmin,
            (long long) ia.duration_ms);
     return;
   }
@@ -265,9 +272,9 @@ main(int argc, char ** argv)
   }
 
   if (report) {
-    printf("%-11s %-6s %5s %6s %6s %5s %6s %6s %5s %5s %5s %6s %8s\n",
+    printf("%-11s %-6s %5s %6s %6s %5s %6s %6s %5s %5s %5s %5s %6s %8s\n",
            "set", "codec", "rate", "N_a", "got_a", "d_a", "N_b", "got_b",
-           "d_b", "lagm", "lagb", "corr", "dur_ms_a");
+           "d_b", "lagm", "lagb", "lagbm", "corr", "dur_ms_a");
   }
   for (size_t i = 0; i < sizeof g_fixtures / sizeof g_fixtures[0]; i++) {
     check_set(&src, dir, &g_fixtures[i], report);
