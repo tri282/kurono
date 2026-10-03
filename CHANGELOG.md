@@ -4,7 +4,7 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] — 2026-10-02
 
 ### Changed
 
@@ -178,7 +178,8 @@ through those.
   summary now reports the measured steady-state headroom; the figure and any
   resulting change will be recorded once enough listening time exists.
 
-[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.2.0...main
+[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.3.0...main
+[1.3.0]: https://gitlab.com/tri282/kurono/-/compare/v1.2.0...v1.3.0
 [1.2.0]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...v1.2.0
 [1.1.0]: https://gitlab.com/tri282/kurono/-/compare/v1.0.1...v1.1.0
 [1.0.1]: https://gitlab.com/tri282/kurono/-/compare/v1.0.0...v1.0.1
