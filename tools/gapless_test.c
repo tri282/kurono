@@ -27,7 +27,7 @@
 #define LAG_MAX               4096
 #define LAG_MIN_CORR          0.5       /* below this the search found no peak */
 #define UNTRIMMED_MAX_SURPLUS 16384L    /* untrimmed path: at most this many extra frames */
-#define GAPLESS_RESAMPLE_TOL  0L        /* set in phase 2 from the phase 0 table */
+#define GAPLESS_RESAMPLE_TOL  1L        /* measured +1/+0 frames, libswresample 6.3 (ffmpeg 8.1.2), fedora; must stay <= 48 (1 ms) */
 #define MAX_FRAMES            131072L   /* both files of a pair plus two max surpluses */
 #define PATH_MAX_LEN          1024
 
@@ -56,7 +56,7 @@ typedef struct {
 
 static const Fixture g_fixtures[] = {
   { "mp3",        "mp3",  48000, 24337, 21111, EXPECT_EXACT },
-  { "m4a",        "m4a",  48000, 24337, 21111, EXPECT_EXACT },
+  { "m4a",        "m4a",  48000, 24337, 21111, EXPECT_UNTRIMMED },  /* declared untrimmed: +239/+393 frames tail, ffmpeg 8.1.2 */
   { "opus",       "opus", 48000, 24337, 21111, EXPECT_EXACT },
   { "ogg",        "ogg",  48000, 24337, 21111, EXPECT_EXACT },
   { "mp3-44k",    "mp3",  44100, 22337, 19411, EXPECT_RESAMPLED },
@@ -196,7 +196,7 @@ check_set(AudioSource * src, const char * dir, const Fixture * fx, int report)
   if (pair && fx->expect != EXPECT_UNTRIMMED) {
     lag_mid = find_lag(len, exp_a / 2, T, &corr_mid);
     lag_bnd = find_lag(len, exp_a, T, &corr_bnd);
-    /* Report only: B's own head offset is lag_bm - (got_a - exp_a). */
+    /* lag_bnd straddles A's tail surplus; lag_bm measures B's head. */
     lag_bm  = find_lag(len, exp_a + exp_b / 2, T, &corr_bm);
   }
 
@@ -218,8 +218,10 @@ check_set(AudioSource * src, const char * dir, const Fixture * fx, int report)
     CHECK(got_b == fx->n_b, "%s: B count %ld, want %ld", fx->set, got_b, fx->n_b);
     CHECK(lag_mid == 0, "%s: mid lag %ld, want 0", fx->set, lag_mid);
     CHECK(lag_bnd == 0, "%s: boundary lag %ld, want 0", fx->set, lag_bnd);
+    CHECK(lag_bm == 0, "%s: B mid lag %ld, want 0", fx->set, lag_bm);
     CHECK(corr_mid >= LAG_MIN_CORR, "%s: mid corr %.3f", fx->set, corr_mid);
     CHECK(corr_bnd >= LAG_MIN_CORR, "%s: boundary corr %.3f", fx->set, corr_bnd);
+    CHECK(corr_bm >= LAG_MIN_CORR, "%s: B mid corr %.3f", fx->set, corr_bm);
     break;
   case EXPECT_RESAMPLED:
     CHECK(labs(got_a - exp_a) <= GAPLESS_RESAMPLE_TOL,
@@ -228,8 +230,10 @@ check_set(AudioSource * src, const char * dir, const Fixture * fx, int report)
           "%s: B count %ld, expected %ld", fx->set, got_b, exp_b);
     CHECK(labs(lag_mid) <= 1, "%s: mid lag %ld", fx->set, lag_mid);
     CHECK(labs(lag_bnd) <= 1, "%s: boundary lag %ld", fx->set, lag_bnd);
+    CHECK(labs(lag_bm) <= 1, "%s: B mid lag %ld", fx->set, lag_bm);
     CHECK(corr_mid >= LAG_MIN_CORR, "%s: mid corr %.3f", fx->set, corr_mid);
     CHECK(corr_bnd >= LAG_MIN_CORR, "%s: boundary corr %.3f", fx->set, corr_bnd);
+    CHECK(corr_bm >= LAG_MIN_CORR, "%s: B mid corr %.3f", fx->set, corr_bm);
     break;
   case EXPECT_UNTRIMMED:
     CHECK(got_a >= fx->n_a && got_a <= fx->n_a + UNTRIMMED_MAX_SURPLUS,

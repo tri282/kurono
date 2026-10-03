@@ -383,10 +383,12 @@ trim_cap_open(Decoder * d, const AVStream * st)
  * (phase-6-decoder.md I.3), and fills *out_info. Deliberately does not
  * set AV_CODEC_FLAG2_SKIP_MANUAL -- libavcodec applies
  * AV_PKT_DATA_SKIP_SAMPLES automatically, which is what makes DESIGN.md
- * V.3's gapless transition close to correct on lossy formats with no
- * trimming code of our own; setting that flag would hand the side data
- * back to us instead and turn a few ms of error into an audible click on
- * every lossy track. Every early-return path frees everything this call
+ * V.3's gapless transition exact in frames for the containers
+ * tools/gapless_test checks (MP3 with a LAME header, Opus, Vorbis),
+ * measured, not assumed; Vorbis relies on the tail cap above. AAC in M4A
+ * is declared untrimmed (a few ms of padding at each track end). Setting
+ * that flag would hand the side data back to us instead and turn a few ms
+ * of error into an audible click on every lossy track. Every early-return path frees everything this call
  * allocated (decoder_close_file, called at both entry and on every
  * failure branch). Takes self, the path, and the StreamInfo to fill;
  * returns 0 on success or a negative AVERROR on any per-file failure

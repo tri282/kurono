@@ -148,7 +148,12 @@ through those.
 
 - Linux only, deliberately. `epoll`, `inotify`, `signalfd` and `timerfd` are
   used directly and there is no portable fallback.
-- Gapless is approximate on lossy formats.
+- Gapless playback is exact on MP3 (with a LAME/Xing header), Opus and Ogg
+  Vorbis, verified against ffmpeg 8.1 (Fedora). AAC in M4A keeps about 5-8 ms
+  of encoder padding at the end of each track. Files without encoder-delay
+  metadata (raw AAC, MP3 without a LAME header) play with the encoder's
+  padding, a few tens of milliseconds. When a file's sample rate differs from
+  the output device's, boundaries are exact to within 1 frame.
 - Configuration is environment variables only; `KURONO_CONFIG` is reserved but
   unread.
 - With the queue pane open, view switching (`tab`, `1`/`2`/`3`) and search

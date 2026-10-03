@@ -60,6 +60,7 @@ workflow:
     - make keymap-test   && ./tools/keymap_test
     - make testsrc-test  && ./tools/testsrc_test
     - make fts-query-test && ./tools/fts_query_test
+    - make gapless-test   && ./tools/gapless_test
 
     # The SPSC ring under ThreadSanitizer, both modes, time-boxed
     # Built on both distros

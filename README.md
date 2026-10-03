@@ -295,6 +295,7 @@ make clean
 | `make testsrc-test` | | Build `tools/testsrc_test`. |
 | `make fts-query-test` | | Build `tools/fts_query_test`. Links `sqlite3` for the real FTS5 parser. |
 | `make nullsink-test` | `-fsanitize=thread` | Build `tools/nullsink_test`, which drives the playback callback from a timer thread with no audio device. |
+| `make gapless-test` | | Build `tools/gapless_test`, which checks that short lossy files decode to exactly their original length. Links the ffmpeg libraries. |
 
 Object files carry `-MMD -MP`, so editing a header rebuilds exactly the translation units that include it. The `.d` files live under `build/` and are removed by `clean`.
 
@@ -340,7 +341,7 @@ kurono/
 └── Makefile
 ```
 
-`tools/` holds the parts pure enough to test without a device, a terminal or any music: `ring_stress` (the SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test`, `fts_query_test` and `nullsink_test`. Most link against exactly the one source file they exercise; `keymap_test`, `fts_query_test` and `nullsink_test` need a few more.
+`tools/` holds the parts pure enough to test without a device, a terminal or any music: `ring_stress` (the SPSC ring under TSan), `queue_test`, `keymap_test`, `testsrc_test`, `fts_query_test`, `nullsink_test` and `gapless_test`. Most link against exactly the one source file they exercise; `keymap_test`, `fts_query_test`, `nullsink_test` and `gapless_test` need a few more. `gapless_test` decodes the files in `tools/fixtures/`, which `tools/gen_fixtures.sh` regenerates with the `ffmpeg` command-line tool; CI uses the committed files.
 
 Third-party use is confined on purpose, all ffmpeg lives in `audio/decoder.c`, all miniaudio in `audio/sink.c`, all SQLite in `library/db.c`, all termbox2 in `ui/tui.c`. `ui/` may call `library/` and `audio/`; neither ever calls back into `ui/`, they emit events instead. `make check` enforces this with grep, so a violation fails the build rather than being noticed in review.
 
@@ -357,7 +358,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what changed in each release.
 
 CI builds and tests every tag on both Fedora and Debian. It cannot run
 `kurono` itself — there is no audio device and no pty in a container — so a
-green pipeline covers the compile, the invariants, `-fanalyzer` and the five
+green pipeline covers the compile, the invariants, `-fanalyzer` and the seven
 standalone test binaries, but not the player. The interface and the audio path
 are verified by hand under ThreadSanitizer and AddressSanitizer before a
 release.

@@ -37,6 +37,7 @@ IDEAS.md
 .claude/settings.local.json
 compile_commands.json
 .cache/
+.stignore
 
 # tools
 .claudeignore
