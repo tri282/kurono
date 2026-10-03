@@ -4,6 +4,13 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Gapless playback of Ogg Vorbis files no longer leaves up to about 2 ms of
+  silence at each track boundary.
+
 ## [1.2.0] — 2026-09-23
 
 ### Added

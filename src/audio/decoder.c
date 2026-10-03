@@ -40,6 +40,16 @@
    to a few thousand samples), so growth should be rare in practice. */
 #define RESIDUAL_INITIAL_FRAMES 8192
 
+/* Frames a capped file may decode past its stated length before the cap
+   is judged wrong and released. ~0.34 s at 48 kHz: above any single
+   block of encoder padding. */
+#define TRIM_HOLD_MAX_FRAMES 16384L
+
+/* Containers (AVInputFormat.name) whose stream duration is exact in
+   samples and whose decode overruns it by encoder padding, on measured
+   evidence. Ogg only: m4a's duration field is not exact. */
+static const char * const TRIM_CAP_FORMATS[] = { "ogg" };
+
 /*
  * Decoder: the ffmpeg-side state behind one AudioSource.self. Opaque to
  * every other file in the tree -- decoder.h declares only a forward-free
@@ -85,6 +95,12 @@ typedef struct {
      phase 7 can never raise EV_DECODE_ERROR (phase-6-decoder.md I.6,
      DESIGN.md XI.1). */
   int last_error;
+
+  /* Tail cap: the true length in session-rate frames, or -1 when the file
+     is uncapped. out_frames counts frames handed to the caller since open
+     or the last seek. */
+  int64_t cap_out;
+  int64_t out_frames;
 } Decoder;
 
 /*
@@ -311,6 +327,8 @@ decoder_close_file(Decoder * d)
   d->last_error   = 0;
   d->residual_len = 0;
   d->residual_off = 0;
+  d->cap_out      = -1;
+  d->out_frames   = 0;
 } /* decoder_close_file */
 
 /* The two vtable slots whose bodies sit below decoder_create, beside the
@@ -320,6 +338,40 @@ decoder_close_file(Decoder * d)
    changing one will look for the other. */
 static void decoder_destroy_impl(void * self);
 static int  decoder_retarget_impl(void * self, uint32_t sample_rate);
+
+/*
+ * trim_cap_open: enable the tail cap for the file just opened when its
+ * container is in TRIM_CAP_FORMATS and its stream duration is an exact
+ * sample count (time base 1/sample_rate). Takes the decoder and the audio
+ * stream; sets d->cap_out and never fails -- any doubt leaves the file
+ * uncapped (-1).
+ */
+static void
+trim_cap_open(Decoder * d, const AVStream * st)
+{
+  d->cap_out = -1;
+
+  const AVInputFormat * fmt = d->fmt_ctx->iformat;
+  if (fmt == NULL || fmt->name == NULL) {
+    return;
+  }
+
+  int listed = 0;
+  for (size_t i = 0; i < sizeof(TRIM_CAP_FORMATS) / sizeof(TRIM_CAP_FORMATS[0]); i++) {
+    if (strcmp(fmt->name, TRIM_CAP_FORMATS[i]) == 0) {
+      listed = 1;
+    }
+  }
+
+  if (!listed || st->duration == (int64_t) AV_NOPTS_VALUE || st->duration <= 0
+      || d->codec_ctx->sample_rate <= 0
+      || st->time_base.num != 1 || st->time_base.den != d->codec_ctx->sample_rate) {
+    return;
+  }
+
+  d->cap_out = av_rescale(st->duration, (int64_t) d->target_fmt.sample_rate,
+                          d->codec_ctx->sample_rate);
+} /* trim_cap_open */
 
 /*
  * decoder_open_impl: AudioSource.open. Closes any previously open file
@@ -420,12 +472,36 @@ decoder_open_impl(void * self, const char * path, StreamInfo * out_info)
   const char * name = avcodec_get_name(d->codec_ctx->codec_id);
   snprintf(out_info->codec, sizeof(out_info->codec), "%s", name != NULL ? name : "?");
 
+  trim_cap_open(d, stream);
+
   return 0;
 
 fail:
   decoder_close_file(d);
   return (ret < 0) ? ret : AVERROR_UNKNOWN;
 } /* decoder_open_impl */
+
+/*
+ * trim_hold_to_eof: called once a capped file has handed over cap_out
+ * frames. Keeps decoding (decode_one_frame appends to the residual, which
+ * is the hold) until EOF. Takes the decoder; returns 0 at EOF within
+ * TRIM_HOLD_MAX_FRAMES, with the held frames dropped as padding, or 1 if
+ * the hold overflowed: the cap is then disabled for the file and the held
+ * frames flow to the caller.
+ */
+static int
+trim_hold_to_eof(Decoder * d)
+{
+  while (decode_one_frame(d)) {
+    if (d->residual_len - d->residual_off > TRIM_HOLD_MAX_FRAMES) {
+      d->cap_out = -1; /* stated length was wrong: play untrimmed */
+      return 1;
+    }
+  }
+  d->residual_len = 0;
+  d->residual_off = 0;
+  return 0;
+} /* trim_hold_to_eof */
 
 /*
  * decoder_read_impl: AudioSource.read. Drains the residual buffer into
@@ -441,7 +517,8 @@ fail:
  * source. Takes self, the destination buffer (frames * 2 floats), and
  * the requested frame count; returns the frame count actually produced,
  * or a negative AVERROR when a failure ended the file and no frames
- * remain to hand over.
+ * remain to hand over. A capped file (trim_cap_open) returns short exactly
+ * at its cap, which is its EOF.
  */
 static long
 decoder_read_impl(void * self, float * dst, long frames)
@@ -454,9 +531,19 @@ decoder_read_impl(void * self, float * dst, long frames)
   long produced = 0;
 
   while (produced < frames) {
+    if (d->cap_out >= 0 && d->out_frames >= d->cap_out) {
+      if (trim_hold_to_eof(d)) {
+        continue; /* cap released: drain the hold normally */
+      }
+      break; /* EOF: short return, as before */
+    }
+
     if (d->residual_off < d->residual_len) {
       long avail = d->residual_len - d->residual_off;
       long want  = frames - produced;
+      if (d->cap_out >= 0 && want > d->cap_out - d->out_frames) {
+        want = (long) (d->cap_out - d->out_frames);
+      }
       long take  = (avail < want) ? avail : want;
 
       memcpy(dst + (size_t) produced * DECODER_CHANNELS,
@@ -465,6 +552,7 @@ decoder_read_impl(void * self, float * dst, long frames)
 
       d->residual_off += take;
       produced += take;
+      d->out_frames += take;
 
       if (d->residual_off >= d->residual_len) {
         d->residual_off = 0;
@@ -536,6 +624,7 @@ decoder_seek_impl(void * self, int64_t ms)
   d->last_error   = 0;
   d->residual_len = 0;
   d->residual_off = 0;
+  d->out_frames   = ms * (int64_t) d->target_fmt.sample_rate / 1000; /* do_seek's resync formula */
 
   return 0;
 } /* decoder_seek_impl */
@@ -700,6 +789,11 @@ decoder_retarget_impl(void * self, uint32_t sample_rate)
   }
 
   Decoder * d = (Decoder *) self;
+  if (d->cap_out >= 0 && d->target_fmt.sample_rate > 0) {
+    /* cap and progress are in session-rate frames: carry them across */
+    d->cap_out    = av_rescale(d->cap_out, sample_rate, d->target_fmt.sample_rate);
+    d->out_frames = av_rescale(d->out_frames, sample_rate, d->target_fmt.sample_rate);
+  }
   d->target_fmt.sample_rate = sample_rate;
 
   /* The residual holds frames resampled to the *old* rate. They belong
