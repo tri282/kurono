@@ -10,7 +10,7 @@
  * was defined to be and both are complete. A -dev suffix on a finished
  * v1 would be the version string lying about the milestone.
  */
-#define KURONO_VERSION "1.3.0"
+#define KURONO_VERSION "1.3.1"
 
 /*
  * kurono_die: restore the terminal if it was claimed, print msg to
