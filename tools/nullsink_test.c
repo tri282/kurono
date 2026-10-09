@@ -102,6 +102,7 @@ test_e4(AudioSink * s, const SessionFormat * f)
 
   CHECK(s->start(s->self) == 0, "start failed");
   CHECK(sink_is_started(s) == 1, "sink_is_started is 0 after start");
+  CHECK(sink_callback_may_run(s) == 1, "sink_callback_may_run is 0 after start");
   sleep_ns(RUN_PERIODS * period_ns(f));
   s->stop(s->self);
 
@@ -121,6 +122,7 @@ test_e4(AudioSink * s, const SessionFormat * f)
         consumed, u, N);
   CHECK(pace_ok, "E3 pacing out of band (late_max %ld ns)", late);
   CHECK(sink_is_started(s) == 0, "sink_is_started is 1 after stop");
+  CHECK(sink_callback_may_run(s) == 0, "sink_callback_may_run is 1 after stop");
   CHECK(sink_cb_alive() == 0, "callback alive after stop");
   printf("e4: N=%" PRIu64 " K=%" PRIu64 " underruns=%u late_max=%ld ns\n",
          N, K, u, late);
