@@ -122,10 +122,11 @@ static ma_context g_context;
 static ma_device  g_device;
 
 /* Written by T1 only (open/close), but READ from T2 as well, through
-   sink_is_started's gate (phase 7's seek fence). A plain int here is a
-   data race the moment phase 7 lands -- and sink_is_started is required
-   to be a pure atomic load with no other effect (plan.md VII gap 2,
-   closed 2026-08-08), which a non-atomic gate would violate. */
+   the seek fence's predicates (sink_callback_may_run, and
+   sink_is_started for the loss detector). A plain int here is a data
+   race the moment phase 7 lands -- and both are required to be pure
+   atomic loads with no other effect (plan.md VII gap 2, closed
+   2026-08-08), which a non-atomic gate would violate. */
 static atomic_bool g_device_open = false;
 
 static Ring g_pcm_ring;
@@ -205,7 +206,8 @@ static void *             g_notify_user = NULL;
 /* NullSink (amendment 10). T1 writes g_null_thread and both flags in
    null_start_impl/null_stop_impl only (T1-only, D-5). g_null_started is
    true strictly before T4 exists and false strictly after it is joined,
-   which is what keeps T2's IV.7.5 fence skip honest under NullSink. */
+   which is what keeps T2's sink_callback_may_run (IV.7.5) honest under
+   NullSink. */
 static pthread_t   g_null_thread;
 static atomic_bool g_null_started = false;
 static atomic_bool g_null_quit    = false;
@@ -252,7 +254,7 @@ kurono_data_callback(ma_device * dev, void * out, const void * in,
 
   const size_t want = (size_t) frameCount * SINK_CHANNELS * sizeof(float);
 
-  /* 1 */ bool flush = atomic_load_explicit(&g_flushing, memory_order_acquire);
+  /* 1 */ bool flush = atomic_load_explicit(&g_flushing, memory_order_seq_cst);
   /* 2 */ if (flush) {
             memset(out, 0, want);
             goto seq; /* touch nothing else while flushing -- DESIGN.md IV.7.6 */
@@ -293,7 +295,7 @@ kurono_data_callback(ma_device * dev, void * out, const void * in,
   /* 7 */ apply_gain((float *) out, frameCount * SINK_CHANNELS);
 
 seq:
-  /* 8 */ atomic_fetch_add_explicit(&g_cb_seq, 1u, memory_order_release);
+  /* 8 */ atomic_fetch_add_explicit(&g_cb_seq, 1u, memory_order_seq_cst);
   atomic_store_explicit(&g_cb_alive, false, memory_order_relaxed);
 } /* kurono_data_callback */
 
@@ -610,8 +612,9 @@ sink_close_impl(void * self)
     return;
   }
   /* Cleared before the teardown, not after: once ma_device_uninit has
-     run, &g_device must not be handed to ma_device_get_state, so
-     sink_is_started's gate has to already read false. */
+     run, &g_device must not be handed to ma_device_get_state, so the
+     sink_is_started and sink_callback_may_run gates have to already
+     read false. */
   atomic_store_explicit(&g_device_open, false, memory_order_release);
   ma_device_uninit(&g_device); /* joins T3 */
   ma_context_uninit(&g_context);
@@ -785,6 +788,32 @@ sink_is_started(const AudioSink * s)
   }
   return ma_device_get_state(&g_device) == ma_device_state_started;
 } /* sink_is_started */
+
+/* Amendment 12: the fence predicate's state mapping, written as the
+   complement so the positive list below is an independent check. */
+#define SINK_STATE_MAY_RUN(s) \
+  ((s) != ma_device_state_uninitialized && (s) != ma_device_state_stopped)
+_Static_assert(SINK_STATE_MAY_RUN(ma_device_state_starting)
+               && SINK_STATE_MAY_RUN(ma_device_state_started)
+               && SINK_STATE_MAY_RUN(ma_device_state_stopping)
+               && !SINK_STATE_MAY_RUN(ma_device_state_stopped)
+               && !SINK_STATE_MAY_RUN(ma_device_state_uninitialized),
+               "amendment 12: starting and stopping run the callback");
+
+/* sink_callback_may_run: see include/audio/sink.h. Pure atomic loads;
+   the device state is read once. */
+int
+sink_callback_may_run(const AudioSink * s)
+{
+  if (s != NULL && s->start == null_start_impl) {
+    return atomic_load_explicit(&g_null_started, memory_order_acquire) ? 1 : 0;
+  }
+  if (!atomic_load_explicit(&g_device_open, memory_order_acquire)) {
+    return 0;
+  }
+  ma_device_state st = ma_device_get_state(&g_device);
+  return SINK_STATE_MAY_RUN(st) ? 1 : 0;
+} /* sink_callback_may_run */
 
 /* sink_underrun_count: see include/audio/sink.h. Relaxed on both sides
    -- T3 increments relaxed inside the callback and this is for display

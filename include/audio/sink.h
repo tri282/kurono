@@ -67,6 +67,16 @@ void sink_get_null(AudioSink * out);
 int sink_is_started(const AudioSink * s);
 
 /*
+ * sink_callback_may_run: true iff the data callback may be executing
+ * now, the seek fence's predicate (DESIGN.md IV.7.5, amendment 12).
+ * Real backend: open, and ma_device_state is neither uninitialized nor
+ * stopped, so starting and stopping count as running. NullSink:
+ * g_null_started, as sink_is_started. Pure atomic loads, safe from any
+ * thread but T3 and T4. Takes the AudioSink, returns 1 or 0.
+ */
+int sink_callback_may_run(const AudioSink * s);
+
+/*
  * sink_underrun_count: how many times the data callback has found
  * pcm_ring short and written silence, since the device was opened.
  *
@@ -205,9 +215,9 @@ Ring * sink_pcm_ring(void);
 
 /*
  * sink_flush_flag: pointer to g_flushing (DESIGN.md IV.7.1-.3). T3's
- * data callback acquire-loads it every invocation, unmodified by this
- * accessor's addition. T2 (audio/engine.c) is the only external writer
- * -- release-store true in engine_flush_begin, release-store false in
+ * data callback seq_cst-loads it every invocation. T2 (audio/engine.c)
+ * is the only external writer -- seq_cst-store true in
+ * engine_flush_begin, release-store false in
  * engine_flush_end -- and no other file may touch it. Takes nothing,
  * returns the pointer; always valid (static storage).
  */
@@ -215,10 +225,10 @@ atomic_bool * sink_flush_flag(void);
 
 /*
  * sink_cb_seq: pointer to g_cb_seq, the callback-invocation counter
- * the seek fence polls (DESIGN.md IV.7.3-.4). T3 release-increments it
- * at the end of every invocation, including the flushing path,
- * unmodified by this accessor. Every external caller (T2 only) reads
- * it acquire and must never write it. Takes nothing, returns the
+ * the seek fence polls (DESIGN.md IV.7.3-.4). T3 seq_cst-increments it
+ * at the end of every invocation, including the flushing path. Every
+ * external caller (T2 only) reads it with at least acquire and must
+ * never write it. Takes nothing, returns the
  * pointer; always valid (static storage).
  */
 const atomic_uint * sink_cb_seq(void);
