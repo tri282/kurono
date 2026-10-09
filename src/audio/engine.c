@@ -16,7 +16,7 @@
  *
  * engine.c is the only module permitted to hold both a ring pointer
  * (pcm_ring, borrowed from sink.c; boundary_ring, owned here) and a
- * sink pointer (used only for sink_is_started's fence check --
+ * sink pointer (used only for sink_callback_may_run, the seek fence's predicate --
  * sink.open/start/stop/close stay on T1, DESIGN.md IV.9).
  *
  * The TRACE_FLUSH contradiction phase 7 flagged here is settled by
@@ -104,7 +104,7 @@ static FlushStat g_flush_stat;
  */
 struct Engine {
   AudioSource src;
-  AudioSink * sink;      /* borrowed; only sink_is_started is ever called on it */
+  AudioSink * sink;      /* borrowed; only sink_callback_may_run is ever called on it */
   Ring      * pcm_ring;  /* borrowed from sink_pcm_ring(); NOT owned, NEVER freed here */
   Ring        boundary_ring;
 
@@ -333,23 +333,22 @@ engine_flush_begin(Engine * e)
   atomic_bool * flushing = sink_flush_flag();
   const atomic_uint * cb_seq = sink_cb_seq();
 
-  unsigned seq0 = atomic_load_explicit(cb_seq, memory_order_acquire);
-  atomic_store_explicit(flushing, true, memory_order_release);
+  /* Flag first, then the sample: amendment 12. */
+  atomic_store_explicit(flushing, true, memory_order_seq_cst);
+  unsigned seq0 = atomic_load_explicit(cb_seq, memory_order_seq_cst);
 
-  /* IV.7.5 fence skip: if the device is not started, the callback
-     provably is not running and cannot start without ma_device_start
-     (T1 only) -- reset immediately rather than burning the 200 ms cap. */
-  if (sink_is_started(e->sink)) {
-    for (int i = 0; i < FLUSH_FENCE_CAP_MS; i++) {
-      unsigned s = atomic_load_explicit(cb_seq, memory_order_acquire);
-      if (s - seq0 >= 2u) { /* IV.7.3: TWO, not one */
-        break;
-      }
-      struct timespec ts;
-      ts.tv_sec  = 0;
-      ts.tv_nsec = (long) FLUSH_FENCE_POLL_MS * 1000000L;
-      nanosleep(&ts, NULL);
+  for (int i = 0; i < FLUSH_FENCE_CAP_MS; i++) {
+    if (!sink_callback_may_run(e->sink)) { /* IV.7.5, re-read every poll */
+      break;
     }
+    unsigned s = atomic_load_explicit(cb_seq, memory_order_acquire);
+    if (s - seq0 >= 2u) { /* IV.7.3, amendment 12 */
+      break;
+    }
+    struct timespec ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = (long) FLUSH_FENCE_POLL_MS * 1000000L;
+    nanosleep(&ts, NULL);
   }
 } /* engine_flush_begin */
 
@@ -486,9 +485,9 @@ engine_device_reflush(Engine * e, const SessionFormat * fmt)
 
   /* The same two routines the seek window uses, not a second divergent
      implementation of the sequence (DESIGN.md IV.7.8). The fence inside
-     engine_flush_begin costs nothing here: sink_is_started is false with
-     the device freshly initialised and not yet started, so IV.7.5's skip
-     branch takes it. */
+     engine_flush_begin costs nothing here: sink_callback_may_run is false
+     with the device freshly initialised and not yet started, so the fence
+     exits on its first poll (IV.7.5). */
   engine_flush_begin(e);
   pcm_flush_and_resync(e, 0);
   engine_flush_end(e);

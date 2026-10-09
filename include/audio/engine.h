@@ -111,7 +111,7 @@ typedef struct Engine Engine;
 /*
  * engine_create: allocate an Engine bound to fmt, to `src` -- the
  * AudioSource it will decode through -- and to sink (used only for
- * sink_is_started; engine.c never calls sink.open/start/stop/close,
+ * sink_callback_may_run; engine.c never calls sink.open/start/stop/close,
  * those stay on T1, DESIGN.md IV.9). Also allocates boundary_ring and
  * binds pcm_ring via sink_pcm_ring(), so sink.open must already have
  * succeeded before this is called.

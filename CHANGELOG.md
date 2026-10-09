@@ -4,6 +4,15 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Seeking at the instant playback was paused or resumed could reset the
+  playback buffer while the audio thread was still reading it, corrupting
+  playback state. Seeks now wait for the audio thread in that window, and
+  still return immediately while paused.
+
 ## [1.3.0] — 2026-10-02
 
 ### Changed
