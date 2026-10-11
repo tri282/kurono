@@ -6,11 +6,33 @@ Notable changes to `kurono`. Format based on
 
 ## [Unreleased]
 
+### Added
+
+- Playlists view: the queue in its own column, with the details of the
+  entry under the cursor beside it. `enter` plays the entry, `d` removes
+  it, `C` clears the queue, `K`/`J` move it.
+- Now playing view: details of the playing track.
+- Settings view: the effective configuration, read-only.
+- `?` opens help, like `h`. Page keys (`pgup`, `pgdn`, `home`, `end`) work
+  in every list.
+
+### Changed
+
+- The number keys select five views: `1` Library, `2` Directories, `3`
+  Playlists, `4` Now playing, `5` Settings (`1`-`3` were Directory, Artists
+  and Album Artists). `tab` cycles all five.
+- `v` goes to the Playlists view and back instead of opening a pane over
+  the browser.
+- `d` and `C` act only in the Playlists view, where the entry they act on
+  is visible.
+- The help overlay lists the keys of the view it was opened from.
+
 ### Removed
 
 - The Album Artists view. Every track is still reachable under its own
   artist, and the album artist tag is still shown in the track details and
   matched by search.
+- The queue pane. The queue is the Playlists view.
 
 ## [1.3.1] — 2026-10-09
 
@@ -183,8 +205,9 @@ through those.
   the output device's, boundaries are exact to within 1 frame.
 - Configuration is environment variables only; `KURONO_CONFIG` is reserved but
   unread.
-- With the queue pane open, view switching (`tab`, `1`/`2`/`3`) and search
-  (`/`) are unbound. Close the pane with `esc` or `v` first.
+- The queue is not visible while browsing; `v` switches to the Playlists view
+  and back.
+- Settings is read-only until v2.3.0.
 - Holding a single-step cursor key at the end of a list runs off the end and
   continues from the other side, because nothing distinguishes a held key from
   repeated presses. Page keys clamp and can be used to stop at an end.

@@ -60,6 +60,28 @@ synth_event(uint16_t key, uint32_t ch, uint8_t mod)
 } /* synth_event */
 
 /*
+ * resolve_view: resolve `ev` through view `v`'s MODE_NORMAL chain. Takes
+ * the view, the event and the arg out-param; returns the Action.
+ */
+static Action
+resolve_view(UiView v, const struct tb_event * ev, int32_t * arg)
+{
+  KeyCtx chain[KEYCTX_CHAIN_MAX];
+  size_t n = keymap_chain(MODE_NORMAL, 0, v, chain);
+  return keymap_resolve(chain, n, ev, arg);
+} /* resolve_view */
+
+/*
+ * resolve_ctx: resolve `ev` through the one-element chain {c}. Takes the
+ * context, the event and the arg out-param; returns the Action.
+ */
+static Action
+resolve_ctx(KeyCtx c, const struct tb_event * ev, int32_t * arg)
+{
+  return keymap_resolve(&c, 1, ev, arg);
+} /* resolve_ctx */
+
+/*
  * test_every_row_resolves: every row of the compiled-in table must
  * resolve to its own action and arg from a faithfully synthesised event.
  * Takes nothing, returns nothing.
@@ -67,21 +89,22 @@ synth_event(uint16_t key, uint32_t ch, uint8_t mod)
 static void
 test_every_row_resolves(void)
 {
-  for (int m = 0; m < MODE_COUNT; m++) {
+  for (int c = 0; c < KEYCTX_COUNT; c++) {
     size_t n = 0;
-    const Binding * tab = keymap_table((UiMode) m, &n);
-    CHECK(tab != NULL && n > 0, "mode %d has an empty table", m);
+    const Binding * tab = keymap_table((KeyCtx) c, &n);
+    CHECK((tab == NULL) == (n == 0), "context %d: rows %p with count %zu",
+          c, (const void *) tab, n);
 
     for (size_t i = 0; i < n; i++) {
       struct tb_event ev = synth_event(tab[i].key, tab[i].ch, tab[i].mod);
       int32_t arg = -12345;
-      Action a = keymap_resolve((UiMode) m, &ev, &arg);
+      Action a = resolve_ctx((KeyCtx) c, &ev, &arg);
       CHECK(a == tab[i].action,
-            "mode %d row %zu (key=%u ch=%u mod=%u) resolved to %s, expected %s",
-            m, i, (unsigned) tab[i].key, (unsigned) tab[i].ch,
+            "context %d row %zu (key=%u ch=%u mod=%u) resolved to %s, expected %s",
+            c, i, (unsigned) tab[i].key, (unsigned) tab[i].ch,
             (unsigned) tab[i].mod, action_name(a), action_name(tab[i].action));
-      CHECK(arg == tab[i].arg, "mode %d row %zu resolved arg %d, expected %d",
-            m, i, (int) arg, (int) tab[i].arg);
+      CHECK(arg == tab[i].arg, "context %d row %zu resolved arg %d, expected %d",
+            c, i, (int) arg, (int) tab[i].arg);
     }
   }
 } /* test_every_row_resolves */
@@ -95,17 +118,17 @@ test_every_row_resolves(void)
 static void
 test_no_duplicate_triples(void)
 {
-  for (int m = 0; m < MODE_COUNT; m++) {
+  for (int c = 0; c < KEYCTX_COUNT; c++) {
     size_t n = 0;
-    const Binding * tab = keymap_table((UiMode) m, &n);
+    const Binding * tab = keymap_table((KeyCtx) c, &n);
 
     for (size_t i = 0; i < n; i++) {
       for (size_t j = i + 1; j < n; j++) {
         CHECK(!(tab[i].key == tab[j].key && tab[i].ch == tab[j].ch &&
                 tab[i].mod == tab[j].mod),
-              "mode %d rows %zu and %zu share (key=%u ch=%u mod=%u): "
+              "context %d rows %zu and %zu share (key=%u ch=%u mod=%u): "
               "%s is unreachable",
-              m, i, j, (unsigned) tab[i].key, (unsigned) tab[i].ch,
+              c, i, j, (unsigned) tab[i].key, (unsigned) tab[i].ch,
               (unsigned) tab[i].mod, action_name(tab[j].action));
       }
     }
@@ -123,45 +146,47 @@ test_unbound_and_non_key(void)
   int32_t arg = -1;
 
   struct tb_event ev = synth_event(0, 'Z', 0);
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE, "'Z' should be unbound");
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE, "'Z' should be unbound");
   CHECK(arg == 0, "unbound key must zero *out_arg, got %d", (int) arg);
 
   ev = synth_event(TB_KEY_F1, 0, 0);
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE, "F1 should be unbound");
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE, "F1 should be unbound");
   CHECK(arg == 0, "unbound key must zero *out_arg");
 
   /* A modifier must not be ignored: alt-j and ctrl-j are not j. */
   ev = synth_event(0, 'j', TB_MOD_ALT);
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE,
         "alt-j must not collide with the j binding");
   ev = synth_event(0, 'j', TB_MOD_CTRL);
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE,
         "ctrl-modified j must not collide with the j binding");
 
   /* Alt-Enter: Enter's own TB_MOD_CTRL is normalised away, but the ALT
      bit must survive and leave the row unmatched. */
   ev = synth_event(TB_KEY_ENTER, 0, TB_MOD_ALT);
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE,
         "alt-enter must not collide with the enter binding");
 
   ev = synth_event(0, 'q', 0);
   ev.type = TB_EVENT_RESIZE;
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE, "a resize event binds nothing");
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE, "a resize event binds nothing");
   CHECK(arg == 0, "non-key event must zero *out_arg");
 
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, NULL, &arg) == ACT_NONE, "NULL event resolves to none");
+  CHECK(resolve_view(VIEW_DIRECTORIES, NULL, &arg) == ACT_NONE, "NULL event resolves to none");
   CHECK(arg == 0, "NULL event must zero *out_arg");
 } /* test_unbound_and_non_key */
 
 /*
  * test_readme_bindings: spot-checks the rows README.md V.2 promises, by
- * key rather than by table index, including the two seek pairs and the
- * three view-set args that are the reason Binding carries an arg at all.
- * Takes nothing, returns nothing.
+ * key rather than by table index, through the Directories chain,
+ * including the two seek pairs that are the reason Binding carries an arg
+ * at all. The view-set rows are K10's (test_view_set_range); d and C are
+ * Playlists-only and K14's (test_view_coverage). Takes nothing, returns
+ * nothing.
  */
 static void
 test_readme_bindings(void)
@@ -177,7 +202,6 @@ test_readme_bindings(void)
     { 0, ' ', ACT_PLAY_PAUSE,      0 },
     { TB_KEY_ENTER, 0, ACT_PLAY_NOW, 0 },
     { 0, 'a', ACT_ENQUEUE,         0 },
-    { 0, 'd', ACT_REMOVE,          0 },
     { 0, 'n', ACT_NEXT,            0 },
     { 0, 'p', ACT_PREV,            0 },
     { 0, '+', ACT_VOL_UP,          5 },
@@ -200,12 +224,10 @@ test_readme_bindings(void)
        where the lowercase key is already taken now or by phase 12b. */
     { 0, 'x', ACT_STOP,            0 },
     { 0, 'M', ACT_MUTE,            0 },
-    { 0, 'C', ACT_CLEAR_QUEUE,     0 },
     { 0, 'o', ACT_JUMP_TO_PLAYING, 0 },
     { 0, 'R', ACT_RETRY_DEVICE,    0 },
-    { TB_KEY_TAB, 0, ACT_VIEW_NEXT, 0 },
-    { 0, '1', ACT_VIEW_SET,        0 },
-    { 0, '2', ACT_VIEW_SET,        1 },
+    { 0, '?', ACT_HELP_TOGGLE,     0 },
+    { 0, 'v', ACT_QUEUE_TOGGLE,    0 },
     { 0, 'q', ACT_QUIT,            0 },
     /* Raw mode means the terminal does not turn this into SIGINT -- see
        the row's comment in keymap.c. Checked here because an unbound
@@ -217,7 +239,7 @@ test_readme_bindings(void)
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
     struct tb_event ev = synth_event(cases[i].key, cases[i].ch, 0);
     int32_t arg = -1;
-    Action a = keymap_resolve(MODE_NORMAL, &ev, &arg);
+    Action a = resolve_view(VIEW_DIRECTORIES, &ev, &arg);
     CHECK(a == cases[i].want, "key=%u ch=%u gave %s, expected %s",
           (unsigned) cases[i].key, (unsigned) cases[i].ch,
           action_name(a), action_name(cases[i].want));
@@ -231,7 +253,7 @@ test_readme_bindings(void)
  * test_mode_tables: the phase-12b rules that can regress without any
  * other check noticing -- the modifier actually discriminating, the
  * vim keys being gone, Esc's asymmetry between normal and the overlays,
- * and MODE_SEARCH's "unresolved means literal text" contract. Takes
+ * and [FILTER]'s "unresolved means literal text" contract. Takes
  * nothing, returns nothing.
  */
 static void
@@ -245,47 +267,20 @@ test_mode_tables(void)
      actions. Injectable end to end as CSI 1;2C by the pty harness. */
   ev  = synth_event(TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT);
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_SEEK_FWD,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_SEEK_FWD,
         "shift+right must seek forward");
   CHECK(arg == 5000, "shift+right seeks %d ms, expected 5000", (int) arg);
 
   ev  = synth_event(TB_KEY_ARROW_RIGHT, 0, 0);
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_COL_RIGHT,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_COL_RIGHT,
         "a bare right arrow must move a column, not seek");
 
   ev  = synth_event(TB_KEY_ARROW_UP, 0, TB_MOD_SHIFT);
   arg = -1;
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_SEEK_FWD &&
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_SEEK_FWD &&
             arg == 30000,
         "shift+up must be the large forward seek");
-
-  /* MODE_QUEUE is an overlay on a player that is still playing, so the
-     transport keys have to survive it (phase 17 runbook item 3). The
-     bare arrows must still be the pane's cursor: the modifier is the
-     whole of the difference, and a resolver that ignored it would make
-     every cursor move a seek. */
-  ev  = synth_event(TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT);
-  arg = -1;
-  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_SEEK_FWD && arg == 5000,
-        "shift+right must seek forward with the queue pane open");
-
-  ev  = synth_event(TB_KEY_ARROW_DOWN, 0, 0);
-  arg = -1;
-  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_CURSOR_DOWN,
-        "a bare down arrow must still move the queue cursor, not seek");
-
-  ev = synth_event(0, '+', 0);
-  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_VOL_UP,
-        "volume must work with the queue pane open");
-
-  ev = synth_event(0, 'n', 0);
-  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_NEXT,
-        "next must work with the queue pane open");
-
-  ev = synth_event(TB_KEY_CTRL_R, 0, 0);
-  CHECK(keymap_resolve(MODE_QUEUE, &ev, &arg) == ACT_RESCAN,
-        "rescan must work with the queue pane open");
 
   /* The vim keys are unbound and reserved, and h is help in both the
      mode that opens it and the mode it opens. */
@@ -293,46 +288,47 @@ test_mode_tables(void)
   for (size_t i = 0; i < sizeof gone / sizeof gone[0]; i++) {
     ev  = synth_event(0, gone[i], 0);
     arg = -1;
-    CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE,
+    CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE,
           "'%c' must be unbound in normal mode", (char) gone[i]);
   }
 
   ev = synth_event(0, 'h', 0);
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_HELP_TOGGLE,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_HELP_TOGGLE,
         "h opens help");
-  CHECK(keymap_resolve(MODE_HELP, &ev, &arg) == ACT_HELP_TOGGLE,
+  CHECK(resolve_ctx(KEYCTX_HELP, &ev, &arg) == ACT_HELP_TOGGLE,
         "h closes the help it opened");
 
   /* Esc: unbound in normal mode on purpose (a stray escape sequence must
      not end the process), a pop everywhere else. */
   ev = synth_event(TB_KEY_ESC, 0, 0);
-  CHECK(keymap_resolve(MODE_NORMAL, &ev, &arg) == ACT_NONE,
+  CHECK(resolve_view(VIEW_DIRECTORIES, &ev, &arg) == ACT_NONE,
         "Esc must be unbound in normal mode");
-  CHECK(keymap_resolve(MODE_HELP, &ev, &arg) == ACT_QUIT,
+  CHECK(resolve_ctx(KEYCTX_HELP, &ev, &arg) == ACT_QUIT,
         "Esc must quit (pop) in help mode");
-  CHECK(keymap_resolve(MODE_SEARCH, &ev, &arg) == ACT_SEARCH_CANCEL,
+  CHECK(resolve_ctx(KEYCTX_FILTER, &ev, &arg) == ACT_SEARCH_CANCEL,
         "Esc cancels a search rather than popping -- column 3 has to come back");
 
-  /* MODE_SEARCH's contract: anything not in its own table resolves
-     ACT_NONE, which tui.c reads as "insert this codepoint". */
+  /* The text-entry contract, now [FILTER]'s (design III.2; plan gap
+     G8): anything not in its own table resolves ACT_NONE, which tui.c
+     reads as "insert this codepoint". */
   const uint32_t typed[] = { 'j', 'q', 'h', ' ', '/' };
   for (size_t i = 0; i < sizeof typed / sizeof typed[0]; i++) {
     ev  = synth_event(0, typed[i], 0);
     arg = -1;
-    CHECK(keymap_resolve(MODE_SEARCH, &ev, &arg) == ACT_NONE,
+    CHECK(resolve_ctx(KEYCTX_FILTER, &ev, &arg) == ACT_NONE,
           "'%c' in search mode is literal text, not an action",
           (char) typed[i]);
   }
 
   /* Every overlay table must offer a way out, or the mode is a trap. */
-  const UiMode closable[] = { MODE_HELP, MODE_MENU };
+  const KeyCtx closable[] = { KEYCTX_HELP, KEYCTX_MENU };
   for (size_t i = 0; i < sizeof closable / sizeof closable[0]; i++) {
     ev = synth_event(0, 'q', 0);
-    CHECK(keymap_resolve(closable[i], &ev, &arg) == ACT_QUIT,
-          "mode %d has no q binding", (int) closable[i]);
+    CHECK(resolve_ctx(closable[i], &ev, &arg) == ACT_QUIT,
+          "context %d has no q binding", (int) closable[i]);
     ev = synth_event(TB_KEY_CTRL_C, 0, 0);
-    CHECK(keymap_resolve(closable[i], &ev, &arg) == ACT_QUIT,
-          "mode %d has no ctrl-c binding", (int) closable[i]);
+    CHECK(resolve_ctx(closable[i], &ev, &arg) == ACT_QUIT,
+          "context %d has no ctrl-c binding", (int) closable[i]);
   }
 } /* test_mode_tables */
 
@@ -346,7 +342,7 @@ static void
 test_key_names(void)
 {
   size_t n = 0;
-  const Binding * tab = keymap_table(MODE_NORMAL, &n);
+  const Binding * tab = keymap_table(KEYCTX_GLOBAL, &n);
 
   for (size_t i = 0; i < n; i++) {
     const char * k = key_name(&tab[i]);
@@ -414,14 +410,14 @@ test_reserved_actions_present(void)
 
   /* No reserved action may be bound in v1 -- binding one would dispatch
      into a case nothing implements. */
-  for (int m = 0; m < MODE_COUNT; m++) {
+  for (int c = 0; c < KEYCTX_COUNT; c++) {
     size_t n = 0;
-    const Binding * tab = keymap_table((UiMode) m, &n);
+    const Binding * tab = keymap_table((KeyCtx) c, &n);
     for (size_t i = 0; i < n; i++) {
       for (size_t r = 0; r < sizeof reserved / sizeof reserved[0]; r++) {
         CHECK(tab[i].action != reserved[r],
-              "mode %d row %zu binds reserved post-v1 action %s",
-              m, i, action_name(tab[i].action));
+              "context %d row %zu binds reserved post-v1 action %s",
+              c, i, action_name(tab[i].action));
       }
     }
   }
@@ -448,32 +444,31 @@ test_reserved_actions_present(void)
 static void
 test_key_names_are_named(void)
 {
-  for (int m = 0; m < MODE_COUNT; m++) {
+  for (int c = 0; c < KEYCTX_COUNT; c++) {
     size_t          n = 0;
-    const Binding * t = keymap_table((UiMode) m, &n);
+    const Binding * t = keymap_table((KeyCtx) c, &n);
 
-    CHECK(t != NULL, "mode %d has no binding table", m);
     if (t == NULL) {
-      continue;
+      continue;   /* a context with no rows (KEYCTX_LIBRARY until phase 5) */
     }
 
     for (size_t i = 0; i < n; i++) {
       const char * name = key_name(&t[i]);
 
       CHECK(name != NULL && name[0] != '\0',
-            "mode %d row %zu (action %s) has an empty key name",
-            m, i, action_name(t[i].action));
+            "context %d row %zu (action %s) has an empty key name",
+            c, i, action_name(t[i].action));
       if (name == NULL) {
         continue;
       }
       CHECK(strstr(name, "key#") == NULL,
-            "mode %d row %zu (action %s) renders as \"%s\" -- the key is "
+            "context %d row %zu (action %s) renders as \"%s\" -- the key is "
             "missing from g_key_name and help will show it that way",
-            m, i, action_name(t[i].action), name);
+            c, i, action_name(t[i].action), name);
       CHECK(strstr(name, "U+") == NULL,
-            "mode %d row %zu (action %s) renders as \"%s\" -- a bare "
+            "context %d row %zu (action %s) renders as \"%s\" -- a bare "
             "codepoint is not a key name a user can act on",
-            m, i, action_name(t[i].action), name);
+            c, i, action_name(t[i].action), name);
     }
   }
 } /* test_key_names_are_named */
@@ -940,6 +935,221 @@ test_layout_list_top(void)
 } /* test_layout_list_top */
 
 /*
+ * test_view_set_range: K10. Every ACT_VIEW_SET row in every context has
+ * an arg in [0, VIEW_COUNT), and '1'..'5' resolve through GLOBAL to
+ * view_set 0..4 exactly (design II.1: UiView = key - 1).
+ */
+static void
+test_view_set_range(void)
+{
+  for (int c = 0; c < KEYCTX_COUNT; c++) {
+    size_t          n   = 0;
+    const Binding * tab = keymap_table((KeyCtx) c, &n);
+    for (size_t i = 0; i < n; i++) {
+      if (tab[i].action == ACT_VIEW_SET) {
+        CHECK(tab[i].arg >= 0 && tab[i].arg < VIEW_COUNT,
+              "context %d row %zu: view_set arg %d outside [0, %d)",
+              c, i, (int) tab[i].arg, (int) VIEW_COUNT);
+      }
+    }
+  }
+
+  for (int v = 0; v < VIEW_COUNT; v++) {
+    struct tb_event ev  = synth_event(0, (uint32_t) ('1' + v), 0);
+    int32_t         arg = -1;
+    CHECK(resolve_ctx(KEYCTX_GLOBAL, &ev, &arg) == ACT_VIEW_SET && arg == v,
+          "'%c' must be view_set %d, got arg %d", '1' + v, v, (int) arg);
+  }
+
+  struct tb_event ev  = synth_event(TB_KEY_TAB, 0, 0);
+  int32_t         arg = -1;
+  CHECK(resolve_ctx(KEYCTX_GLOBAL, &ev, &arg) == ACT_VIEW_NEXT, "tab must be view_next");
+} /* test_view_set_range */
+
+/*
+ * expect_chain: the design III.2 table, written out independently of
+ * keymap_chain. Takes the mode, the editing flag, the view and the out
+ * array; returns the length.
+ */
+static size_t
+expect_chain(UiMode mode, int editing, int view, KeyCtx out[KEYCTX_CHAIN_MAX])
+{
+  if (mode == MODE_HELP) {
+    out[0] = KEYCTX_HELP;
+    return 1;
+  }
+  if (mode == MODE_MENU) {
+    out[0] = KEYCTX_MENU;
+    return 1;
+  }
+  if (editing || mode == MODE_SEARCH) {
+    out[0] = KEYCTX_FILTER;
+    return 1;
+  }
+  if (view == VIEW_LIBRARY) {
+    out[0] = KEYCTX_LIBRARY; out[1] = KEYCTX_BROWSE; out[2] = KEYCTX_LIST; out[3] = KEYCTX_GLOBAL;
+    return 4;
+  }
+  if (view == VIEW_DIRECTORIES) {
+    out[0] = KEYCTX_BROWSE; out[1] = KEYCTX_LIST; out[2] = KEYCTX_GLOBAL;
+    return 3;
+  }
+  if (view == VIEW_PLAYLISTS) {
+    out[0] = KEYCTX_TRACKLIST; out[1] = KEYCTX_LIST; out[2] = KEYCTX_GLOBAL;
+    return 3;
+  }
+  out[0] = KEYCTX_GLOBAL;
+  return 1;
+} /* expect_chain */
+
+/*
+ * test_chains: K11. keymap_chain matches design III.2 for every mode x
+ * editing x view.
+ */
+static void
+test_chains(void)
+{
+  const UiMode modes[] = { MODE_NORMAL, MODE_HELP, MODE_MENU, MODE_SEARCH };
+
+  for (size_t mi = 0; mi < sizeof modes / sizeof modes[0]; mi++) {
+    for (int ed = 0; ed <= 1; ed++) {
+      for (int v = 0; v < VIEW_COUNT; v++) {
+        KeyCtx got[KEYCTX_CHAIN_MAX], want[KEYCTX_CHAIN_MAX];
+        size_t gn = keymap_chain(modes[mi], ed, (UiView) v, got);
+        size_t wn = expect_chain(modes[mi], ed, v, want);
+        CHECK(gn == wn && memcmp(got, want, wn * sizeof want[0]) == 0,
+              "chain for mode %d editing %d view %d: length %zu, expected %zu",
+              (int) modes[mi], ed, v, gn, wn);
+      }
+    }
+  }
+} /* test_chains */
+
+/*
+ * test_no_shadowing: K12. Within each view's MODE_NORMAL chain no
+ * (key, ch, mod) triple is bound in two tables (design III.3 rule 3).
+ */
+static void
+test_no_shadowing(void)
+{
+  for (int v = 0; v < VIEW_COUNT; v++) {
+    KeyCtx chain[KEYCTX_CHAIN_MAX];
+    size_t nc = keymap_chain(MODE_NORMAL, 0, (UiView) v, chain);
+
+    for (size_t a = 0; a < nc; a++) {
+      size_t          na = 0;
+      const Binding * ta = keymap_table(chain[a], &na);
+      for (size_t b = a + 1; b < nc; b++) {
+        size_t          nb = 0;
+        const Binding * tb = keymap_table(chain[b], &nb);
+        for (size_t i = 0; i < na; i++) {
+          for (size_t j = 0; j < nb; j++) {
+            CHECK(!(ta[i].key == tb[j].key && ta[i].ch == tb[j].ch && ta[i].mod == tb[j].mod),
+                  "view %d: contexts %d and %d both bind %s (key=%u ch=%u mod=%u)",
+                  v, (int) chain[a], (int) chain[b], action_name(tb[j].action),
+                  (unsigned) tb[j].key, (unsigned) tb[j].ch, (unsigned) tb[j].mod);
+          }
+        }
+      }
+    }
+  }
+} /* test_no_shadowing */
+
+/*
+ * test_global_reach: K13. Every action design III.3 rule 1 makes global
+ * has a GLOBAL row, and every GLOBAL row resolves to the same action and
+ * arg through every view's MODE_NORMAL chain.
+ */
+static void
+test_global_reach(void)
+{
+  const Action global[] = {
+    ACT_PLAY_PAUSE, ACT_NEXT, ACT_PREV, ACT_VOL_UP, ACT_VOL_DOWN, ACT_SEEK_FWD,
+    ACT_SEEK_BACK, ACT_TOGGLE_SHUFFLE, ACT_CYCLE_REPEAT, ACT_STOP, ACT_MUTE,
+    ACT_HELP_TOGGLE, ACT_MENU_TOGGLE, ACT_RETRY_DEVICE, ACT_RESCAN,
+    ACT_JUMP_TO_PLAYING, ACT_SEARCH, ACT_QUEUE_TOGGLE, ACT_VIEW_NEXT,
+    ACT_VIEW_SET, ACT_QUIT,
+  };
+  size_t          n   = 0;
+  const Binding * tab = keymap_table(KEYCTX_GLOBAL, &n);
+
+  for (size_t g = 0; g < sizeof global / sizeof global[0]; g++) {
+    int found = 0;
+    for (size_t i = 0; i < n; i++) {
+      found |= (tab[i].action == global[g]);
+    }
+    CHECK(found, "%s has no GLOBAL row", action_name(global[g]));
+  }
+
+  for (int v = 0; v < VIEW_COUNT; v++) {
+    for (size_t i = 0; i < n; i++) {
+      struct tb_event ev  = synth_event(tab[i].key, tab[i].ch, tab[i].mod);
+      int32_t         arg = -12345;
+      Action          a   = resolve_view((UiView) v, &ev, &arg);
+      CHECK(a == tab[i].action && arg == tab[i].arg,
+            "view %d: GLOBAL row %zu (%s) resolves to %s arg %d",
+            v, i, action_name(tab[i].action), action_name(a), (int) arg);
+    }
+  }
+} /* test_global_reach */
+
+/*
+ * test_view_coverage: K14. Each view resolves the keys its regions need
+ * (design III.6), and Now playing and Settings resolve no cursor key.
+ */
+static void
+test_view_coverage(void)
+{
+  struct { int view; uint16_t key; uint32_t ch; Action want; } cases[] = {
+    { VIEW_LIBRARY,     0,                  '/', ACT_SEARCH    },
+    { VIEW_LIBRARY,     0,                  'a', ACT_ENQUEUE   },
+    { VIEW_LIBRARY,     TB_KEY_ENTER,       0,   ACT_PLAY_NOW  },
+    { VIEW_LIBRARY,     TB_KEY_ARROW_LEFT,  0,   ACT_COL_LEFT  },
+    { VIEW_LIBRARY,     TB_KEY_ARROW_RIGHT, 0,   ACT_COL_RIGHT },
+    { VIEW_DIRECTORIES, 0,                  '/', ACT_SEARCH    },
+    { VIEW_DIRECTORIES, 0,                  'a', ACT_ENQUEUE   },
+    { VIEW_DIRECTORIES, TB_KEY_ENTER,       0,   ACT_PLAY_NOW  },
+    { VIEW_DIRECTORIES, TB_KEY_ARROW_LEFT,  0,   ACT_COL_LEFT  },
+    { VIEW_DIRECTORIES, TB_KEY_ARROW_RIGHT, 0,   ACT_COL_RIGHT },
+    /* d and C are Playlists-only (decide D7). */
+    { VIEW_DIRECTORIES, 0,                  'd', ACT_NONE      },
+    { VIEW_DIRECTORIES, 0,                  'C', ACT_NONE      },
+    { VIEW_PLAYLISTS,   0,                  'd', ACT_REMOVE    },
+    { VIEW_PLAYLISTS,   0,                  'C', ACT_CLEAR_QUEUE },
+    { VIEW_PLAYLISTS,   0,                  'K', ACT_MOVE_UP   },
+    { VIEW_PLAYLISTS,   0,                  'J', ACT_MOVE_DOWN },
+    { VIEW_PLAYLISTS,   TB_KEY_ENTER,       0,   ACT_CONFIRM   },
+    { VIEW_PLAYLISTS,   TB_KEY_ARROW_UP,    0,   ACT_CURSOR_UP },
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    struct tb_event ev  = synth_event(cases[i].key, cases[i].ch, 0);
+    int32_t         arg = -1;
+    Action          a   = resolve_view((UiView) cases[i].view, &ev, &arg);
+    CHECK(a == cases[i].want, "view %d key=%u ch=%u gave %s, expected %s",
+          cases[i].view, (unsigned) cases[i].key, (unsigned) cases[i].ch,
+          action_name(a), action_name(cases[i].want));
+  }
+
+  const UiView    bare[]   = { VIEW_NOW_PLAYING, VIEW_SETTINGS };
+  const uint16_t  cursor[] = { TB_KEY_ARROW_UP, TB_KEY_ARROW_DOWN, TB_KEY_PGUP,
+                               TB_KEY_PGDN, TB_KEY_HOME, TB_KEY_END };
+  for (size_t v = 0; v < sizeof bare / sizeof bare[0]; v++) {
+    int32_t arg = -1;
+    for (size_t k = 0; k < sizeof cursor / sizeof cursor[0]; k++) {
+      struct tb_event ev = synth_event(cursor[k], 0, 0);
+      CHECK(resolve_view(bare[v], &ev, &arg) == ACT_NONE,
+            "view %d resolves cursor key %u", (int) bare[v], (unsigned) cursor[k]);
+    }
+    struct tb_event ev = synth_event(0, ' ', 0);
+    CHECK(resolve_view(bare[v], &ev, &arg) == ACT_PLAY_PAUSE,
+          "view %d must resolve space", (int) bare[v]);
+    ev = synth_event(0, 'q', 0);
+    CHECK(resolve_view(bare[v], &ev, &arg) == ACT_QUIT,
+          "view %d must resolve q", (int) bare[v]);
+  }
+} /* test_view_coverage */
+
+/*
  * main: runs every check, returns 0 when all passed and 1 otherwise.
  */
 int
@@ -964,9 +1174,14 @@ main(void)
   test_layout_directories_golden();
   test_layout_total();
   test_layout_list_top();
+  test_view_set_range();
+  test_chains();
+  test_no_shadowing();
+  test_global_reach();
+  test_view_coverage();
 
   size_t n = 0;
-  (void) keymap_table(MODE_NORMAL, &n);
+  (void) keymap_table(KEYCTX_GLOBAL, &n);
   if (g_failures == 0) {
     printf("keymap_test: ok (%zu bindings, %d actions, %d style slots)\n",
            n, (int) ACT_COUNT, (int) STYLE_COUNT);

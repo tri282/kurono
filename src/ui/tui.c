@@ -62,7 +62,8 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
    drawn, playing or idle: losing it the moment playback starts is the
    defect this exists to fix (v1.0.1 #14), and it is worst on a narrow
    terminal, which is where a drop-below-floor rule would drop it.
-   Fourteen columns leaves room for the longest view label plus its separator. */
+   Fourteen columns leaves room for the longest view label (11, "now
+   playing") plus its separator. */
 #define VIEW_FIELD_W 14
 
 /* Below this budget the ellipsis is more of the field than the content
@@ -100,6 +101,11 @@ static int       g_dirty  = 1;
 #define UI_MODE_STACK_MAX 4
 static UiMode g_mode_stack[UI_MODE_STACK_MAX] = { MODE_NORMAL };
 static int    g_mode_depth = 1;
+
+/* The current view (design II.1, II.7). Input-routing state like the
+   mode stack, so it lives here; main.c reads it through ui_view(). The
+   startup view is assigned by main.c, not taken from this initialiser. */
+static UiView g_view = VIEW_LIBRARY;
 
 /* The overlay scroll offset, in rows. Reset whenever a mode is pushed or
    popped so an overlay never opens halfway down. */
@@ -143,16 +149,26 @@ search_reset(void)
 } /* search_reset */
 
 /*
- * tui_compute_layout: recompute every rectangle from the current
- * terminal size. Called at init and on every TB_EVENT_RESIZE, and by
- * nothing else -- no widget reads tb_width/tb_height itself. Takes and
- * returns nothing; the result is g_layout.
+ * layout_view: the view whose variants lay out `v`. Takes the view,
+ * returns the view to pass to layout_compute.
+ */
+static UiView
+layout_view(UiView v)
+{
+  /* Library shows the Artists browser until phase 5 (design XII step 3). */
+  return (v == VIEW_LIBRARY) ? VIEW_DIRECTORIES : v;
+} /* layout_view */
+
+/*
+ * tui_compute_layout: recompute every rectangle from the current view
+ * and terminal size. Called at init, on every TB_EVENT_RESIZE and by
+ * ui_view_set, and by nothing else -- no widget reads tb_width/tb_height
+ * itself. Takes and returns nothing; the result is g_layout.
  */
 static void
 tui_compute_layout(void)
 {
-  /* Every v1 view uses the Directories variant until phase 3 (design XII step 1). */
-  layout_compute(VIEW_DIRECTORIES, tb_width(), tb_height(), 1, &g_layout);
+  layout_compute(layout_view(g_view), tb_width(), tb_height(), 1, &g_layout);
 } /* tui_compute_layout */
 
 /*
@@ -318,58 +334,40 @@ fmt_clock(int64_t ms, char * buf, size_t bufsz)
 
 
 /*
- * View labels, drawn over column 1. Sized by BROWSER_SRC_COUNT and
- * checked below, the same mechanism g_mode_label and g_action_name use:
- * a view added without a label fails the build rather than drawing an
- * empty heading. This table is the whole of what the draw code knows
- * about views -- there is no branch on the id anywhere below.
+ * View labels for the header's view field (design II.8). Unsized and
+ * checked below, so a view added without a label fails the build.
  */
 static const char * const g_view_label[] = {
-  [BROWSER_SRC_DIRECTORY] = "directory",
-  [BROWSER_SRC_LIBRARY]   = "artists",
+  [VIEW_LIBRARY]     = "library",
+  [VIEW_DIRECTORIES] = "directories",
+  [VIEW_PLAYLISTS]   = "playlists",
+  [VIEW_NOW_PLAYING] = "now playing",
+  [VIEW_SETTINGS]    = "settings",
 };
 
-_Static_assert(sizeof(g_view_label) / sizeof(g_view_label[0]) == BROWSER_SRC_COUNT,
-               "g_view_label must have one entry per browser view");
+_Static_assert(sizeof(g_view_label) / sizeof(g_view_label[0]) == VIEW_COUNT,
+               "g_view_label must have one entry per view");
 
 /*
- * draw_header: row 0 -- what is playing, or the program name while idle.
- * Takes the model, returns nothing.
+ * draw_header: row 0 -- the view field, then what is playing, else the
+ * model's crumb, else the program name (design II.8). Takes the model,
+ * returns nothing.
  */
 static void
 draw_header(const TuiModel * m)
 {
   fill_row(0, 0, g_layout.w, STYLE_HEADER);
-  /* Idle, the header names where the browser is and which view it is,
-     instead of repeating the program name.
-     Deliberately NOT browser_cwd: since phase 16 a key is the source's
-     private encoding ("D/music/x", "2:5:Bjork"), and printing one puts
-     an implementation detail on row 0. The name of the row the user is
-     inside says the same thing in the source's own words, and is
-     already on hand from column 0. At the top level there is no such
-     row, and the program name is the honest answer -- the view label is
-     not it, since it now has a field of its own below. */
-  const char * what = "kurono";
-  char         crumb[256];
 
+  const char * what = "kurono";
   if (m->now_playing != NULL) {
     what = m->now_playing;
-  } else if (m->browser != NULL) {
-    const BrowserRow * here =
-      browser_parent_row(m->browser, browser_parent_cursor(m->browser));
-
-    if (here != NULL) {
-      snprintf(crumb, sizeof crumb, "%s", here->name);
-      what = crumb;
-    }
+  } else if (m->crumb != NULL) {
+    what = m->crumb;
   }
 
   /* The view label gets its own fixed field so starting playback -- which
-     overwrites `what` above -- never erases it (v1.0.1 #14). Composed
-     independently of now_playing/browser state above. */
-  const char * view = (m->view >= 0 && m->view < BROWSER_SRC_COUNT)
-                        ? g_view_label[m->view]
-                        : "";
+     overwrites `what` above -- never erases it (v1.0.1 #14). */
+  const char * view = ((unsigned) g_view < (unsigned) VIEW_COUNT) ? g_view_label[g_view] : "";
   draw_text(1, 0, VIEW_FIELD_W - 1, STYLE_HEADER, view);
 
   int x = 1 + VIEW_FIELD_W;
@@ -378,22 +376,18 @@ draw_header(const TuiModel * m)
 } /* draw_header */
 
 /*
- * draw_list: draw one region's rows. Takes the region, the row array and
- * its length, the cursor index, the scroll offset, whether this region
- * owns the cursor, whether it only marks the cursor row, and the base
- * slot (STYLE_COUNT means "decide per row from is_dir"). Returns nothing.
- *
- * The parent and info regions are derived (browser.h's miller layout):
- * drawn dim, with no cursor bar, because they are not navigable. The
- * parent region still marks the row the user is inside.
+ * draw_list: draw one region's rows below its reserved top rows. Takes
+ * the region, the reserved row count, the row array and its length, the
+ * cursor index, the scroll offset, whether the region draws a cursor bar,
+ * whether it only marks the cursor row, the base slot (STYLE_COUNT means
+ * "decide per row from is_dir") and whether rows are centred. Returns
+ * nothing.
  */
 static void
-draw_list(const Region * reg, const BrowserRow * rows, size_t n,
+draw_list(const Region * reg, int top, const BrowserRow * rows, size_t n,
           size_t cursor, size_t scroll, int is_active, int mark_only,
-          StyleSlot base)
+          StyleSlot base, int centre)
 {
-  int top = layout_list_top(VIEW_DIRECTORIES, reg->role);
-
   for (int r = 0; r < reg->h - top; r++) {
     size_t idx = scroll + (size_t) r;
     if (idx >= n || rows == NULL) {
@@ -421,112 +415,173 @@ draw_list(const Region * reg, const BrowserRow * rows, size_t n,
     if ((is_active || mark_only) && idx == cursor) {
       fill_row(reg->x, reg->y + top + r, reg->w, slot);
     }
-    draw_text(reg->x, reg->y + top + r, reg->w, slot, br->name);
+
+    int off = 0;
+    if (centre) {
+      int tw = text_width(br->name);
+      off = (tw < reg->w) ? (reg->w - tw) / 2 : 0;
+    }
+    draw_text(reg->x + off, reg->y + top + r, reg->w - off, slot, br->name);
   }
 } /* draw_list */
 
+/* How a role's cursor row draws (design II.5). */
+#define CUR_NONE  0   /* no cursor row */
+#define CUR_MARK  1   /* STYLE_SELECTED mark */
+#define CUR_FOCUS 2   /* STYLE_CURSOR bar when focused, else a mark */
+
 /*
- * draw_body: the regions and the separators between them. Takes the
- * model, returns nothing. Regions are looked up by role (design II.5).
- *
- * The three regions are one widget viewed at three depths (DESIGN.md
- * VIII.4): main is the listing with the cursor, parent is what contains
- * it, info is what is inside the selection. Only main is navigable,
- * which is why only it is drawn at full contrast.
+ * Per-role draw style (design II.5), indexed by RegionRole: the cursor
+ * rule, the slot for other rows (STYLE_COUNT: per is_dir), and whether
+ * tui.c centres the scroll on the cursor rather than using the list's.
+ */
+static const struct {
+  int       cursor;
+  StyleSlot base;
+  int       tui_scroll;
+} g_role_style[ROLE_COUNT] = {
+  [ROLE_PARENT]  = { CUR_MARK,  STYLE_COUNT,        1 },
+  [ROLE_MAIN]    = { CUR_FOCUS, STYLE_COUNT,        0 },
+  [ROLE_FACET]   = { CUR_FOCUS, STYLE_COUNT,        0 },
+  [ROLE_INFO]    = { CUR_NONE,  STYLE_COL_INACTIVE, 0 },
+  [ROLE_QUEUE]   = { CUR_FOCUS, STYLE_COUNT,        1 },
+  [ROLE_COVER]   = { CUR_NONE,  STYLE_COUNT,        0 },
+  [ROLE_SOURCES] = { CUR_MARK,  STYLE_NORMAL,       1 },
+};
+
+/*
+ * draw_region: draw one allocated region from its list (design II.5).
+ * Takes the region and the list; returns nothing. An empty list draws
+ * its `empty` text dim at the first list row.
+ */
+static void
+draw_region(const Region * reg, const TuiList * l)
+{
+  if ((unsigned) reg->role >= (unsigned) ROLE_COUNT) {
+    return;
+  }
+
+  int top  = layout_list_top(g_view, reg->role);
+  int rows = reg->h - top;
+
+  if (l->n == 0 || l->rows == NULL) {
+    if (l->empty != NULL) {
+      draw_text(reg->x, reg->y + top, reg->w, STYLE_DIM, l->empty);
+    }
+    return;
+  }
+
+  int    rule    = g_role_style[reg->role].cursor;
+  int    focused = (rule == CUR_FOCUS && ui_focus() == reg->role);
+  int    mark    = (rule == CUR_MARK || (rule == CUR_FOCUS && !focused));
+  size_t scroll  = g_role_style[reg->role].tui_scroll
+                     ? list_scroll_for(l->cursor, l->n, rows)
+                     : l->scroll;
+
+  draw_list(reg, top, l->rows, l->n, l->cursor, scroll, focused, mark,
+            g_role_style[reg->role].base, l->centre);
+
+  /* The playing row, marked after the list rather than through it:
+     draw_list decides a row's slot from the cursor and one base style,
+     and the playing row is neither. Skipped on the cursor row, because
+     the cursor has to win. */
+  if (l->playing >= 0 && (size_t) l->playing != l->cursor) {
+    size_t pi = (size_t) l->playing;
+    if (pi >= scroll && pi < scroll + (size_t) rows && pi < l->n) {
+      draw_text(reg->x, reg->y + top + (int) (pi - scroll), reg->w,
+                STYLE_PLAYING, l->rows[pi].name);
+    }
+  }
+} /* draw_region */
+
+/*
+ * draw_search_results: the MODE_SEARCH results, drawn into INFO until
+ * phase 5 (decide D22). Takes the region and the model; returns nothing.
+ */
+static void
+draw_search_results(const Region * info, const TuiModel * m)
+{
+  if (m->search_n > 0 && m->search_rows != NULL) {
+    /* The clamp lives here and not in the input path because this is
+       the only place that knows how many rows there are: a keystroke can
+       shrink the result set under a cursor that was valid for the
+       previous query. */
+    g_search_shown = m->search_n;
+    if (g_search_cursor >= m->search_n) {
+      g_search_cursor = m->search_n - 1;
+    }
+    draw_list(info, 0, m->search_rows, m->search_n, g_search_cursor,
+              list_scroll_for(g_search_cursor, m->search_n, info->h),
+              1, 0, STYLE_SEARCH_MATCH, 0);
+  } else {
+    g_search_shown = 0;
+    draw_text(info->x, info->y, info->w, STYLE_DIM,
+              (g_search_len > 0) ? "(no results)" : "(type to search)");
+  }
+} /* draw_search_results */
+
+/*
+ * draw_body: every allocated region by role, then the separators between
+ * them (design II.5, II.6). Takes the model, returns nothing.
  */
 static void
 draw_body(const TuiModel * m)
 {
-  const Region * parent = layout_find(&g_layout, ROLE_PARENT);
-  const Region * body   = layout_find(&g_layout, ROLE_MAIN);
-  const Region * info   = layout_find(&g_layout, ROLE_INFO);
+  for (int i = 0; i < g_layout.nregions; i++) {
+    const Region * r = &g_layout.region[i];
 
-  /* Every branch below falls through to the separators -- an early
-     return here silently drops them, which is exactly what an empty
-     directory did before this was restructured. The frame is not the
-     listing's to skip. */
-  if (m->browser == NULL) {
-    if (body != NULL) {
-      draw_text(body->x, body->y, body->w, STYLE_DIM, "(no browser)");
-    }
-  } else {
-    size_t n      = browser_count(m->browser);
-    size_t cursor = browser_cursor(m->browser);
-    size_t pn     = browser_parent_count(m->browser);
-    size_t pcur   = browser_parent_cursor(m->browser);
-    size_t vn     = browser_preview_count(m->browser);
+    switch (r->role) {
+      case ROLE_COVER:
+      case ROLE_COUNT:
+        break;   /* never allocated in v2.0.0 (design II.5) */
 
-    if (parent != NULL) {
-      draw_list(parent, browser_parent_rows(m->browser), pn, pcur,
-                list_scroll_for(pcur, pn, parent->h), 0, 1, STYLE_COUNT);
-    }
+      case ROLE_SOURCES: {
+        /* One fixed row until v2.1.0 (design V.2). */
+        char       name[32];
+        BrowserRow row;
+        TuiList    src;
 
-    if (body != NULL) {
-      if (n == 0) {
+        snprintf(name, sizeof name, "Queue (%zu)", m->list[ROLE_QUEUE].n);
+        memset(&src, 0, sizeof src);
+        row.name   = name;
+        row.key    = NULL;
+        row.is_dir = 0;
+        src.rows    = &row;
+        src.n       = 1;
+        src.playing = -1;
+        draw_region(r, &src);
+        break;
+      }
+
+      case ROLE_INFO:
+        if (ui_mode() == MODE_SEARCH) {
+          draw_search_results(r, m);
+        } else {
+          draw_region(r, &m->list[ROLE_INFO]);
+        }
+        break;
+
+      case ROLE_MAIN: {
+        const TuiList * l = &m->list[ROLE_MAIN];
+        draw_region(r, l);
         /* DESIGN.md XI.5: an empty index is a first-run state, not an
            error state, and the thing the user needs is the path and the
            variable that changes it. */
-        draw_text(body->x, body->y, body->w, STYLE_DIM, "(empty)");
-        if (m->music_dir != NULL) {
-          draw_text(body->x, body->y + 2, body->w, STYLE_DIM, m->music_dir);
-          draw_text(body->x, body->y + 3, body->w, STYLE_DIM,
+        if (l->n == 0 && m->library_empty && m->music_dir != NULL) {
+          int top = layout_list_top(g_view, ROLE_MAIN);
+          draw_text(r->x, r->y + top + 2, r->w, STYLE_DIM, m->music_dir);
+          draw_text(r->x, r->y + top + 3, r->w, STYLE_DIM,
                     "set KURONO_MUSIC_DIR to change");
         }
-      } else {
-        draw_list(body, browser_rows(m->browser), n, cursor,
-                  browser_scroll(m->browser), 1, 0, STYLE_COUNT);
+        break;
       }
-    }
 
-    /* Info is the search results while a search is up, the queue while
-       the queue pane is up, and the selection's preview otherwise. The
-       preview cache underneath is untouched in every case, which is
-       what makes closing either one restore it exactly. */
-    if (info != NULL) {
-      if (ui_mode() == MODE_SEARCH) {
-        if (m->search_n > 0 && m->search_rows != NULL) {
-          /* The clamp lives here and not in the input path because this
-             is the only place that knows how many rows there are: a
-             keystroke can shrink the result set under a cursor that was
-             valid for the previous query. */
-          g_search_shown = m->search_n;
-          if (g_search_cursor >= m->search_n) {
-            g_search_cursor = m->search_n - 1;
-          }
-          draw_list(info, m->search_rows, m->search_n, g_search_cursor,
-                    list_scroll_for(g_search_cursor, m->search_n, info->h),
-                    1, 0, STYLE_SEARCH_MATCH);
-        } else {
-          g_search_shown = 0;
-          draw_text(info->x, info->y, info->w, STYLE_DIM,
-                    (g_search_len > 0) ? "(no results)" : "(type to search)");
-        }
-      } else if (ui_mode() == MODE_QUEUE) {
-        if (m->queue_n > 0 && m->queue_rows != NULL) {
-          size_t qc = (m->queue_cursor < m->queue_n) ? m->queue_cursor : m->queue_n - 1;
-          size_t scroll = list_scroll_for(qc, m->queue_n, info->h);
-
-          draw_list(info, m->queue_rows, m->queue_n, qc, scroll, 1, 0,
-                    STYLE_NORMAL);
-
-          /* The playing entry, marked after the list rather than through
-             it: draw_list decides a row's slot from the cursor and one
-             base style, and the playing row is neither. Skipped when it
-             is the cursor row, because the cursor bar has to win. */
-          if (m->queue_playing >= 0 && (size_t) m->queue_playing != qc) {
-            size_t pi = (size_t) m->queue_playing;
-            if (pi >= scroll && pi < scroll + (size_t) info->h && pi < m->queue_n) {
-              draw_text(info->x, info->y + (int) (pi - scroll), info->w,
-                        STYLE_PLAYING, m->queue_rows[pi].name);
-            }
-          }
-        } else {
-          draw_text(info->x, info->y, info->w, STYLE_DIM, "(queue empty)");
-        }
-      } else {
-        draw_list(info, browser_preview_rows(m->browser), vn, vn, 0, 0, 0,
-                  STYLE_COL_INACTIVE);
-      }
+      case ROLE_PARENT:
+      case ROLE_FACET:
+      case ROLE_QUEUE:
+      default:
+        draw_region(r, &m->list[r->role]);
+        break;
     }
   }
 
@@ -555,7 +610,6 @@ static const char * const g_mode_label[MODE_COUNT] = {
   [MODE_HELP]   = "-- HELP --",
   [MODE_MENU]   = "-- MENU --",
   [MODE_SEARCH] = "-- SEARCH --",
-  [MODE_QUEUE]  = "-- QUEUE --",
 };
 
 _Static_assert(sizeof(g_mode_label) / sizeof(g_mode_label[0]) == MODE_COUNT,
@@ -596,18 +650,25 @@ overlay_fits(void)
  * draw_overlay: the help box, centred, drawn over the columns and under
  * nothing. Takes nothing, returns nothing.
  *
- * Its contents are a walk of the MODE_NORMAL binding table through
- * key_name and action_name -- there is no hand-written key list anywhere,
- * so a binding added later appears here with no second edit and cannot
- * drift from what the keymap actually does (amendment 04 decision 10).
- * Rows bound to ACT_NONE are skipped; nothing in v1's table has one, and
- * a config file could produce one as an explicit unbind.
+ * Its contents are a walk of the chain the overlay covers --
+ * keymap_chain(MODE_NORMAL, 0, view), view tables first and GLOBAL last
+ * (decide D23) -- through key_name and action_name. There is no
+ * hand-written key list anywhere, so a binding added later appears here
+ * with no second edit and cannot drift from what the keymap actually does
+ * (amendment 04 decision 10). Rows bound to ACT_NONE are skipped; a
+ * config file could produce one as an explicit unbind.
  */
 static void
 draw_overlay(void)
 {
-  size_t          n    = 0;
-  const Binding * rows = keymap_table(MODE_NORMAL, &n);
+  KeyCtx chain[KEYCTX_CHAIN_MAX];
+  size_t nc = keymap_chain(MODE_NORMAL, 0, g_view, chain);
+  size_t n  = 0;
+  for (size_t c = 0; c < nc; c++) {
+    size_t cn = 0;
+    (void) keymap_table(chain[c], &cn);
+    n += cn;
+  }
 
   int box_w = g_layout.w - 2 * OVERLAY_MARGIN;
   if (box_w > OVERLAY_MAX_W) {
@@ -625,8 +686,8 @@ draw_overlay(void)
   }
 
   /* Clamped here rather than where the scroll is changed: the dispatch
-     path does not know how many rows the table has or how tall the box
-     is, and both change with the terminal size. */
+     path does not know how many rows the chain has or how tall the box
+     is, and both change with the view and the terminal size. */
   int max_scroll = (int) n - list_rows;
   if (max_scroll < 0) {
     max_scroll = 0;
@@ -650,17 +711,23 @@ draw_overlay(void)
            n);
   draw_text(box_x + 2, box_y, box_w - 4, STYLE_POPUP, title);
 
-  int drawn = 0;
-  for (size_t i = (size_t) g_overlay_scroll; i < n && drawn < list_rows; i++) {
-    if (rows[i].action == ACT_NONE) {
-      continue;
+  size_t idx   = 0;
+  int    drawn = 0;
+  for (size_t c = 0; c < nc && drawn < list_rows; c++) {
+    size_t          cn   = 0;
+    const Binding * rows = keymap_table(chain[c], &cn);
+
+    for (size_t i = 0; i < cn && drawn < list_rows; i++, idx++) {
+      if (idx < (size_t) g_overlay_scroll || rows[i].action == ACT_NONE) {
+        continue;
+      }
+      draw_text(box_x + 2, list_y + drawn, OVERLAY_KEY_W, STYLE_POPUP,
+                key_name(&rows[i]));
+      draw_text(box_x + 2 + OVERLAY_KEY_W, list_y + drawn,
+                box_w - 4 - OVERLAY_KEY_W, STYLE_POPUP,
+                action_name(rows[i].action));
+      drawn++;
     }
-    draw_text(box_x + 2, list_y + drawn, OVERLAY_KEY_W, STYLE_POPUP,
-              key_name(&rows[i]));
-    draw_text(box_x + 2 + OVERLAY_KEY_W, list_y + drawn,
-              box_w - 4 - OVERLAY_KEY_W, STYLE_POPUP,
-              action_name(rows[i].action));
-    drawn++;
   }
 } /* draw_overlay */
 
@@ -918,7 +985,7 @@ search_key(const struct tb_event * ev, Action a)
 
 /*
  * dispatch_event: route one termbox event by its type. Key events resolve
- * against the table for the current mode and go to action_dispatch;
+ * through the chain for the current mode and view and go to action_dispatch;
  * resize recomputes the layout. Every path marks the screen dirty -- the
  * single present happens later, at the bottom of the loop iteration.
  * Takes the event, returns nothing.
@@ -930,7 +997,9 @@ dispatch_event(const struct tb_event * ev)
     case TB_EVENT_KEY: {
       int32_t arg  = 0;
       UiMode  mode = ui_mode();
-      Action  a    = keymap_resolve(mode, ev, &arg);
+      KeyCtx  chain[KEYCTX_CHAIN_MAX];
+      size_t  nc   = keymap_chain(mode, 0, g_view, chain);
+      Action  a    = keymap_resolve(chain, nc, ev, &arg);
 
       /* Search is handled here and not in main.c's action_dispatch
          because the query is terminal text state and lives in this file.
@@ -953,9 +1022,7 @@ dispatch_event(const struct tb_event * ev)
 
       /* Named modes rather than "not normal": overlay_scroll_action moves
          the box's own scroll offset, which only the two drawn-as-a-box
-         modes have. MODE_QUEUE's cursor lives in ui/queueview.c and is
-         moved through action_dispatch like the browser's, so swallowing
-         its arrows here would leave the pane unnavigable. */
+         modes have. */
       int box_overlay = (mode == MODE_HELP || mode == MODE_MENU);
       if (a != ACT_NONE && !(box_overlay && overlay_scroll_action(a))) {
         action_dispatch(a, arg);
@@ -1102,15 +1169,13 @@ ui_mode_toggle(UiMode m)
     return 0;
   }
 
-  /* MODE_SEARCH and MODE_QUEUE draw no box: they borrow column 2 and the
-     message row,
-     both of which exist at any size the browser itself draws at. Gating
-     it on the overlay's margins would refuse a search on a terminal that
+  /* MODE_SEARCH draws no box: it borrows INFO and the message row, both
+     of which exist at any size the browser itself draws at. Gating it on
+     the overlay's margins would refuse a search on a terminal that
      renders the browser perfectly well. A terminal too small to draw
      anything still refuses, because there would be nowhere to show the
      prompt. */
-  int fits = (m == MODE_SEARCH || m == MODE_QUEUE) ? !g_layout.too_small
-                                                  : overlay_fits();
+  int fits = (m == MODE_SEARCH) ? !g_layout.too_small : overlay_fits();
   if (!fits || g_mode_depth >= UI_MODE_STACK_MAX) {
     return -1;
   }
@@ -1120,6 +1185,36 @@ ui_mode_toggle(UiMode m)
   g_dirty = 1;
   return 1;
 } /* ui_mode_toggle */
+
+/* ui_view: see include/ui/tui.h. */
+UiView
+ui_view(void)
+{
+  return g_view;
+} /* ui_view */
+
+/* ui_view_set: see include/ui/tui.h. */
+void
+ui_view_set(UiView v)
+{
+  g_view = v;
+  if (g_active) {
+    tui_compute_layout();
+  }
+  g_dirty = 1;
+} /* ui_view_set */
+
+/* ui_focus: see include/ui/tui.h. */
+RegionRole
+ui_focus(void)
+{
+  switch (g_view) {
+    case VIEW_LIBRARY:
+    case VIEW_DIRECTORIES: return ROLE_MAIN;
+    case VIEW_PLAYLISTS:   return ROLE_QUEUE;
+    default:               return ROLE_COUNT;
+  }
+} /* ui_focus */
 
 /*
  * tui_active: whether the terminal is currently claimed. Takes nothing,

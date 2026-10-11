@@ -417,12 +417,12 @@ typedef struct {
   Engine *      e;
   EventLoop *   el;
 
-  /* One source and one Browser per view (DESIGN.md VIII.4). `br` is the
-     active view's widget and is what every navigation action and the
-     draw code touch, so nothing below the view switch knows views
-     exist. Each view keeps its own cursor by construction: switching
-     away and back restores position because the widget was never torn
-     down (phase-16-browser.md I.2). */
+  /* One source and one Browser per data source (DESIGN.md VIII.4). `br`
+     is the browser that owns the focused region of the current view, or
+     NULL in a view without one (player_view_browser); it is what every
+     navigation action touches. Each browser keeps its own cursor by
+     construction: switching away and back restores position because the
+     widget was never torn down (phase-16-browser.md I.2). */
   /* Borrowed by every library source for the lifetime of the run: the
      source keeps the pointer rather than copying (browser.h), so this
      array must outlive the browsers, not the construction block that
@@ -430,8 +430,23 @@ typedef struct {
   const char **   rootv;
   BrowserSource   brsrc[BROWSER_SRC_COUNT];
   Browser *       brv[BROWSER_SRC_COUNT];
-  int             view;              /* index into brv, the active view */
-  Browser *       br;                /* == brv[view]; NULL on every headless run */
+  Browser *       br;                /* focused view's browser; NULL on every headless run */
+  int             prev_view;         /* where `v` returns from Playlists (decide D26) */
+
+  /* INFO detail caches, keyed by track id and rebuilt at repaint only
+     when the id changes; -1 forces a rebuild (decide D21). `info_*` is
+     the Playlists cursor entry, `np_*` the playing track. Rows are owned
+     here and freed with the library source's free_rows. */
+  int64_t         info_id;
+  BrowserRow *    info_rows;
+  size_t          info_n;
+  int64_t         np_id;
+  BrowserRow *    np_rows;
+  size_t          np_n;
+
+  /* The Settings view's rows, built once at startup (design V.4). */
+  BrowserRow *    settings_rows;
+  size_t          settings_n;
   Queue *         q;                 /* NULL on every headless run */
 
   /* The playing track, for the status bar. A copy of the basename
@@ -600,6 +615,81 @@ static void player_on_notify(void * user, int notification_type);
 static void player_action(Player * p, Action a, int32_t arg);
 
 /*
+ * player_view_browser: the browser that owns the focused region of the
+ * current view. Takes the Player, returns brv[] for Library and
+ * Directories (Library shows the Artists browser until phase 5) and NULL
+ * for every other view.
+ */
+static Browser *
+player_view_browser(const Player * p)
+{
+  switch (ui_view()) {
+    case VIEW_LIBRARY:     return p->brv[BROWSER_SRC_LIBRARY];
+    case VIEW_DIRECTORIES: return p->brv[BROWSER_SRC_DIRECTORY];
+    default:               return NULL;
+  }
+} /* player_view_browser */
+
+/*
+ * player_view_src: the source behind p->br. Takes the Player, returns
+ * the Directories source in Directories and the library source in every
+ * other view; callers reach it only with p->br != NULL.
+ */
+static const BrowserSource *
+player_view_src(const Player * p)
+{
+  return (ui_view() == VIEW_DIRECTORIES) ? &p->brsrc[BROWSER_SRC_DIRECTORY]
+                                         : &p->brsrc[BROWSER_SRC_LIBRARY];
+} /* player_view_src */
+
+/*
+ * player_view_rows: list rows of the focused region (design VII), its
+ * height less the rows reserved above the list. Takes nothing, returns
+ * at least 1.
+ */
+static int
+player_view_rows(void)
+{
+  const Region * r = layout_find(tui_layout(), ui_focus());
+  if (r == NULL) {
+    return 1;
+  }
+  int rows = r->h - layout_list_top(ui_view(), r->role);
+  return (rows > 1) ? rows : 1;
+} /* player_view_rows */
+
+/*
+ * player_view_viewports: tell the browser that owns an allocated region
+ * of the current view how many list rows it has (design VII). Takes the
+ * Player, returns nothing. Run after every resize drain and view switch.
+ */
+static void
+player_view_viewports(Player * p)
+{
+  if (p->br == NULL) {
+    return;
+  }
+  const Region * r = layout_find(tui_layout(), ROLE_MAIN);
+  if (r != NULL) {
+    browser_set_viewport(p->br, r->h - layout_list_top(ui_view(), ROLE_MAIN));
+  }
+} /* player_view_viewports */
+
+/*
+ * player_view_switch: make `v` the current view. Takes the Player and
+ * the view (range checked by the caller), returns nothing. Never
+ * refused (design II.1).
+ */
+static void
+player_view_switch(Player * p, UiView v)
+{
+  ui_view_set(v);
+  p->br = player_view_browser(p);
+  player_view_viewports(p);
+  tui_mark_dirty();
+} /* player_view_switch */
+
+/*
  * player_queue_find: play-order position of the first entry whose path
  * equals `path`. Takes the queue, the path and an out-param for the
  * position; returns 1 on a hit and 0 on a miss, leaving *out untouched
@@ -695,20 +785,13 @@ player_message(Player * p)
  * Never writes to stderr: termbox2 owns the terminal here.
  */
 /*
- * queue_cursor_action: move the queue pane's cursor for one navigation
- * action. Takes the action, returns 1 when it moved the cursor and 0
- * when the action was not a cursor move.
- *
- * Separate from the browser's block in action_dispatch because the two
- * lists are never both focused: whichever is on top consumes the keys
- * outright.
+ * queue_cursor_action: move the Playlists queue cursor for one
+ * navigation action. Takes the action and the page size, returns 1 when
+ * it moved the cursor and 0 when the action was not a cursor move.
  */
 static int
-queue_cursor_action(Action a)
+queue_cursor_action(Action a, int page)
 {
-  const TuiLayout * l = tui_layout();
-  int page = (l != NULL && l->body_h > 1) ? l->body_h - 1 : 1;
-
   switch (a) {
     case ACT_CURSOR_UP:        queueview_cursor_move(-1);         return 1;
     case ACT_CURSOR_DOWN:      queueview_cursor_move(1);          return 1;
@@ -755,22 +838,13 @@ action_dispatch(Action a, int32_t arg)
   }
 
   if (a == ACT_QUEUE_TOGGLE) {
-    /* Rebuilt on the way in, never per repaint: the pane's contents can
-       only change through an action, and every action that changes them
-       rebuilds. */
-    if (ui_mode() == MODE_QUEUE) {
-      ui_mode_pop();
-    } else if (ui_mode_toggle(MODE_QUEUE) > 0) {
-      queueview_rebuild(p->q, p->db);
-      /* Open on what is playing rather than at the top: the pane is
-         opened to see where you are far more often than to see entry 1. */
-      if (p->q != NULL && queue_count(p->q) > 0) {
-        queueview_cursor_set(queue_cursor(p->q));
-      }
+    /* Playlists and back (decide D8, D26). */
+    if (ui_view() != VIEW_PLAYLISTS) {
+      p->prev_view = (int) ui_view();
+      player_view_switch(p, VIEW_PLAYLISTS);
     } else {
-      player_report(p, "terminal too small for the queue");
+      player_view_switch(p, (UiView) p->prev_view);
     }
-    tui_mark_dirty();
     return;
   }
 
@@ -784,7 +858,7 @@ action_dispatch(Action a, int32_t arg)
   }
 
   if (a == ACT_CONFIRM) {
-    if (ui_mode() == MODE_QUEUE) {
+    if (ui_view() == VIEW_PLAYLISTS) {
       player_queue_confirm(p);
       return;
     }
@@ -793,57 +867,56 @@ action_dispatch(Action a, int32_t arg)
     return;
   }
 
-  /* The queue pane owns the cursor keys while it is up. Checked above
-     the browser's navigation block rather than inside it: the browser is
-     still on screen underneath and must not move, and a pane whose
-     arrows moved the list behind it would be the same class of silent
-     wrongness as an unbound key. */
-  if (ui_mode() == MODE_QUEUE && queue_cursor_action(a)) {
-    tui_mark_dirty();
-    return;
-  }
-
-  /* View switching sits above the browser guard on purpose: if one
-     view failed to build, the others are still reachable, and being
-     stranded in a dead view with no way out is worse than the failure
-     that caused it. */
+  /* View switching sits above the browser guard on purpose: every view
+     is reachable whatever failed to build (design II.1). */
   switch (a) {
     case ACT_VIEW_NEXT:
     case ACT_VIEW_PREV:
     case ACT_VIEW_SET: {
-      /* A view switch is an index change and nothing else: each view's
-         widget keeps running, so its cursor, scroll and depth are
-         exactly where they were left (phase-16-browser.md I.2). */
+      /* A view switch moves nothing else: each widget keeps running, so
+         its cursor, scroll and depth are exactly where they were left
+         (phase-16-browser.md I.2). */
       int next;
       if (a == ACT_VIEW_SET) {
         next = arg;
       } else {
-        int step = (a == ACT_VIEW_NEXT) ? 1 : BROWSER_SRC_COUNT - 1;
-        next = (p->view + step) % BROWSER_SRC_COUNT;
+        int step = (a == ACT_VIEW_NEXT) ? 1 : VIEW_COUNT - 1;
+        next = ((int) ui_view() + step) % VIEW_COUNT;
       }
 
-      if (next < 0 || next >= BROWSER_SRC_COUNT || p->brv[next] == NULL) {
+      if (next < 0 || next >= VIEW_COUNT) {
         player_report(p, "view unavailable");
+        tui_mark_dirty();
       } else {
-        p->view = next;
-        p->br   = p->brv[next];
+        player_view_switch(p, (UiView) next);
       }
-      tui_mark_dirty();
       return;
     }
     default:
       break;
   }
 
+  /* A page is one screenful minus a row of overlap, so the line the user
+     was reading stays on screen across the jump. */
+  int page = player_view_rows() - 1;
+  if (page < 1) {
+    page = 1;
+  }
+
+  if (ui_view() == VIEW_PLAYLISTS) {
+    if (queue_cursor_action(a, page)) {
+      tui_mark_dirty();
+      return;
+    }
+    if (a == ACT_COL_LEFT || a == ACT_COL_RIGHT) {
+      return;   /* SOURCES is not focusable (decide D13) */
+    }
+  }
+
   /* Navigation. Every one of these is a pure cursor move inside
      browser.c -- nothing here reaches the engine, and a browser that
      failed to build leaves them all no-ops rather than special cases. */
   if (p->br != NULL) {
-    /* A page is one screenful minus a row of overlap, so the line the
-       user was reading stays on screen across the jump. */
-    const TuiLayout * l = tui_layout();
-    int page = (l != NULL && l->body_h > 1) ? l->body_h - 1 : 1;
-
     switch (a) {
       case ACT_CURSOR_UP:
         browser_cursor_move(p->br, -1);
@@ -928,7 +1001,7 @@ player_row_target(Player * p, const BrowserRow * row,
     return -1;
   }
 
-  int64_t id = browser_library_track_id(&p->brsrc[p->view], row->key);
+  int64_t id = browser_library_track_id(player_view_src(p), row->key);
   if (id <= 0) {
     /* Not a library row -- the filesystem source's keys are still paths,
        and so is anything a future source hands back that is not a track.
@@ -1005,7 +1078,7 @@ player_enqueue_row(Player * p, const BrowserRow * sel)
   size_t       n = 0;
   size_t       added = 0;
 
-  if (browser_library_expand(&p->brsrc[p->view], sel->key, &rows, &n) == 0 && n > 0) {
+  if (browser_library_expand(player_view_src(p), sel->key, &rows, &n) == 0 && n > 0) {
     int rc = player_enqueue_rows(p, rows, n, &added);
     db_track_rows_free(rows, n);
     if (rc != 0) {
@@ -1077,7 +1150,7 @@ player_play_container(Player * p, const BrowserRow * sel)
   size_t       n = 0;
   size_t       added = 0;
 
-  if (browser_library_expand(&p->brsrc[p->view], sel->key, &rows, &n) != 0 || n == 0) {
+  if (browser_library_expand(player_view_src(p), sel->key, &rows, &n) != 0 || n == 0) {
     db_track_rows_free(rows, n);
     player_report(p, "%s holds no tracks", sel->name);
     return;
@@ -2515,7 +2588,7 @@ player_queue_playing_index(const Player * p)
 } /* player_queue_playing_index */
 
 /*
- * player_queue_remove: ACT_REMOVE against the queue pane's cursor. Takes
+ * player_queue_remove: ACT_REMOVE against the Playlists cursor. Takes
  * the Player, returns nothing.
  *
  * Removing the entry that is playing does not stop playback: the audio
@@ -2584,7 +2657,7 @@ player_queue_move(Player * p, int dir)
 } /* player_queue_move */
 
 /*
- * player_queue_confirm: Enter in the queue pane -- play the entry under
+ * player_queue_confirm: Enter in Playlists -- play the entry under
  * the cursor. Takes the Player, returns nothing.
  *
  * An explicit user action, so it is a real CMD_PLAY and therefore
@@ -2652,7 +2725,7 @@ player_locate(Player * p, int64_t track_id, const char * label)
 
   char * parent = NULL;
   char * row    = NULL;
-  int    rc     = browser_library_locate(&p->brsrc[p->view], &t, &parent, &row);
+  int    rc     = browser_library_locate(player_view_src(p), &t, &parent, &row);
   db_track_row_free_fields(&t);
 
   if (rc != 0) {
@@ -2675,12 +2748,32 @@ player_locate(Player * p, int64_t track_id, const char * label)
 } /* player_locate */
 
 /*
- * player_jump_to_playing: ACT_JUMP_TO_PLAYING -- move the browser to the
- * playing track. Takes the Player, returns nothing.
+ * player_jump_to_playing: ACT_JUMP_TO_PLAYING -- move the current view's
+ * cursor to the playing track (design III.6). Takes the Player, returns
+ * nothing.
  */
 static void
 player_jump_to_playing(Player * p)
 {
+  switch (ui_view()) {
+    case VIEW_PLAYLISTS: {
+      int at = player_queue_playing_index(p);
+      if (at < 0) {
+        player_report(p, "nothing playing");
+        return;
+      }
+      queueview_cursor_set((size_t) at);
+      tui_mark_dirty();
+      return;
+    }
+    case VIEW_NOW_PLAYING:
+    case VIEW_SETTINGS:
+      player_report(p, "nothing to jump to here");
+      return;
+    default:
+      break;
+  }
+
   if (p->br == NULL) {
     player_report(p, "nothing to browse");
     return;
@@ -3059,6 +3152,9 @@ player_rescan(Player * p)
     }
   }
   queueview_rebuild(p->q, p->db);
+  /* Tags may have changed behind the same ids (decide D21). */
+  p->info_id = -1;
+  p->np_id   = -1;
 
   int indexed = ui.done - skipped;
   if (skipped > 0) {
@@ -3367,6 +3463,211 @@ player_tick(Player * p)
 } /* player_tick */
 
 /*
+ * player_view_rows_free: free rows built by player_view_settings_build.
+ * Takes the rows and their count, returns nothing. NULL is a no-op.
+ */
+static void
+player_view_rows_free(BrowserRow * rows, size_t n)
+{
+  if (rows == NULL) {
+    return;
+  }
+  for (size_t i = 0; i < n; i++) {
+    free(rows[i].name);
+    free(rows[i].key);
+  }
+  free(rows);
+} /* player_view_rows_free */
+
+/*
+ * player_view_settings_build: the Settings view's read-only rows (design
+ * V.4), the fields --paths prints. Takes the Player, returns nothing; on
+ * allocation failure settings_rows stays NULL and the view draws
+ * "(unavailable)".
+ */
+static void
+player_view_settings_build(Player * p)
+{
+  const char * trace = getenv("KURONO_TRACE");
+  size_t       cap   = p->cfg.nroots + 7;
+  BrowserRow * rows  = calloc(cap, sizeof *rows);
+  size_t       n     = 0;
+  char         buf[PATH_MAX + 32];
+
+  if (rows == NULL) {
+    return;
+  }
+
+  for (size_t i = 0; i < p->cfg.nroots; i++) {
+    snprintf(buf, sizeof buf, "%-13s %s%s", "music dir", p->cfg.roots[i].path,
+             p->cfg.roots[i].ok ? "" : " (missing)");
+    rows[n++].name = strdup(buf);
+  }
+
+  size_t len = (size_t) snprintf(buf, sizeof buf, "%-13s ", "ignored");
+  for (size_t i = 0; i < p->cfg.nignore && len < sizeof buf; i++) {
+    len += (size_t) snprintf(buf + len, sizeof buf - len, "%s%s", p->cfg.ignore[i],
+                             (i + 1 < p->cfg.nignore) ? ", " : "");
+  }
+  rows[n++].name = strdup(buf);
+
+  snprintf(buf, sizeof buf, "%-13s %s", "playlists", p->cfg.playlist_dir);
+  rows[n++].name = strdup(buf);
+  snprintf(buf, sizeof buf, "%-13s %s", "database", p->cfg.db_path);
+  rows[n++].name = strdup(buf);
+  snprintf(buf, sizeof buf, "%-13s %s", "startup scan", p->cfg.no_scan ? "off" : "on");
+  rows[n++].name = strdup(buf);
+  snprintf(buf, sizeof buf, "%-13s %s", "trace",
+           (trace != NULL && strcmp(trace, "1") == 0) ? "on" : "off");
+  rows[n++].name = strdup(buf);
+  snprintf(buf, sizeof buf, "%-13s %s", "theme", "default");
+  rows[n++].name = strdup(buf);
+  rows[n++].name = strdup("read-only; a configuration file arrives in v2.3.0");
+
+  for (size_t i = 0; i < n; i++) {
+    if (rows[i].name == NULL) {
+      player_view_rows_free(rows, n);
+      return;
+    }
+  }
+  p->settings_rows = rows;
+  p->settings_n    = n;
+} /* player_view_settings_build */
+
+/*
+ * player_view_detail: rebuild one INFO detail cache when its track id
+ * changed (design V.2). Takes the Player, the wanted id, and the cache's
+ * id, rows and count; returns nothing. id 0 leaves the cache empty.
+ */
+static void
+player_view_detail(Player * p, int64_t id, int64_t * cid, BrowserRow ** rows, size_t * n)
+{
+  const BrowserSource * lib = &p->brsrc[BROWSER_SRC_LIBRARY];
+
+  if (*cid == id) {
+    return;
+  }
+  if (*rows != NULL) {
+    lib->free_rows(lib->self, *rows, *n);
+  }
+  *rows = NULL;
+  *n    = 0;
+  *cid  = id;
+  if (id > 0 && browser_library_detail(lib, id, rows, n) != 0) {
+    *rows = NULL;
+    *n    = 0;
+  }
+} /* player_view_detail */
+
+/*
+ * player_view_details: refresh the INFO cache the current view draws.
+ * Takes the Player, returns nothing. Runs from player_repaint only, never
+ * from the fill the scan-progress repaint shares.
+ */
+static void
+player_view_details(Player * p)
+{
+  if (ui_view() == VIEW_PLAYLISTS) {
+    int64_t id = 0;
+    if (p->q != NULL && queueview_count() > 0) {
+      const QueueEntry * e = queue_at(p->q, queueview_cursor());
+      id = (e != NULL) ? e->track_id : 0;
+    }
+    player_view_detail(p, id, &p->info_id, &p->info_rows, &p->info_n);
+  } else if (ui_view() == VIEW_NOW_PLAYING) {
+    player_view_detail(p, p->now_id, &p->np_id, &p->np_rows, &p->np_n);
+  }
+} /* player_view_details */
+
+/*
+ * player_fill_lists: one TuiList per role the current view draws (design
+ * II.5, V). Takes the Player and the model, returns nothing.
+ */
+static void
+player_fill_lists(Player * p, TuiModel * m)
+{
+  for (int r = 0; r < ROLE_COUNT; r++) {
+    m->list[r].playing = -1;
+  }
+
+  switch (ui_view()) {
+    case VIEW_LIBRARY:
+    case VIEW_DIRECTORIES: {
+      Browser * b = p->br;
+      if (b == NULL) {
+        m->list[ROLE_MAIN].empty = "(unavailable)";
+        break;
+      }
+      TuiList * pl = &m->list[ROLE_PARENT];
+      pl->rows   = browser_parent_rows(b);
+      pl->n      = browser_parent_count(b);
+      pl->cursor = browser_parent_cursor(b);
+
+      TuiList * ml = &m->list[ROLE_MAIN];
+      ml->rows   = browser_rows(b);
+      ml->n      = browser_count(b);
+      ml->cursor = browser_cursor(b);
+      ml->scroll = browser_scroll(b);
+      ml->empty  = "(empty)";
+
+      TuiList * il = &m->list[ROLE_INFO];
+      il->rows   = browser_preview_rows(b);
+      il->n      = browser_preview_count(b);
+      il->cursor = il->n;
+
+      /* The name of the row the user is inside, never browser_cwd: a key
+         is the source's private encoding (phase 16). */
+      const BrowserRow * here = browser_parent_row(b, browser_parent_cursor(b));
+      m->crumb         = (here != NULL) ? here->name : NULL;
+      m->library_empty = (ml->n == 0);
+      break;
+    }
+
+    case VIEW_PLAYLISTS: {
+      TuiList * ql = &m->list[ROLE_QUEUE];
+      ql->rows    = queueview_rows();
+      ql->n       = queueview_count();
+      ql->cursor  = queueview_cursor();
+      if (ql->n > 0 && ql->cursor >= ql->n) {
+        ql->cursor = ql->n - 1;
+      }
+      ql->playing = player_queue_playing_index(p);
+      ql->empty   = "(queue empty)";
+
+      TuiList * il = &m->list[ROLE_INFO];
+      il->rows   = p->info_rows;
+      il->n      = p->info_n;
+      il->cursor = il->n;
+      il->empty  = (ql->n > 0) ? "(no library entry)" : NULL;
+      m->crumb   = "Queue";
+      break;
+    }
+
+    case VIEW_NOW_PLAYING: {
+      TuiList * il = &m->list[ROLE_INFO];
+      il->rows   = p->np_rows;
+      il->n      = p->np_n;
+      il->cursor = il->n;
+      il->centre = 1;
+      il->empty  = (p->now_name[0] != '\0') ? "(no library entry)" : "(nothing playing)";
+      break;
+    }
+
+    case VIEW_SETTINGS: {
+      TuiList * sl = &m->list[ROLE_MAIN];
+      sl->rows   = p->settings_rows;
+      sl->n      = p->settings_n;
+      sl->cursor = sl->n;
+      sl->empty  = "(unavailable)";
+      break;
+    }
+
+    default:
+      break;
+  }
+} /* player_fill_lists */
+
+/*
  * player_fill_model: describe the Player to the draw code. Takes the
  * Player and the model to fill, returns nothing.
  *
@@ -3390,22 +3691,20 @@ player_fill_model(Player * p, TuiModel * out)
   m.paused      = (p->play == PLAY_PAUSED);
   m.volume_pct  = p->vol_pct;
   m.muted       = p->muted;
-  m.browser     = p->br;
-  m.view        = p->view;
   m.search_rows = p->search_rows;
   m.search_n    = p->search_n;
-  m.queue_rows  = queueview_rows();
-  m.queue_n     = queueview_count();
-  m.queue_cursor = queueview_cursor();
-  m.queue_playing = player_queue_playing_index(p);
   m.music_dir   = (p->cfg.nroots > 0) ? p->cfg.roots[0].path : NULL;
+  player_fill_lists(p, &m);
 
   /* DESIGN.md XI.7: a result set that ran out of memory is reported and
-     rendered, never aborted. Drained here because the repaint is the
-     one place that runs after every query. */
-  if (p->br != NULL && browser_library_truncated(&p->brsrc[p->view])) {
-    player_report(p, "out of memory, result truncated");
-    m.message = player_message(p);
+     rendered, never aborted. Drained here, for both sources (design
+     VII), because the repaint is the one place that runs after every
+     query. */
+  for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
+    if (p->brv[v] != NULL && browser_library_truncated(&p->brsrc[v])) {
+      player_report(p, "out of memory, result truncated");
+      m.message = player_message(p);
+    }
   }
   if (p->q != NULL) {
     m.shuffle = queue_shuffle(p->q);
@@ -3442,6 +3741,7 @@ player_repaint(Player * p)
      and must not re-query the database while a scan holds the write
      transaction open. */
   browser_refresh_derived(p->br);
+  player_view_details(p);
   player_fill_model(p, &m);
   tui_draw(&m);
 } /* player_repaint */
@@ -3578,12 +3878,17 @@ shutdown_all(Player * p)
         exists to make unwriteable. */
   /* Before the browsers only for tidiness -- the results borrow nothing
      from them. A run can end with a search still open, which is the only
-     reason this is here at all. The queue pane's rows are in the same
-     position and freed for the same reason: they borrow nothing, and a
-     run can end with the pane up. Both must go before db_close, though,
-     which is step 7 below -- the rows were built from it. */
+     reason this is here at all. The queue view's rows and the view
+     caches are in the same position and freed for the same reason: they
+     borrow nothing. All must go before db_close, though, which is step 7
+     below -- the rows were built from it. */
   player_search_free(p);
   queueview_free();
+  player_view_detail(p, 0, &p->info_id, &p->info_rows, &p->info_n);
+  player_view_detail(p, 0, &p->np_id, &p->np_rows, &p->np_n);
+  player_view_rows_free(p->settings_rows, p->settings_n);
+  p->settings_rows = NULL;
+  p->settings_n    = 0;
 
   for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
     browser_destroy(p->brv[v]);
@@ -3680,12 +3985,7 @@ player_loop(Player * p)
              can deliver a resize on either fd (see above), and a
              viewport that lags a resize scrolls the selection off
              screen. */
-          if (p->br != NULL) {
-            const TuiLayout * l = tui_layout();
-            if (l != NULL) {
-              browser_set_viewport(p->br, l->body_h);
-            }
-          }
+          player_view_viewports(p);
           break;
 
         /* EPOLLHUP|EPOLLERR on the tty. SIGHUP on the signalfd usually
@@ -4121,8 +4421,6 @@ run_tui(void)
         fprintf(stderr, "kurono: view %d unavailable -- browsing disabled\n", v);
       }
     }
-    p.view = BROWSER_SRC_DIRECTORY;
-    p.br   = p.brv[p.view];
   }
 
   /* The queue. Seeded from the clock rather than internally, because
@@ -4135,6 +4433,15 @@ run_tui(void)
   if (p.q == NULL) {
     fprintf(stderr, "kurono: could not create the queue -- playback disabled\n");
   }
+
+  /* The views' own state (design V.2, V.4; decide D21, D26). The queue
+     view is valid before the first mutation; queueview_rebuild takes a
+     NULL queue (decide D27). */
+  p.prev_view = VIEW_LIBRARY;
+  p.info_id   = -1;
+  p.np_id     = -1;
+  queueview_rebuild(p.q, p.db);
+  player_view_settings_build(&p);
 
   /* Step 9: tb_init, then the remaining epoll registrations. Its
      position is unaffected by amendment 05 -- what used to precede it
@@ -4167,16 +4474,10 @@ run_tui(void)
     return p.status;
   }
 
-  /* The browser needs a viewport before the first paint, not only on
-     the first resize: without this the widget keeps its minimum of one
-     row and a listing taller than the terminal would draw one line and
-     scroll on every cursor move. */
-  if (p.br != NULL) {
-    const TuiLayout * l0 = tui_layout();
-    if (l0 != NULL) {
-      browser_set_viewport(p.br, l0->body_h);
-    }
-  }
+  /* The startup view by assignment, not by ordinal (design II.1). The
+     browser needs a viewport before the first paint, not only on the
+     first resize: without it the widget keeps its minimum of one row. */
+  player_view_switch(&p, VIEW_LIBRARY);
 
   /* First paint before the first wait, or the screen stays blank until
      something happens to be dirty. */

@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "../../vendor/termbox2.h"   /* struct tb_event, TB_KEY_*, TB_MOD_* */
+#include "layout.h"                  /* UiView, for keymap_chain (design II.7) */
 
 /*
  * Key -> Action resolution (DESIGN.md VIII.5).
@@ -66,16 +67,30 @@ typedef enum {
 } Action;
 
 /*
- * UiMode: which binding table an event resolves against (amendment 04
- * decision 3). The stack that holds these lives in ui/tui.c and nothing
- * outside that file writes it; main.c reads the top through ui_mode().
+ * UiMode: what is on top of the input stack (amendment 04 decision 3).
+ * The stack lives in ui/tui.c and nothing outside that file writes it;
+ * main.c reads the top through ui_mode(). HELP, MENU and SEARCH each
+ * resolve against one exclusive context (keymap_chain).
  *
- * MODE_COUNT is not a mode. It sizes the table-of-tables in keymap.c and
- * the name array in tui.c.
+ * MODE_COUNT is not a mode. It sizes the name array in tui.c.
  */
 typedef enum {
-  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_QUEUE, MODE_COUNT
+  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_COUNT
 } UiMode;
+
+/*
+ * KeyCtx: one binding table each (design III.2). A view resolves a key
+ * through a chain of contexts; HELP, MENU and FILTER are exclusive and
+ * replace the chain. Append-only: v2.3.0's config file names these as
+ * sections ([global], [list], ...).
+ */
+typedef enum {
+  KEYCTX_GLOBAL = 0, KEYCTX_LIST, KEYCTX_BROWSE, KEYCTX_LIBRARY, KEYCTX_TRACKLIST,
+  KEYCTX_FILTER, KEYCTX_HELP, KEYCTX_MENU,
+  KEYCTX_COUNT
+} KeyCtx;
+
+#define KEYCTX_CHAIN_MAX 4
 
 /*
  * One row of the binding table.
@@ -98,9 +113,30 @@ typedef struct {
   int32_t  arg;        /* seek ms, volume step, view id, eq band, ... */
 } Binding;
 
-Action keymap_resolve(UiMode mode, const struct tb_event * ev, int32_t * out_arg);
+/*
+ * keymap_chain: the contexts in force for (mode, editing, view), in
+ * resolution order (design III.2 table). Pure. Fills out[] and returns
+ * the chain length.
+ */
+size_t keymap_chain(UiMode mode, int editing, UiView view, KeyCtx out[KEYCTX_CHAIN_MAX]);
 
-const Binding * keymap_table(UiMode mode, size_t * out_count);
+/*
+ * keymap_resolve: walk the chain's tables in order, first match wins.
+ * Takes the chain and its length, the event and an out-param for the
+ * row's arg (not NULL); returns the Action, or ACT_NONE with *out_arg = 0
+ * for a non-key event or a key no table in the chain binds.
+ */
+Action keymap_resolve(const KeyCtx * chain, size_t n, const struct tb_event * ev,
+                      int32_t * out_arg);
+
+/*
+ * keymap_table: the compiled-in rows of one context, for the help
+ * overlay and the tests. Takes the context and an out-param for the row
+ * count (may be NULL); returns the first row, or NULL with a count of 0
+ * for a context with no rows (KEYCTX_LIBRARY until phase 5) or out of
+ * range.
+ */
+const Binding * keymap_table(KeyCtx ctx, size_t * out_count);
 
 const char * action_name(Action a);
 

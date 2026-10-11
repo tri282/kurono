@@ -20,6 +20,20 @@
  */
 
 /*
+ * TuiList: one region's rows (design II.5). `scroll` is used as given
+ * for MAIN, FACET and INFO; tui.c centres PARENT, QUEUE and SOURCES on
+ * the cursor itself. A cursor >= n marks no row.
+ */
+typedef struct {
+  const BrowserRow * rows;
+  size_t             n, cursor, scroll;
+  int                playing;  /* row overdrawn in STYLE_PLAYING, -1 for none */
+  const char *       empty;    /* drawn dim when n == 0; may be NULL */
+  int                capped;   /* filled in phase 5 */
+  int                centre;   /* centre each row (Now playing) */
+} TuiList;
+
+/*
  * What the status bar and header show. main.c fills one of these per
  * repaint from the Player it already owns. Every pointer may be NULL and
  * every count may be zero -- an idle player with no device is the normal
@@ -37,43 +51,27 @@ typedef struct {
   int          volume_pct;
   int          muted;
 
-  /* Borrowed, may be NULL before the browser exists or in a run that
-     has none. tui.c reads it only through browser.h's const accessors:
-     ui/ calling ui/ is inside the dependency graph, and browser.c
-     itself depends on nothing but libc, so this does not weaken the
-     rule that tui.c reaches neither audio/ nor library/. */
-  const Browser * browser;
+  /* One list per region role (design II.5); tui.c draws whichever roles
+     the current layout allocated. Rows are borrowed until the next
+     repaint. */
+  TuiList         list[ROLE_COUNT];
 
-  /* Which view `browser` belongs to, for the column labels only. The
-     draw code must not branch on it for anything else: a view is a
-     source plus a label, and a switch here is the leak DESIGN.md VIII.4
-     forbids (phase-16-browser.md I.1). */
-  int             view;
+  /* Header text when idle (design II.8); NULL draws the program name. */
+  const char *    crumb;
 
-  /* The resolved music directory, for DESIGN.md XI.5's first-run state:
-     an empty index shows the path and the variable that changes it.
-     Borrowed from Config; NULL on a run with no browser. */
+  /* DESIGN.md XI.5's first-run state: MAIN is an empty index, so the
+     draw adds the music directory and the variable that changes it. */
+  int             library_empty;
+
+  /* The resolved music directory, for library_empty. Borrowed from
+     Config; NULL on a run with no root. */
   const char *    music_dir;
 
-  /* Search results, for column 2 while MODE_SEARCH is on top. Borrowed
-     from the Player, which owns the rows and frees them when the search
-     ends. Column 2's own preview cache is deliberately NOT touched
-     while a search is up: the results are drawn instead of it, so
-     cancelling restores it byte-for-byte by doing nothing at all
-     (plans/kurono/05-impl/phase-16.md step 6). */
+  /* Search results, drawn into INFO while MODE_SEARCH is on top (decide
+     D22). Borrowed from the Player, which owns the rows and frees them
+     when the search ends. Removed in phase 5. */
   const BrowserRow * search_rows;
   size_t             search_n;
-
-  /* The queue pane's rows, for column 2 while MODE_QUEUE is on top.
-     Borrowed from ui/queueview.c, which owns them and the cursor;
-     main.c passes them through for the same reason it passes the search
-     results through, and column 2's preview cache is untouched here as
-     well. `queue_playing` is the play-order position of the entry that
-     is sounding, or -1 when nothing is. */
-  const BrowserRow * queue_rows;
-  size_t             queue_n;
-  size_t             queue_cursor;
-  int                queue_playing;
 
   /* DESIGN.md XI.6: a visible underrun counter is worth more than any
      amount of reasoning about whether underruns are happening. Shown
@@ -112,6 +110,19 @@ int  tui_active(void);
 UiMode ui_mode(void);
 int    ui_mode_toggle(UiMode m);
 void   ui_mode_pop(void);
+
+/*
+ * View state (design II.1, II.7), owned by tui.c beside the mode stack.
+ *
+ * ui_view returns the current view. ui_view_set stores `v`, recomputes
+ * the layout and marks the screen dirty; the caller validates the range.
+ * ui_focus returns the role that owns the cursor: ROLE_MAIN in Library
+ * and Directories, ROLE_QUEUE in Playlists, ROLE_COUNT (none) in Now
+ * playing and Settings.
+ */
+UiView     ui_view(void);
+void       ui_view_set(UiView v);
+RegionRole ui_focus(void);
 
 void tui_get_fds(int * ttyfd, int * resizefd);
 

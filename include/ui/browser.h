@@ -188,6 +188,14 @@ int browser_library_expand(const BrowserSource * src, const char * row_key,
                            DbTrackRow ** out_rows, size_t * out_n);
 
 /*
+ * browser_library_detail: the track-detail rows lib_preview_track builds
+ * for library id `id` (design IV.1, V.2). Takes the library source, the
+ * id, and out-params; returns 0 with *out owned by the caller (free with
+ * the source's free_rows) or -1. id 0 or an unknown id is -1.
+ */
+int browser_library_detail(const BrowserSource * src, int64_t id, BrowserRow ** out, size_t * n);
+
+/*
  * browser_create / browser_destroy: the widget. `root` is the key the
  * first column loads and the point above which ascending stops.
  * Returns NULL on allocation failure or if the root will not load.

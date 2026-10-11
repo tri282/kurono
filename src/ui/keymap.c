@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 /*
- * ui/keymap.c -- the one compiled-in Binding table and the table walk
+ * ui/keymap.c -- the per-context Binding tables and the chain walk
  * that resolves a termbox2 key event to an Action.
  *
  * CLAUDE.md's architectural rule: no raw key switch statements in the
@@ -22,7 +22,9 @@
 #define SEEK_LARGE_MS    30000
 
 /*
- * The binding table, matched in order.
+ * The binding tables, one per KeyCtx (design III.2, IX.1), each matched
+ * in order. A (key, ch, mod) triple appears in at most one table of any
+ * non-exclusive chain; keymap_test asserts it.
  *
  * key/ch/mod are matched together; see the Binding comment in keymap.h
  * for which of key and ch termbox2 populates. Space is a printable
@@ -35,19 +37,11 @@
  * because keymap_resolve strips that bit for control keys -- see the
  * comment there.
  */
-static const Binding g_bindings_normal[] = {
-  /* navigation. The arrows own it outright as of phase 12b
-     (amendment-04-input-modes.md decision 1): h/j/k/l are unbound and
-     reserved, because a keymap that answers to j, k and l but opens a
-     window on h fails silently on the most-practised motion in the set. */
-  { TB_KEY_ARROW_UP,    0, 0, ACT_CURSOR_UP,   0 },
-  { TB_KEY_ARROW_DOWN,  0, 0, ACT_CURSOR_DOWN, 0 },
-  { TB_KEY_ARROW_LEFT,  0, 0, ACT_COL_LEFT,    0 },
-  { TB_KEY_ARROW_RIGHT, 0, 0, ACT_COL_RIGHT,   0 },
 
+/* KEYCTX_GLOBAL: meaningful in every view (design III.3 rule 1). */
+static const Binding g_bindings_global[] = {
   /* transport */
   { 0,           ' ', 0, ACT_PLAY_PAUSE, 0 },
-  { TB_KEY_ENTER, 0,  0, ACT_PLAY_NOW,   0 },
   { 0, 'n',  0, ACT_NEXT,             0 },
   { 0, 'p',  0, ACT_PREV,             0 },
   { 0, '+',  0, ACT_VOL_UP,           VOL_STEP_PCT },
@@ -84,18 +78,8 @@ static const Binding g_bindings_normal[] = {
      bound here so the keymap settles in one change rather than leaving
      the key silently unbound between 12b and the settings menu. */
   { 0, 'h',  0, ACT_HELP_TOGGLE,      0 },
+  { 0, '?',  0, ACT_HELP_TOGGLE,      0 },
   { 0, 'm',  0, ACT_MENU_TOGGLE,      0 },
-
-  /* queue. `v` opens the pane -- one of the few unshifted keys left that
-     is not h/j/k/l, which amendment 04 decision 1 keeps reserved. `d`
-     and `C` stay bound here as well as in the queue's own table: both
-     act on the queue rather than on what is under the browser cursor,
-     so they work with the pane closed and report what they did. */
-  { 0, 'a',  0, ACT_ENQUEUE,          0 },
-  { 0, 'd',  0, ACT_REMOVE,           0 },
-  { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
-  { 0, 'o',  0, ACT_JUMP_TO_PLAYING,  0 },
-  { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
 
   /* device. Shift-R because `r` is repeat; 12b's settings menu offers the
      same action to anyone who does not know the key. */
@@ -107,13 +91,18 @@ static const Binding g_bindings_normal[] = {
      keys a hand reaching for it will already be near. */
   { TB_KEY_CTRL_R, 0, 0, ACT_RESCAN,  0 },
 
-  /* search */
+  { 0, 'o',  0, ACT_JUMP_TO_PLAYING,  0 },
   { 0, '/',  0, ACT_SEARCH,           0 },
 
-  /* views */
+  /* views. `v` goes to Playlists and back (decide D8); the digits are
+     UiView + 1 (design II.1). */
+  { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
   { TB_KEY_TAB, 0, 0, ACT_VIEW_NEXT,  0 },
-  { 0, '1',  0, ACT_VIEW_SET,         0 },
-  { 0, '2',  0, ACT_VIEW_SET,         1 },
+  { 0, '1',  0, ACT_VIEW_SET,         VIEW_LIBRARY },
+  { 0, '2',  0, ACT_VIEW_SET,         VIEW_DIRECTORIES },
+  { 0, '3',  0, ACT_VIEW_SET,         VIEW_PLAYLISTS },
+  { 0, '4',  0, ACT_VIEW_SET,         VIEW_NOW_PLAYING },
+  { 0, '5',  0, ACT_VIEW_SET,         VIEW_SETTINGS },
 
   { 0, 'q',  0, ACT_QUIT,             0 },
 
@@ -129,7 +118,45 @@ static const Binding g_bindings_normal[] = {
   /* Esc is deliberately absent here (amendment 04 decision 5). It arrives
      from stray escape sequences and from a terminal that half-parses a
      key, and an Esc that can end the process is an infuriating bug. It is
-     bound in every non-normal table, where popping is all it can do. */
+     bound in every exclusive table, where popping is all it can do. */
+};
+
+/* KEYCTX_LIST: the focused list's cursor. The arrows own navigation
+   outright as of phase 12b (amendment-04-input-modes.md decision 1):
+   h/j/k/l are unbound and reserved, because a keymap that answers to j,
+   k and l but opens a window on h fails silently on the most-practised
+   motion in the set. */
+static const Binding g_bindings_list[] = {
+  { TB_KEY_ARROW_UP,    0, 0, ACT_CURSOR_UP,        0 },
+  { TB_KEY_ARROW_DOWN,  0, 0, ACT_CURSOR_DOWN,      0 },
+  { TB_KEY_ARROW_LEFT,  0, 0, ACT_COL_LEFT,         0 },
+  { TB_KEY_ARROW_RIGHT, 0, 0, ACT_COL_RIGHT,        0 },
+  { TB_KEY_PGUP,        0, 0, ACT_CURSOR_PAGE_UP,   0 },
+  { TB_KEY_PGDN,        0, 0, ACT_CURSOR_PAGE_DOWN, 0 },
+  { TB_KEY_HOME,        0, 0, ACT_CURSOR_HOME,      0 },
+  { TB_KEY_END,         0, 0, ACT_CURSOR_END,       0 },
+};
+
+/* KEYCTX_BROWSE: act on the browser selection (Library, Directories). */
+static const Binding g_bindings_browse[] = {
+  { TB_KEY_ENTER, 0,  0, ACT_PLAY_NOW,   0 },
+  { 0, 'a',  0, ACT_ENQUEUE,          0 },
+};
+
+/*
+ * KEYCTX_TRACKLIST: edit the queue under the Playlists cursor. `d` and
+ * `C` live only here (decide D7): the entry they act on is visible only
+ * in this view.
+ *
+ * K and J rather than shift+arrow for the moves: termbox2 v2.5.0 sets
+ * TB_MOD_SHIFT only on TB_KEY_ARROW_*, and those four are already seek.
+ */
+static const Binding g_bindings_tracklist[] = {
+  { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,          0 },
+  { 0, 'd',  0, ACT_REMOVE,           0 },
+  { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
+  { 0, 'K',  0, ACT_MOVE_UP,          0 },
+  { 0, 'J',  0, ACT_MOVE_DOWN,        0 },
 };
 
 /*
@@ -153,8 +180,8 @@ static const Binding g_bindings_help[] = {
 /*
  * MODE_MENU is written now and pushed by nothing until phase 17b. The
  * arrows adjust a value there as well as move the cursor, which is why
- * per-mode tables exist at all: no ACT_MENU_UP family is needed for the
- * same key to mean a different thing in a different list.
+ * per-context tables exist at all: no ACT_MENU_UP family is needed for
+ * the same key to mean a different thing in a different list.
  */
 static const Binding g_bindings_menu[] = {
   { TB_KEY_ARROW_UP,    0, 0, ACT_CURSOR_UP,        0 },
@@ -173,17 +200,15 @@ static const Binding g_bindings_menu[] = {
 };
 
 /*
- * MODE_SEARCH binds the keys below and nothing else, and the omission is
- * the design (amendment 04 decision 4): every other event resolves ACT_NONE,
- * and tui.c reads ACT_NONE with a non-zero ev->ch as "insert this
- * codepoint into the query". That is what keeps text entry inside the
- * binding table instead of bypassing it. Esc cancels rather than pops --
- * cancelling a search also has to restore column 3 (phase 16), which is
- * more than a pop -- though phase 16 found there is nothing to restore,
- * because the search draws over column 3 without disturbing it.
- * tui.c pushes this mode on ACT_SEARCH.
+ * KEYCTX_FILTER binds the keys below and nothing else, and the omission
+ * is the design (amendment 04 decision 4): every other event resolves
+ * ACT_NONE, and tui.c reads ACT_NONE with a non-zero ev->ch as "insert
+ * this codepoint into the query". That is what keeps text entry inside
+ * the binding table instead of bypassing it. Esc cancels rather than
+ * pops. MODE_SEARCH resolves against this table until phase 5 (decide
+ * D22).
  */
-static const Binding g_bindings_search[] = {
+static const Binding g_bindings_filter[] = {
   { TB_KEY_ESC,        0, 0, ACT_SEARCH_CANCEL, 0 },
   { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,       0 },
   { TB_KEY_BACKSPACE2, 0, 0, ACT_REMOVE,        0 },
@@ -191,85 +216,30 @@ static const Binding g_bindings_search[] = {
   { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,   0 },
   /* Ctrl-C is bound here for the same reason it is bound in every other
      table: it is the one key that must never be swallowed as text. Every
-     other unbound key in this mode is literal input, and without this row
-     Ctrl-C would be one of them. */
+     other unbound key in this context is literal input, and without this
+     row Ctrl-C would be one of them. */
   { TB_KEY_CTRL_C,     0, 0, ACT_QUIT,          0 },
-};
-
-/*
- * MODE_QUEUE. The pane is a list to move a cursor through and edit, so
- * it takes the overlay tables' shape and adds the four edits. Two rows
- * are worth their own note:
- *
- * `d` and `C` repeat their normal-mode bindings rather than being moved
- * here, because both act on the queue and neither needs the pane open --
- * the pane changes which entry `d` means, not whether it works.
- *
- * ACT_MOVE_UP / ACT_MOVE_DOWN get their first bindings in the program
- * here. K and J rather than shift+arrow: termbox2 v2.5.0 sets
- * TB_MOD_SHIFT only on TB_KEY_ARROW_*, and those four are already seek.
- */
-static const Binding g_bindings_queue[] = {
-  { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,        0 },
-  { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,      0 },
-  { TB_KEY_PGUP,       0, 0, ACT_CURSOR_PAGE_UP,   0 },
-  { TB_KEY_PGDN,       0, 0, ACT_CURSOR_PAGE_DOWN, 0 },
-  { TB_KEY_HOME,       0, 0, ACT_CURSOR_HOME,      0 },
-  { TB_KEY_END,        0, 0, ACT_CURSOR_END,       0 },
-  { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,          0 },
-  { 0, 'd',  0, ACT_REMOVE,           0 },
-  { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
-  { 0, 'K',  0, ACT_MOVE_UP,          0 },
-  { 0, 'J',  0, ACT_MOVE_DOWN,        0 },
-  { 0, 's',  0, ACT_TOGGLE_SHUFFLE,   0 },
-  { 0, 'r',  0, ACT_CYCLE_REPEAT,     0 },
-  { 0, ' ',  0, ACT_PLAY_PAUSE,       0 },
-  /* Transport, repeated from normal mode rather than moved: the pane is
-     an overlay on a player that is still playing, and a mode that binds
-     play/pause but not seek or volume is an omission wearing a design's
-     clothes (phase 17 runbook item 3). The shift+arrow rows do not
-     collide with the bare arrows above -- the resolver matches the
-     modifier -- which is what makes K/J the right keys for the moves. */
-  { TB_KEY_ARROW_RIGHT, 0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_SMALL_MS },
-  { TB_KEY_ARROW_LEFT,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_SMALL_MS },
-  { TB_KEY_ARROW_UP,    0, TB_MOD_SHIFT, ACT_SEEK_FWD,  SEEK_LARGE_MS },
-  { TB_KEY_ARROW_DOWN,  0, TB_MOD_SHIFT, ACT_SEEK_BACK, SEEK_LARGE_MS },
-  { 0, '.',  0, ACT_SEEK_FWD,         SEEK_SMALL_MS },
-  { 0, ',',  0, ACT_SEEK_BACK,        SEEK_SMALL_MS },
-  { 0, 'L',  0, ACT_SEEK_FWD,         SEEK_LARGE_MS },
-  { 0, 'H',  0, ACT_SEEK_BACK,        SEEK_LARGE_MS },
-  { 0, '+',  0, ACT_VOL_UP,           VOL_STEP_PCT },
-  { 0, '-',  0, ACT_VOL_DOWN,         VOL_STEP_PCT },
-  { 0, 'M',  0, ACT_MUTE,             0 },
-  { 0, 'n',  0, ACT_NEXT,             0 },
-  { 0, 'p',  0, ACT_PREV,             0 },
-  { 0, 'v',  0, ACT_QUEUE_TOGGLE,     0 },
-  /* Rescan, for the same reason as the transport rows above: it acts on
-     the library, not on the pane, and the pane is an overlay rather than
-     a screen. View switching stays out -- it would have to close the
-     pane to mean anything, which is a decision, not an omission. */
-  { TB_KEY_CTRL_R, 0, 0, ACT_RESCAN,  0 },
-  { 0, 'q',  0, ACT_QUIT,             0 },
-  { TB_KEY_ESC,    0, 0, ACT_QUIT,    0 },
-  { TB_KEY_CTRL_C, 0, 0, ACT_QUIT,    0 },
 };
 
 #define TABLE_ROWS(t) (sizeof(t) / sizeof((t)[0]))
 
 /*
- * The table-of-tables, indexed by UiMode. Sized by MODE_COUNT so a mode
- * added without a table fails the build rather than resolving every key
- * to ACT_NONE at runtime.
+ * The table-of-tables, indexed by KeyCtx. Sized by KEYCTX_COUNT; an
+ * absent entry is { NULL, 0 }, which every walker treats as no rows.
  */
 static const struct {
   const Binding * rows;
   size_t          count;
-} g_mode_tables[MODE_COUNT] = {
-  [MODE_NORMAL] = { g_bindings_normal, TABLE_ROWS(g_bindings_normal) },
-  [MODE_HELP]   = { g_bindings_help,   TABLE_ROWS(g_bindings_help)   },
-  [MODE_MENU]   = { g_bindings_menu,   TABLE_ROWS(g_bindings_menu)   },
-  [MODE_SEARCH] = { g_bindings_search, TABLE_ROWS(g_bindings_search) },
-  [MODE_QUEUE]  = { g_bindings_queue,  TABLE_ROWS(g_bindings_queue)  },
+} g_ctx_tables[KEYCTX_COUNT] = {
+  [KEYCTX_GLOBAL]    = { g_bindings_global,    TABLE_ROWS(g_bindings_global)    },
+  [KEYCTX_LIST]      = { g_bindings_list,      TABLE_ROWS(g_bindings_list)      },
+  [KEYCTX_BROWSE]    = { g_bindings_browse,    TABLE_ROWS(g_bindings_browse)    },
+  /* filled in phase 5 (design IX.1) */
+  [KEYCTX_LIBRARY]   = { NULL, 0 },
+  [KEYCTX_TRACKLIST] = { g_bindings_tracklist, TABLE_ROWS(g_bindings_tracklist) },
+  [KEYCTX_FILTER]    = { g_bindings_filter,    TABLE_ROWS(g_bindings_filter)    },
+  [KEYCTX_HELP]      = { g_bindings_help,      TABLE_ROWS(g_bindings_help)      },
+  [KEYCTX_MENU]      = { g_bindings_menu,      TABLE_ROWS(g_bindings_menu)      },
 };
 
 /*
@@ -359,29 +329,53 @@ normalized_mod(const struct tb_event * ev)
 } /* normalized_mod */
 
 /*
- * Resolves a termbox2 event to an Action by walking the binding table in
- * order. Takes the event and an out-parameter for the row's arg, returns
- * the Action, or ACT_NONE with *out_arg = 0 for a non-key event or an
- * unbound key. out_arg may not be NULL.
+ * keymap_chain: the contexts in force for (mode, editing, view), in
+ * resolution order (design III.2). Fills out[] and returns its length.
+ */
+size_t
+keymap_chain(UiMode mode, int editing, UiView view, KeyCtx out[KEYCTX_CHAIN_MAX])
+{
+  size_t n = 0;
+  if (mode == MODE_HELP) { out[n++] = KEYCTX_HELP; return n; }
+  if (mode == MODE_MENU) { out[n++] = KEYCTX_MENU; return n; }
+  /* MODE_SEARCH resolves against FILTER until phase 5 (decide D22). */
+  if (editing || mode == MODE_SEARCH) { out[n++] = KEYCTX_FILTER; return n; }
+  switch (view) {
+    case VIEW_LIBRARY:     out[n++] = KEYCTX_LIBRARY;   out[n++] = KEYCTX_BROWSE; out[n++] = KEYCTX_LIST; break;
+    case VIEW_DIRECTORIES: out[n++] = KEYCTX_BROWSE;    out[n++] = KEYCTX_LIST;   break;
+    case VIEW_PLAYLISTS:   out[n++] = KEYCTX_TRACKLIST; out[n++] = KEYCTX_LIST;   break;
+    default:               break;   /* Now playing, Settings: GLOBAL only */
+  }
+  out[n++] = KEYCTX_GLOBAL;
+  return n;
+} /* keymap_chain */
+
+/*
+ * keymap_resolve: see include/ui/keymap.h. Walks each table of the chain
+ * in order and returns the first row matching (key, ch, mod).
  */
 Action
-keymap_resolve(UiMode mode, const struct tb_event * ev, int32_t * out_arg)
+keymap_resolve(const KeyCtx * chain, size_t n, const struct tb_event * ev,
+               int32_t * out_arg)
 {
   *out_arg = 0;
 
-  if (ev == NULL || ev->type != TB_EVENT_KEY) {
+  if (chain == NULL || ev == NULL || ev->type != TB_EVENT_KEY) {
     return ACT_NONE;
   }
 
-  size_t          count = 0;
-  const Binding * rows  = keymap_table(mode, &count);
-  uint8_t         mod   = normalized_mod(ev);
+  uint8_t mod = normalized_mod(ev);
 
-  for (size_t i = 0; i < count; i++) {
-    const Binding * b = &rows[i];
-    if (b->key == ev->key && b->ch == ev->ch && b->mod == mod) {
-      *out_arg = b->arg;
-      return b->action;
+  for (size_t c = 0; c < n; c++) {
+    size_t          count = 0;
+    const Binding * rows  = keymap_table(chain[c], &count);
+
+    for (size_t i = 0; i < count; i++) {
+      const Binding * b = &rows[i];
+      if (b->key == ev->key && b->ch == ev->ch && b->mod == mod) {
+        *out_arg = b->arg;
+        return b->action;
+      }
     }
   }
 
@@ -389,26 +383,24 @@ keymap_resolve(UiMode mode, const struct tb_event * ev, int32_t * out_arg)
 } /* keymap_resolve */
 
 /*
- * Exposes the compiled-in table for the test harness and, later, for the
- * help overlay and the config parser's merge. Takes an out-parameter for
- * the row count (may be NULL), returns a pointer to the first row.
+ * keymap_table: see include/ui/keymap.h.
  */
 const Binding *
-keymap_table(UiMode mode, size_t * out_count)
+keymap_table(KeyCtx ctx, size_t * out_count)
 {
   /* Unsigned for the same reason action_name compares unsigned: the enum
-     may itself be unsigned and `mode < 0` would be a dead comparison. An
-     out-of-range mode falls back to the normal table rather than
-     returning NULL -- every caller walks the result, and a NULL here
-     would turn a bad mode into a crash in draw code. */
-  unsigned idx = (unsigned) mode;
-  if (idx >= (unsigned) MODE_COUNT) {
-    idx = (unsigned) MODE_NORMAL;
+     may itself be unsigned and `ctx < 0` would be a dead comparison. */
+  unsigned idx = (unsigned) ctx;
+  if (idx >= (unsigned) KEYCTX_COUNT) {
+    if (out_count != NULL) {
+      *out_count = 0;
+    }
+    return NULL;
   }
   if (out_count != NULL) {
-    *out_count = g_mode_tables[idx].count;
+    *out_count = g_ctx_tables[idx].count;
   }
-  return g_mode_tables[idx].rows;
+  return g_ctx_tables[idx].rows;
 } /* keymap_table */
 
 /*

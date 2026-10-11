@@ -1123,6 +1123,31 @@ browser_library_truncated(const BrowserSource * src)
   return 0;
 } /* browser_library_truncated */
 
+/*
+ * browser_library_detail: see include/ui/browser.h.
+ */
+int
+browser_library_detail(const BrowserSource * src, int64_t id, BrowserRow ** out, size_t * n)
+{
+  BrowserRow * rows = NULL;
+  size_t       count = 0, cap = 0;
+
+  if (src == NULL || src->load != lib_load || src->self == NULL || out == NULL
+      || n == NULL || id <= 0) {
+    return -1;
+  }
+
+  LibSource * s = (LibSource *) src->self;
+  if (s->db == NULL || lib_preview_track(s, id, &rows, &count, &cap) != 0 || count == 0) {
+    rows_free(rows, count);
+    return -1;
+  }
+
+  *out = rows;
+  *n   = count;
+  return 0;
+} /* browser_library_detail */
+
 /* ---------------------------------------------------------------------
  * The widget.
  *
