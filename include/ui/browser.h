@@ -296,4 +296,11 @@ const BrowserRow * browser_parent_row(const Browser * b, size_t i);
 size_t             browser_preview_count(const Browser * b);
 const BrowserRow * browser_preview_row(const Browser * b, size_t i);
 
+/* Contiguous arrays behind the three columns, browser_count() /
+   browser_parent_count() / browser_preview_count() long. NULL for a NULL
+   browser or an empty column. Borrowed until the next mutation. */
+const BrowserRow * browser_rows(const Browser * b);
+const BrowserRow * browser_parent_rows(const Browser * b);
+const BrowserRow * browser_preview_rows(const Browser * b);
+
 #endif // KURONO_UI_BROWSER_H

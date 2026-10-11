@@ -17,6 +17,7 @@
    by every row-level check rather than by one special case. */
 
 #include "../include/ui/keymap.h"
+#include "../include/ui/layout.h"
 #include "../include/ui/listgeom.h"
 #include "../include/ui/theme.h"
 
@@ -676,6 +677,270 @@ test_list_cursor_move(void)
 } /* test_list_cursor_move */
 
 /*
+ * layout_expect: the test's own variant selection, written independently
+ * of layout_compute. Takes the view, size and facet flag, returns the
+ * index of the variant that must be chosen and fills widths[].
+ */
+static size_t
+layout_expect(UiView v, int w, int facet_on, int * widths)
+{
+  size_t                n   = 0;
+  const LayoutVariant * var = layout_variants(v, &n);
+
+  for (size_t vi = 0; vi < n; vi++) {
+    const LayoutVariant * lv = &var[vi];
+    int ok = 1;
+    int sum = 0;
+    int avail = w - ((int) lv->ncols - 1);
+
+    for (size_t i = 0; i < lv->ncols; i++) {
+      if (lv->col[i].role == ROLE_FACET && !facet_on) {
+        ok = 0;
+      }
+      widths[i] = (i + 1 < lv->ncols) ? avail * lv->col[i].pct / 100 : avail - sum;
+      sum += widths[i];
+      if (vi + 1 < n && widths[i] < lv->col[i].min_w) {
+        ok = 0;
+      }
+    }
+    if (ok) {
+      return vi;
+    }
+  }
+  return n;
+} /* layout_expect */
+
+/*
+ * test_layout_tiling: K1-K4. Every region and separator cell of the body
+ * is covered exactly once, regions stay inside the body, roles are unique
+ * and match the independently selected variant, minimums hold.
+ */
+static void
+test_layout_tiling(void)
+{
+  static const int hs[] = { 15, 24, 40, 100 };
+  static unsigned char cov[300 * 98];
+
+  for (int v = 0; v < (int) VIEW_COUNT; v++) {
+    for (int facet = 0; facet <= 1; facet++) {
+      for (int w = TUI_MIN_W; w <= 300; w++) {
+        for (size_t hi = 0; hi < sizeof hs / sizeof hs[0]; hi++) {
+          int h = hs[hi];
+          TuiLayout l;
+          layout_compute((UiView) v, w, h, facet, &l);
+          CHECK(!l.too_small, "v=%d %dx%d: too_small", v, w, h);
+          CHECK(l.body_y == 1 && l.body_h == h - 2 && l.status_y == h - 1,
+                "v=%d %dx%d: rows %d/%d/%d", v, w, h, l.body_y, l.body_h, l.status_y);
+
+          memset(cov, 0, sizeof cov);
+          int seen[ROLE_COUNT] = { 0 };
+          for (int i = 0; i < l.nregions; i++) {
+            const Region * r = &l.region[i];
+            CHECK(r->w >= 1 && r->h >= 1 && r->x >= 0 && r->x + r->w <= l.w,
+                  "v=%d %dx%d region %d: x=%d w=%d h=%d", v, w, h, i, r->x, r->w, r->h);
+            CHECK(r->y == l.body_y && r->y + r->h <= l.body_y + l.body_h,
+                  "v=%d %dx%d region %d: y=%d h=%d outside body", v, w, h, i, r->y, r->h);
+            CHECK(r->role != ROLE_COVER && !seen[r->role],
+                  "v=%d %dx%d: role %d cover or twice", v, w, h, (int) r->role);
+            seen[r->role] = 1;
+            for (int y = 0; y < r->h; y++) {
+              for (int x = r->x; x < r->x + r->w && x < w; x++) {
+                cov[y * 300 + x]++;
+              }
+              if (r->x + r->w < w) {
+                cov[y * 300 + r->x + r->w]++;
+              }
+            }
+          }
+          int bad = 0;
+          for (int y = 0; y < l.body_h; y++) {
+            for (int x = 0; x < w; x++) {
+              bad += (cov[y * 300 + x] != 1);
+            }
+          }
+          CHECK(bad == 0, "v=%d facet=%d %dx%d: %d cells not covered exactly once",
+                v, facet, w, h, bad);
+
+          int    ew[LAYOUT_MAX_COLS];
+          size_t vi = layout_expect((UiView) v, w, facet, ew);
+          size_t nv = 0;
+          const LayoutVariant * var = layout_variants((UiView) v, &nv);
+          CHECK(vi < nv, "v=%d %dx%d: no variant selected", v, w, h);
+          if (vi < nv) {
+            CHECK((size_t) l.nregions == var[vi].ncols,
+                  "v=%d facet=%d %dx%d: %d regions, variant %zu has %zu",
+                  v, facet, w, h, l.nregions, vi, var[vi].ncols);
+            for (int i = 0; i < l.nregions && (size_t) i < var[vi].ncols; i++) {
+              CHECK(l.region[i].role == var[vi].col[i].role && l.region[i].w == ew[i],
+                    "v=%d facet=%d %dx%d col %d: role/width mismatch", v, facet, w, h, i);
+              if (vi + 1 < nv) {
+                CHECK(l.region[i].w >= var[vi].col[i].min_w,
+                      "v=%d facet=%d %dx%d col %d: w=%d below min", v, facet, w, h, i,
+                      l.region[i].w);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+} /* test_layout_tiling */
+
+/*
+ * layout_roles_are: 1 when *l allocated exactly the `n` roles in `want`,
+ * in order. Takes the layout, the count and the roles.
+ */
+static int
+layout_roles_are(const TuiLayout * l, int n, const RegionRole * want)
+{
+  if (l->nregions != n) {
+    return 0;
+  }
+  for (int i = 0; i < n; i++) {
+    if (l->region[i].role != want[i]) {
+      return 0;
+    }
+  }
+  return 1;
+} /* layout_roles_are */
+
+/*
+ * test_layout_declared: K5. Variant 1 is chosen at 200x60, and the
+ * narrow-terminal fallbacks at 60x15.
+ */
+static void
+test_layout_declared(void)
+{
+  static const RegionRole lib3[]  = { ROLE_FACET, ROLE_MAIN, ROLE_INFO };
+  static const RegionRole lib2[]  = { ROLE_MAIN, ROLE_INFO };
+  static const RegionRole dir3[]  = { ROLE_PARENT, ROLE_MAIN, ROLE_INFO };
+  static const RegionRole pl3[]   = { ROLE_SOURCES, ROLE_QUEUE, ROLE_INFO };
+  static const RegionRole info1[] = { ROLE_INFO };
+  static const RegionRole main1[] = { ROLE_MAIN };
+  TuiLayout l;
+
+  layout_compute(VIEW_LIBRARY, 200, 60, 1, &l);
+  CHECK(layout_roles_are(&l, 3, lib3), "Library 200x60 facet on");
+  layout_compute(VIEW_DIRECTORIES, 200, 60, 1, &l);
+  CHECK(layout_roles_are(&l, 3, dir3), "Directories 200x60");
+  layout_compute(VIEW_PLAYLISTS, 200, 60, 1, &l);
+  CHECK(layout_roles_are(&l, 3, pl3), "Playlists 200x60");
+  layout_compute(VIEW_NOW_PLAYING, 200, 60, 1, &l);
+  CHECK(layout_roles_are(&l, 1, info1), "Now playing 200x60");
+  layout_compute(VIEW_SETTINGS, 200, 60, 1, &l);
+  CHECK(layout_roles_are(&l, 1, main1), "Settings 200x60");
+  layout_compute(VIEW_LIBRARY, 200, 60, 0, &l);
+  CHECK(layout_roles_are(&l, 2, lib2), "Library 200x60 facet off");
+  layout_compute(VIEW_LIBRARY, 60, 15, 1, &l);
+  CHECK(layout_roles_are(&l, 2, lib2), "Library 60x15: facet 11 < 12 must drop");
+  layout_compute(VIEW_PLAYLISTS, 60, 15, 1, &l);
+  CHECK(layout_roles_are(&l, 3, pl3), "Playlists 60x15");
+  CHECK(l.region[0].w == 11 && l.region[1].w == 29 && l.region[2].w == 18,
+        "Playlists 60x15 widths %d/%d/%d, want 11/29/18",
+        l.region[0].w, l.region[1].w, l.region[2].w);
+} /* test_layout_declared */
+
+/*
+ * test_layout_floor: K6. Below 60x15 every view is too small and holds no
+ * regions; 60x15 is large enough for every view.
+ */
+static void
+test_layout_floor(void)
+{
+  TuiLayout l;
+
+  for (int v = 0; v < (int) VIEW_COUNT; v++) {
+    layout_compute((UiView) v, 59, 40, 1, &l);
+    CHECK(l.too_small == 1 && l.nregions == 0, "v=%d 59x40 not too small", v);
+    layout_compute((UiView) v, 200, 14, 1, &l);
+    CHECK(l.too_small == 1 && l.nregions == 0, "v=%d 200x14 not too small", v);
+    layout_compute((UiView) v, 60, 15, 1, &l);
+    CHECK(l.too_small == 0 && l.nregions > 0, "v=%d 60x15 too small", v);
+  }
+} /* test_layout_floor */
+
+/*
+ * test_layout_directories_golden: K7. Directories reproduces v1.3.1's
+ * width formula at every width, and the design's spot rows.
+ */
+static void
+test_layout_directories_golden(void)
+{
+  TuiLayout l;
+
+  for (int w = TUI_MIN_W; w <= 300; w++) {
+    int avail = w - 2;
+    int w0 = avail * 25 / 100;
+    int w1 = avail * 30 / 100;
+    int w2 = avail - w0 - w1;
+    int x1 = w0 + 1;
+    int x2 = x1 + w1 + 1;
+
+    layout_compute(VIEW_DIRECTORIES, w, 24, 1, &l);
+    CHECK(l.nregions == 3 && l.region[0].role == ROLE_PARENT
+            && l.region[1].role == ROLE_MAIN && l.region[2].role == ROLE_INFO,
+          "w=%d: Directories roles", w);
+    CHECK(l.region[0].x == 0 && l.region[0].w == w0 && l.region[1].x == x1
+            && l.region[1].w == w1 && l.region[2].x == x2 && l.region[2].w == w2,
+          "w=%d: Directories geometry differs from v1.3.1", w);
+  }
+
+  static const int spot[][4] = { { 60, 14, 17, 27 }, { 80, 19, 23, 36 }, { 120, 29, 35, 54 } };
+  for (size_t i = 0; i < sizeof spot / sizeof spot[0]; i++) {
+    layout_compute(VIEW_DIRECTORIES, spot[i][0], 24, 1, &l);
+    CHECK(l.region[0].w == spot[i][1] && l.region[1].w == spot[i][2]
+            && l.region[2].w == spot[i][3],
+          "w=%d: widths %d/%d/%d, want %d/%d/%d", spot[i][0], l.region[0].w,
+          l.region[1].w, l.region[2].w, spot[i][1], spot[i][2], spot[i][3]);
+  }
+} /* test_layout_directories_golden */
+
+/*
+ * test_layout_total: K8. layout_compute is defined for every size and
+ * every view value, in or out of range.
+ */
+static void
+test_layout_total(void)
+{
+  TuiLayout a, b;
+
+  for (int v = -1; v <= (int) VIEW_COUNT; v++) {
+    for (int w = 1; w <= 300; w++) {
+      for (int h = 1; h <= 100; h++) {
+        layout_compute((UiView) v, w, h, 1, &a);
+        int small = (w < TUI_MIN_W || h < TUI_MIN_H);
+        if (a.nregions < 0 || a.nregions > (int) ROLE_COUNT || a.too_small != small
+            || (small && a.nregions != 0) || (!small && a.nregions == 0)) {
+          CHECK(0, "v=%d %dx%d: nregions=%d too_small=%d", v, w, h, a.nregions, a.too_small);
+        }
+      }
+    }
+  }
+
+  layout_compute((UiView) VIEW_COUNT, 100, 30, 1, &a);
+  layout_compute(VIEW_LIBRARY, 100, 30, 1, &b);
+  CHECK(memcmp(&a, &b, sizeof a) == 0, "VIEW_COUNT must lay out as Library");
+  layout_compute((UiView) -1, 100, 30, 1, &a);
+  CHECK(memcmp(&a, &b, sizeof a) == 0, "view -1 must lay out as Library");
+} /* test_layout_total */
+
+/*
+ * test_layout_list_top: K9. Only the Library facet and main lists
+ * reserve a top row.
+ */
+static void
+test_layout_list_top(void)
+{
+  for (int v = 0; v < (int) VIEW_COUNT; v++) {
+    for (int r = 0; r < (int) ROLE_COUNT; r++) {
+      int want = (v == VIEW_LIBRARY && (r == ROLE_FACET || r == ROLE_MAIN));
+      CHECK(layout_list_top((UiView) v, (RegionRole) r) == want,
+            "layout_list_top(%d, %d) != %d", v, r, want);
+    }
+  }
+} /* test_layout_list_top */
+
+/*
  * main: runs every check, returns 0 when all passed and 1 otherwise.
  */
 int
@@ -694,6 +959,12 @@ main(void)
   test_theme_degrade();
   test_list_scroll_for();
   test_list_cursor_move();
+  test_layout_tiling();
+  test_layout_declared();
+  test_layout_floor();
+  test_layout_directories_golden();
+  test_layout_total();
+  test_layout_list_top();
 
   size_t n = 0;
   (void) keymap_table(MODE_NORMAL, &n);

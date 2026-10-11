@@ -1745,3 +1745,26 @@ browser_preview_row(const Browser * b, size_t i)
   return &b->vrows[i];
 } /* browser_preview_row */
 
+
+/*
+ * browser_rows / browser_parent_rows / browser_preview_rows: see
+ * include/ui/browser.h. Takes a browser, returns the column's array or
+ * NULL when the browser or the column is empty.
+ */
+const BrowserRow *
+browser_rows(const Browser * b)
+{
+  return (b == NULL || b->n == 0) ? NULL : b->rows;
+} /* browser_rows */
+
+const BrowserRow *
+browser_parent_rows(const Browser * b)
+{
+  return (b == NULL || b->pn == 0) ? NULL : b->prows;
+} /* browser_parent_rows */
+
+const BrowserRow *
+browser_preview_rows(const Browser * b)
+{
+  return (b == NULL || b->vn == 0) ? NULL : b->vrows;
+} /* browser_preview_rows */

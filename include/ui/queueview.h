@@ -12,7 +12,7 @@
 /*
  * ui/queueview.c owns the queue pane's cursor and the display metadata
  * behind each line, and nothing else (DESIGN.md III.2's table). In
- * particular it does not draw: draw_column and draw_text are file-scope
+ * particular it does not draw: draw_list and draw_text are file-scope
  * in ui/tui.c and stay there, so this file hands out an array of rows
  * the same way a search hands out its results, and tui.c draws it. That
  * is what keeps tui.c calling neither audio/ nor library/ while the

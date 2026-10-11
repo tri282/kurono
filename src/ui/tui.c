@@ -37,6 +37,7 @@
 #include <wchar.h>
 
 #include "../../include/ui/keymap.h"
+#include "../../include/ui/layout.h"
 #include "../../include/ui/listgeom.h"
 #include "../../include/ui/theme.h"
 #include "../../include/ui/tui.h"
@@ -46,26 +47,6 @@
    model rests on -- a Makefile that ever drops -DTB_OPT_ATTR_W=32 fails
    the build here instead of silently producing a colourless player. */
 _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes");
-
-/* Below this, the layout has no room for a header, one body row, and a
-   status bar with a readable progress area. DESIGN.md VIII.4 /
-   phase-11-tui.md I.7. */
-#define TUI_MIN_W 60
-#define TUI_MIN_H 15
-
-/* Column width shares, in percent of the body width left after the
-   separators and the (currently zero-width) cover pane. Column 3 takes
-   the remainder so rounding never loses or invents a cell. */
-#define COL1_PCT 25
-#define COL2_PCT 30
-
-/* Reserved cover pane (DESIGN.md IX.1, phase-11-tui.md II). v1 draws
-   nothing there and the pane takes no width, so the three columns use the
-   full body; the constant and the branch below are the whole obligation
-   this phase has to cover art -- arriving later must not require the
-   four-region layout to be re-derived after three widgets were written
-   against a three-region one. */
-#define COVER_PANE_W 0
 
 /* Progress bar width in the status bar, and the space its clock needs. */
 #define PROGRESS_W 24
@@ -139,15 +120,6 @@ static char   g_search[SEARCH_MAX];
 static size_t g_search_len = 0;
 
 /*
- * The rows main.c handed back for the current query, parked here for the
- * length of one draw. draw_column reads rows through a (Browser *,
- * index) accessor, and search results have no Browser -- this is the
- * adapter, and the pointer is written and read inside draw_body with no
- * suspension point between.
- */
-static const BrowserRow * g_search_draw = NULL;
-
-/*
  * The cursor over the results, and the row count the last draw saw.
  * The count is kept because the cursor is moved from the input path,
  * which has no model to ask -- clamping it there against a stale count
@@ -157,17 +129,6 @@ static const BrowserRow * g_search_draw = NULL;
  */
 static size_t g_search_cursor = 0;
 static size_t g_search_shown  = 0;
-
-/*
- * search_row_at: draw_column's accessor over g_search_draw. Takes the
- * (ignored) browser and an index, returns the row.
- */
-static const BrowserRow *
-search_row_at(const Browser * b, size_t i)
-{
-  (void) b;
-  return &g_search_draw[i];
-} /* search_row_at */
 
 /*
  * search_reset: empty the query. Takes and returns nothing.
@@ -190,48 +151,8 @@ search_reset(void)
 static void
 tui_compute_layout(void)
 {
-  TuiLayout * l = &g_layout;
-  memset(l, 0, sizeof *l);
-
-  l->w = tb_width();
-  l->h = tb_height();
-
-  if (l->w < TUI_MIN_W || l->h < TUI_MIN_H) {
-    l->too_small = 1;
-    return;
-  }
-
-  /* Row 0 is the header, the last row is the status bar, everything
-     between is the body. */
-  l->body_y   = 1;
-  l->body_h   = l->h - 2;
-  l->status_y = l->h - 1;
-
-  /* Two single-column separators between the three columns, plus one
-     more before the cover pane when it has width. */
-  int cover_w = COVER_PANE_W;
-  /* The comparison is always false in v1 by construction -- COVER_PANE_W
-     is 0 and the branch exists so the arithmetic is already right when it
-     stops being 0 (phase-11-tui.md II). Suppressed rather than deleted;
-     deleting it is the retrofit this phase is paying to avoid. */
-  /* cppcheck-suppress knownConditionTrueFalse */
-  int seps    = 2 + (cover_w > 0 ? 1 : 0);
-  int avail   = l->w - seps - cover_w;
-  if (avail < 3) {
-    l->too_small = 1;
-    return;
-  }
-
-  l->col_w[0] = avail * COL1_PCT / 100;
-  l->col_w[1] = avail * COL2_PCT / 100;
-  l->col_w[2] = avail - l->col_w[0] - l->col_w[1];
-
-  l->col_x[0] = 0;
-  l->col_x[1] = l->col_w[0] + 1;
-  l->col_x[2] = l->col_x[1] + l->col_w[1] + 1;
-
-  l->cover_w = cover_w;
-  l->cover_x = (cover_w > 0) ? (l->col_x[2] + l->col_w[2] + 1) : l->w;
+  /* Every v1 view uses the Directories variant until phase 3 (design XII step 1). */
+  layout_compute(VIEW_DIRECTORIES, tb_width(), tb_height(), 1, &g_layout);
 } /* tui_compute_layout */
 
 /*
@@ -458,41 +379,29 @@ draw_header(const TuiModel * m)
 } /* draw_header */
 
 /*
- * draw_column: draw one column's worth of rows. Takes the column index,
- * the row accessor's count, a callback-free pair of (row, index) reads
- * through the model, the cursor index, the scroll offset, and whether
- * this column owns the cursor. Returns nothing.
+ * draw_list: draw one region's rows. Takes the region, the row array and
+ * its length, the cursor index, the scroll offset, whether this region
+ * owns the cursor, whether it only marks the cursor row, and the base
+ * slot (STYLE_COUNT means "decide per row from is_dir"). Returns nothing.
  *
- * Columns 0 and 2 are derived (browser.h's miller layout): they are
- * drawn dim, with no cursor bar, because they are not navigable. Column
- * 0 still marks the row the user is inside, which is what makes the
- * layout readable as a path rather than three unrelated lists.
- *
- * `base` is the slot every non-cursor row in this column gets, or
- * STYLE_COUNT for "decide per row from is_dir". It is a parameter rather
- * than a constant because column 2 draws its preview in
- * STYLE_COL_INACTIVE and its search results in STYLE_SEARCH_MATCH, and
- * that is the whole difference between the two -- not a second drawing
- * routine.
+ * The parent and info regions are derived (browser.h's miller layout):
+ * drawn dim, with no cursor bar, because they are not navigable. The
+ * parent region still marks the row the user is inside.
  */
 static void
-draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
-            const Browser * b, size_t n, size_t cursor, size_t scroll,
-            int is_active, int mark_only, StyleSlot base)
+draw_list(const Region * reg, const BrowserRow * rows, size_t n,
+          size_t cursor, size_t scroll, int is_active, int mark_only,
+          StyleSlot base)
 {
-  int cx = g_layout.col_x[c];
-  int cw = g_layout.col_w[c];
+  int top = layout_list_top(VIEW_DIRECTORIES, reg->role);
 
-  for (int r = 0; r < g_layout.body_h; r++) {
+  for (int r = 0; r < reg->h - top; r++) {
     size_t idx = scroll + (size_t) r;
-    if (idx >= n) {
+    if (idx >= n || rows == NULL) {
       break;
     }
 
-    const BrowserRow * br = row(b, idx);
-    if (br == NULL) {
-      break;
-    }
+    const BrowserRow * br = &rows[idx];
 
     StyleSlot slot;
     if (is_active && idx == cursor) {
@@ -507,35 +416,40 @@ draw_column(int c, const BrowserRow * (*row)(const Browser *, size_t),
       slot = STYLE_NORMAL;
     }
 
-    /* The cursor row reads as a bar across the whole column, not just
+    /* The cursor row reads as a bar across the whole region, not just
        under its text, or a short name leaves the selection looking
        ragged against a long one. */
     if ((is_active || mark_only) && idx == cursor) {
-      fill_row(cx, g_layout.body_y + r, cw, slot);
+      fill_row(reg->x, reg->y + top + r, reg->w, slot);
     }
-    draw_text(cx, g_layout.body_y + r, cw, slot, br->name);
+    draw_text(reg->x, reg->y + top + r, reg->w, slot, br->name);
   }
-} /* draw_column */
+} /* draw_list */
 
 /*
- * draw_body: the three columns, the separators between them, and the
- * reserved cover pane. Takes the model, returns nothing.
+ * draw_body: the regions and the separators between them. Takes the
+ * model, returns nothing. Regions are looked up by role (design II.5).
  *
- * The three columns are one widget viewed at three depths (DESIGN.md
- * VIII.4): column 1 is the listing with the cursor, column 0 is what
- * contains it, column 2 is what is inside the selection. Only column 1
- * is navigable, which is why only it is drawn at full contrast.
+ * The three regions are one widget viewed at three depths (DESIGN.md
+ * VIII.4): main is the listing with the cursor, parent is what contains
+ * it, info is what is inside the selection. Only main is navigable,
+ * which is why only it is drawn at full contrast.
  */
 static void
 draw_body(const TuiModel * m)
 {
-  /* Every branch below falls through to the separators and the cover
-     pane -- an early return here silently drops them, which is exactly
-     what an empty directory did before this was restructured. The frame
-     is not the listing's to skip. */
+  const Region * parent = layout_find(&g_layout, ROLE_PARENT);
+  const Region * body   = layout_find(&g_layout, ROLE_MAIN);
+  const Region * info   = layout_find(&g_layout, ROLE_INFO);
+
+  /* Every branch below falls through to the separators -- an early
+     return here silently drops them, which is exactly what an empty
+     directory did before this was restructured. The frame is not the
+     listing's to skip. */
   if (m->browser == NULL) {
-    draw_text(g_layout.col_x[1], g_layout.body_y, g_layout.col_w[1],
-              STYLE_DIM, "(no browser)");
+    if (body != NULL) {
+      draw_text(body->x, body->y, body->w, STYLE_DIM, "(no browser)");
+    }
   } else {
     size_t n      = browser_count(m->browser);
     size_t cursor = browser_cursor(m->browser);
@@ -543,106 +457,90 @@ draw_body(const TuiModel * m)
     size_t pcur   = browser_parent_cursor(m->browser);
     size_t vn     = browser_preview_count(m->browser);
 
-    draw_column(0, browser_parent_row, m->browser, pn, pcur,
-                list_scroll_for(pcur, pn, g_layout.body_h), 0, 1, STYLE_COUNT);
-
-    if (n == 0) {
-      /* DESIGN.md XI.5: an empty index is a first-run state, not an
-         error state, and the thing the user needs is the path and the
-         variable that changes it. */
-      draw_text(g_layout.col_x[1], g_layout.body_y, g_layout.col_w[1],
-                STYLE_DIM, "(empty)");
-      if (m->music_dir != NULL) {
-        draw_text(g_layout.col_x[1], g_layout.body_y + 2, g_layout.col_w[1],
-                  STYLE_DIM, m->music_dir);
-        draw_text(g_layout.col_x[1], g_layout.body_y + 3, g_layout.col_w[1],
-                  STYLE_DIM, "set KURONO_MUSIC_DIR to change");
-      }
-    } else {
-      draw_column(1, browser_row, m->browser, n, cursor,
-                  browser_scroll(m->browser), 1, 0, STYLE_COUNT);
+    if (parent != NULL) {
+      draw_list(parent, browser_parent_rows(m->browser), pn, pcur,
+                list_scroll_for(pcur, pn, parent->h), 0, 1, STYLE_COUNT);
     }
 
-    /* Column 2 is the search results while a search is up, the queue
-       while the queue pane is up, and the selection's preview otherwise.
-       The preview cache underneath is untouched in every case, which is
-       what makes closing either one restore it exactly: there is nothing
-       to restore. */
-    if (ui_mode() == MODE_SEARCH) {
-      if (m->search_n > 0 && m->search_rows != NULL) {
-        /* The clamp lives here and not in the input path because this is
-           the only place that knows how many rows there are: a keystroke
-           can shrink the result set under a cursor that was valid for
-           the previous query. */
-        g_search_shown = m->search_n;
-        if (g_search_cursor >= m->search_n) {
-          g_search_cursor = m->search_n - 1;
+    if (body != NULL) {
+      if (n == 0) {
+        /* DESIGN.md XI.5: an empty index is a first-run state, not an
+           error state, and the thing the user needs is the path and the
+           variable that changes it. */
+        draw_text(body->x, body->y, body->w, STYLE_DIM, "(empty)");
+        if (m->music_dir != NULL) {
+          draw_text(body->x, body->y + 2, body->w, STYLE_DIM, m->music_dir);
+          draw_text(body->x, body->y + 3, body->w, STYLE_DIM,
+                    "set KURONO_MUSIC_DIR to change");
         }
-        g_search_draw = m->search_rows;
-        draw_column(2, search_row_at, NULL, m->search_n, g_search_cursor,
-                    list_scroll_for(g_search_cursor, m->search_n, g_layout.body_h),
-                    1, 0, STYLE_SEARCH_MATCH);
-        g_search_draw = NULL;
       } else {
-        g_search_shown = 0;
-        draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
-                  STYLE_DIM,
-                  (g_search_len > 0) ? "(no results)" : "(type to search)");
+        draw_list(body, browser_rows(m->browser), n, cursor,
+                  browser_scroll(m->browser), 1, 0, STYLE_COUNT);
       }
-    } else if (ui_mode() == MODE_QUEUE) {
-      if (m->queue_n > 0 && m->queue_rows != NULL) {
-        size_t qc = (m->queue_cursor < m->queue_n) ? m->queue_cursor : m->queue_n - 1;
-        size_t scroll = list_scroll_for(qc, m->queue_n, g_layout.body_h);
+    }
 
-        g_search_draw = m->queue_rows;   /* the same (rows, index) adapter */
-        draw_column(2, search_row_at, NULL, m->queue_n, qc, scroll, 1, 0,
-                    STYLE_NORMAL);
-        g_search_draw = NULL;
-
-        /* The playing entry, marked after the column rather than through
-           it: draw_column decides a row's slot from the cursor and one
-           base style, and the playing row is neither. Skipped when it is
-           the cursor row, because the cursor bar has to win -- otherwise
-           moving onto the playing track makes the cursor disappear. */
-        if (m->queue_playing >= 0 && (size_t) m->queue_playing != qc) {
-          size_t pi = (size_t) m->queue_playing;
-          if (pi >= scroll && pi < scroll + (size_t) g_layout.body_h && pi < m->queue_n) {
-            draw_text(g_layout.col_x[2],
-                      g_layout.body_y + (int) (pi - scroll),
-                      g_layout.col_w[2], STYLE_PLAYING, m->queue_rows[pi].name);
+    /* Info is the search results while a search is up, the queue while
+       the queue pane is up, and the selection's preview otherwise. The
+       preview cache underneath is untouched in every case, which is
+       what makes closing either one restore it exactly. */
+    if (info != NULL) {
+      if (ui_mode() == MODE_SEARCH) {
+        if (m->search_n > 0 && m->search_rows != NULL) {
+          /* The clamp lives here and not in the input path because this
+             is the only place that knows how many rows there are: a
+             keystroke can shrink the result set under a cursor that was
+             valid for the previous query. */
+          g_search_shown = m->search_n;
+          if (g_search_cursor >= m->search_n) {
+            g_search_cursor = m->search_n - 1;
           }
+          draw_list(info, m->search_rows, m->search_n, g_search_cursor,
+                    list_scroll_for(g_search_cursor, m->search_n, info->h),
+                    1, 0, STYLE_SEARCH_MATCH);
+        } else {
+          g_search_shown = 0;
+          draw_text(info->x, info->y, info->w, STYLE_DIM,
+                    (g_search_len > 0) ? "(no results)" : "(type to search)");
+        }
+      } else if (ui_mode() == MODE_QUEUE) {
+        if (m->queue_n > 0 && m->queue_rows != NULL) {
+          size_t qc = (m->queue_cursor < m->queue_n) ? m->queue_cursor : m->queue_n - 1;
+          size_t scroll = list_scroll_for(qc, m->queue_n, info->h);
+
+          draw_list(info, m->queue_rows, m->queue_n, qc, scroll, 1, 0,
+                    STYLE_NORMAL);
+
+          /* The playing entry, marked after the list rather than through
+             it: draw_list decides a row's slot from the cursor and one
+             base style, and the playing row is neither. Skipped when it
+             is the cursor row, because the cursor bar has to win. */
+          if (m->queue_playing >= 0 && (size_t) m->queue_playing != qc) {
+            size_t pi = (size_t) m->queue_playing;
+            if (pi >= scroll && pi < scroll + (size_t) info->h && pi < m->queue_n) {
+              draw_text(info->x, info->y + (int) (pi - scroll), info->w,
+                        STYLE_PLAYING, m->queue_rows[pi].name);
+            }
+          }
+        } else {
+          draw_text(info->x, info->y, info->w, STYLE_DIM, "(queue empty)");
         }
       } else {
-        draw_text(g_layout.col_x[2], g_layout.body_y, g_layout.col_w[2],
-                  STYLE_DIM, "(queue empty)");
-      }
-    } else {
-      draw_column(2, browser_preview_row, m->browser, vn, vn, 0, 0, 0,
+        draw_list(info, browser_preview_rows(m->browser), vn, vn, 0, 0, 0,
                   STYLE_COL_INACTIVE);
+      }
     }
   }
 
-  /* Vertical separators, between the columns only -- the outer edges are
-     the terminal's own. */
+  /* Vertical separators, between regions only -- the outer edges are the
+     terminal's own (design II.6). */
   uintattr_t bfg = style_fg(&g_theme, STYLE_BORDER);
   uintattr_t bbg = style_bg(&g_theme, STYLE_BORDER);
-  for (int c = 0; c < 2; c++) {
-    int x = g_layout.col_x[c] + g_layout.col_w[c];
-    for (int y = g_layout.body_y; y < g_layout.body_y + g_layout.body_h; y++) {
-      tb_set_cell(x, y, 0x2502 /* box drawings light vertical */, bfg, bbg);
-    }
-  }
-
-  /* Reserved cover pane. COVER_PANE_W is 0 in v1, so this never runs --
-     it exists so the pane's border has a call site and the layout does
-     not have to be re-derived when a cover renderer arrives
-     (DESIGN.md IX.1). */
-  if (g_layout.cover_w > 0) {
-    uintattr_t cfg = style_fg(&g_theme, STYLE_COVER_BORDER);
-    uintattr_t cbg = style_bg(&g_theme, STYLE_COVER_BORDER);
-    int x = g_layout.cover_x - 1;
-    for (int y = g_layout.body_y; y < g_layout.body_y + g_layout.body_h; y++) {
-      tb_set_cell(x, y, 0x2502, cfg, cbg);
+  for (int i = 0; i < g_layout.nregions; i++) {
+    const Region * r = &g_layout.region[i];
+    if (r->x + r->w < g_layout.w) {
+      for (int y = r->y; y < r->y + r->h; y++) {
+        tb_set_cell(r->x + r->w, y, 0x2502 /* box drawings light vertical */, bfg, bbg);
+      }
     }
   }
 } /* draw_body */

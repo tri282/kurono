@@ -7,6 +7,7 @@
 
 #include "browser.h"
 #include "keymap.h"   /* UiMode, for the mode-stack accessors below */
+#include "layout.h"   /* TuiLayout, for tui_layout() */
 
 /*
  * ui/tui.c owns the terminal: it is the only translation unit that
@@ -17,18 +18,6 @@
  * other (ui/ may call audio/). Keeping it out means phase 12 can hand the
  * browser the same struct without untangling engine calls from draw code.
  */
-
-/* DESIGN.md VIII.4's layout, in rows and columns. Recomputed on resize
-   and on nothing else; no widget reads tb_width/tb_height itself. */
-typedef struct {
-  int w, h;              /* terminal size at the last layout */
-  int too_small;         /* 1 when below TUI_MIN_W x TUI_MIN_H */
-  int body_y, body_h;    /* the three-column region */
-  int col_x[3];          /* left edge of each column */
-  int col_w[3];          /* width of each column, separators excluded */
-  int cover_x, cover_w;  /* reserved cover pane; cover_w is 0 in v1 */
-  int status_y;          /* the status bar row */
-} TuiLayout;
 
 /*
  * What the status bar and header show. main.c fills one of these per
