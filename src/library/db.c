@@ -30,6 +30,14 @@
 #define LIST_COLS "id, artist, album, year, disc_no, track_no, title, duration_ms, " \
                   "CASE WHEN title IS NULL THEN path END AS path"
 
+/* Index serving LIST_ORDER for the All listing (Q3 rung 3). Created on
+   every open rather than by a migrate case, so schema_version stays 2
+   and a 1.x build still opens the file. Its columns must match
+   LIST_ORDER term for term. */
+#define SQL_LIST_INDEX \
+  "CREATE INDEX IF NOT EXISTS idx_tracks_list ON tracks(" \
+  "artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, album, disc_no, track_no, path);"
+
 /*
  * SQL_TRACKS_FTS_DDL: the tracks_fts virtual table definition, shared
  * between SQL_SCHEMA (fresh databases) and migrate's case 1 (existing
@@ -689,6 +697,12 @@ db_open(const char * db_path, const char * const * roots, size_t nroots, int * o
 
     if (reconcile_music_dirs(db->conn, roots, nroots, out_rescanned) != 0) {
       kurono_die("failed to reconcile music_dirs in %s", db_path);
+    }
+
+    /* Not fatal: without the index the All listing still works, it only
+       sorts in a temporary B-tree. */
+    if (sqlite3_exec(db->conn, SQL_LIST_INDEX, NULL, NULL, NULL) != SQLITE_OK) {
+      fprintf(stderr, "kurono: cannot create the list index in %s: %s\n", db_path, sqlite3_errmsg(db->conn));
     }
 
     prepare_all_statements(db);

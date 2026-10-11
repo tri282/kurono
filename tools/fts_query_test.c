@@ -2135,6 +2135,83 @@ test_list_path_tiebreak(void)
 } /* test_list_path_tiebreak */
 
 /*
+ * plan_mentions: 1 if EXPLAIN QUERY PLAN of `sql` on `raw` has a detail
+ * line containing `needle`, else 0.
+ */
+static int
+plan_mentions(sqlite3 * raw, const char * sql, const char * needle)
+{
+  sqlite3_stmt * stmt = NULL;
+  char           q[512];
+  int            found = 0;
+
+  snprintf(q, sizeof q, "EXPLAIN QUERY PLAN %s", sql);
+  if (sqlite3_prepare_v2(raw, q, -1, &stmt, NULL) != SQLITE_OK) {
+    return 0;
+  }
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char * detail = (const char *) sqlite3_column_text(stmt, 3);
+    if (detail != NULL && strstr(detail, needle) != NULL) {
+      found = 1;
+    }
+  }
+  sqlite3_finalize(stmt);
+  return found;
+} /* plan_mentions */
+
+/*
+ * test_list_index: Q3 rung 3. db_open creates idx_tracks_list on an
+ * existing database that lacks it, and the All order walks it with no
+ * temporary sort.
+ */
+static void
+test_list_index(void)
+{
+  char         path[] = "/tmp/kurono_list_index_XXXXXX";
+  int          fd = mkstemp(path);
+  const char * roots[] = { "/music" };
+  const char * all = "SELECT * FROM tracks" T_LIST_ORDER;
+  sqlite3 *    raw = NULL;
+  Db *         db;
+
+  if (fd < 0) {
+    CHECK(0, "mkstemp failed for the list index fixture");
+    return;
+  }
+  close(fd);
+  unlink(path);
+
+  db = db_open(path, roots, 1, NULL);
+  CHECK(db != NULL, "db_open(%s) returned NULL", path);
+  if (db == NULL) {
+    unlink(path);
+    return;
+  }
+  db_close(db);
+
+  /* Drop it, as a cache written before v2.0.0 would lack it. */
+  if (sqlite3_open(path, &raw) == SQLITE_OK) {
+    CHECK(sqlite3_exec(raw, "DROP INDEX idx_tracks_list;", NULL, NULL, NULL) == SQLITE_OK,
+          "a fresh database has no idx_tracks_list");
+  }
+  sqlite3_close(raw);
+  raw = NULL;
+
+  db = db_open(path, roots, 1, NULL);
+  CHECK(db != NULL, "reopen of %s returned NULL", path);
+  if (db != NULL) {
+    db_close(db);
+  }
+
+  if (sqlite3_open(path, &raw) == SQLITE_OK) {
+    CHECK(plan_mentions(raw, all, "idx_tracks_list"), "the All order does not use idx_tracks_list after reopen");
+    CHECK(!plan_mentions(raw, all, "TEMP B-TREE"), "the All order still sorts in a temporary B-tree");
+  }
+  sqlite3_close(raw);
+  unlink(path);
+} /* test_list_index */
+
+/*
  * test_list_untagged: F6 and Q2. The all-NULL row is in the All listing
  * and in no artist's listing, and it is the first row of the All listing
  * (decisions Q2: NULL sorts first).
@@ -2513,6 +2590,7 @@ int main(int argc, char ** argv)
     test_list_latency();
     test_list_untagged();
     test_list_path_tiebreak();
+    test_list_index();
     test_list_grouping();
     test_fts_prefix_index();
     test_schema_migrate();
