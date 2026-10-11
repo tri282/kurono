@@ -23,6 +23,7 @@
 
 #include "../include/ui/browser.h"
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1517,7 +1518,9 @@ cmp_int_null(int ha, int64_t a, int hb, int64_t b)
 /*
  * list_cmp: design IV.2 <K>; the SQL order in db.c is the other half.
  * Per name term NULL first, then ASCII-NOCASE, then strcmp; integers
- * NULL first then numeric; path strcmp. Takes two rows, returns <0, 0, >0.
+ * NULL first then numeric; path strcmp. List rows carry a path only when
+ * untitled (Q3), so the path term is skipped (0) when either is NULL.
+ * Takes two rows, returns <0, 0, >0.
  */
 static int
 list_cmp(const DbTrackRow * a, const DbTrackRow * b)
@@ -1531,21 +1534,24 @@ list_cmp(const DbTrackRow * a, const DbTrackRow * b)
   if ((c = cmp_bin_null(a->album, b->album)) != 0) return c;
   if ((c = cmp_int_null(a->has_disc_no, a->disc_no, b->has_disc_no, b->disc_no)) != 0) return c;
   if ((c = cmp_int_null(a->has_track_no, a->track_no, b->has_track_no, b->track_no)) != 0) return c;
+  if (a->path == NULL || b->path == NULL) return 0;
   return strcmp(a->path, b->path);
 } /* list_cmp */
 
 /*
  * check_list_sorted: assert `rows` is strictly increasing under
- * list_cmp (path is unique, so equal is also a failure). Takes a label
+ * list_cmp (equal is also a failure, except where both rows are titled
+ * and so carry no path to break the tie, Q3). Takes a label
  * for the message and the rows.
  */
 static void
 check_list_sorted(const char * what, const DbTrackRow * rows, size_t n)
 {
   for (size_t i = 1; i < n; i++) {
-    if (list_cmp(&rows[i - 1], &rows[i]) >= 0) {
-      CHECK(0, "%s: row %zu (%s) does not follow row %zu (%s) under <K>",
-            what, i, rows[i].path, i - 1, rows[i - 1].path);
+    int c = list_cmp(&rows[i - 1], &rows[i]);
+    if (c > 0 || (c == 0 && (rows[i].path != NULL || rows[i - 1].path != NULL))) {
+      CHECK(0, "%s: row %zu (id %" PRId64 ") does not follow row %zu (id %" PRId64 ") under <K>",
+            what, i, rows[i].id, i - 1, rows[i - 1].id);
       return;
     }
   }
@@ -2088,6 +2094,47 @@ test_list_latency(void)
 } /* test_list_latency */
 
 /*
+ * test_list_path_tiebreak: <K>'s last term is the real path even though
+ * a titled list row carries none (Q3). Two titled rows equal on every
+ * other key, inserted so that rowid order is the reverse of path order;
+ * paths come from db_query_track_by_id, since the list rows lack them.
+ */
+static void
+test_list_path_tiebreak(void)
+{
+  const char * roots[] = { "/music" };
+  Db *         db = db_open(":memory:", roots, 1, NULL);
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+
+  CHECK(db != NULL, "tiebreak: db_open failed");
+  if (db == NULL) {
+    return;
+  }
+  CHECK(gf_add(db, "/music/dup/z.flac", "/music/dup", "Dup", "Twin", "Same", 2000, 1, 1) == 0 &&
+        gf_add(db, "/music/dup/a.flac", "/music/dup", "Dup", "Twin", "Same", 2000, 1, 1) == 0,
+        "tiebreak: fixture insert failed");
+
+  db_query_tracks_list(db, NULL, NULL, &rows, &n);
+  CHECK(n == 2, "tiebreak: All has %zu rows, want 2", n);
+  if (n == 2) {
+    DbTrackRow first, second;
+    int        ok = db_query_track_by_id(db, rows[0].id, &first) == 1 &&
+                    db_query_track_by_id(db, rows[1].id, &second) == 1;
+    CHECK(ok, "tiebreak: track lookup by id failed");
+    if (ok) {
+      CHECK(strcmp(first.path, "/music/dup/a.flac") == 0 && strcmp(second.path, "/music/dup/z.flac") == 0,
+            "tiebreak: rows tied on every other key are not in path order (%s, %s)",
+            first.path, second.path);
+      db_track_row_free_fields(&first);
+      db_track_row_free_fields(&second);
+    }
+  }
+  db_track_rows_free(rows, n);
+  db_close(db);
+} /* test_list_path_tiebreak */
+
+/*
  * test_list_untagged: F6 and Q2. The all-NULL row is in the All listing
  * and in no artist's listing, and it is the first row of the All listing
  * (decisions Q2: NULL sorts first).
@@ -2109,13 +2156,23 @@ test_list_untagged(void)
 
   db_query_tracks_list(gdb, NULL, NULL, &rows, &n);
   for (size_t i = 0; i < n; i++) {
-    if (strcmp(rows[i].path, "/music/untagged/x.flac") == 0) {
+    if (rows[i].path != NULL && strcmp(rows[i].path, "/music/untagged/x.flac") == 0) {
       id = rows[i].id;
     }
   }
   CHECK(id != 0, "F6: the untagged row is missing from the All listing");
-  CHECK(n > 0 && strcmp(rows[0].path, "/music/untagged/x.flac") == 0,
-        "Q2: the first row of All is %s, want the untagged row", n > 0 ? rows[0].path : "(none)");
+  CHECK(n > 0 && rows[0].id == id,
+        "Q2: the first row of All is id %" PRId64 ", want the untagged row (id %" PRId64 ")",
+        n > 0 ? rows[0].id : 0, id);
+  /* Q3 projection contract: path only for untitled rows, other fields unloaded. */
+  for (size_t i = 0; i < n; i++) {
+    CHECK((rows[i].title == NULL) == (rows[i].path != NULL),
+          "Q3: list row id %" PRId64 " title %s but path %s", rows[i].id,
+          rows[i].title ? "set" : "NULL", rows[i].path ? "set" : "NULL");
+    CHECK(rows[i].parent_dir == NULL && rows[i].album_artist == NULL
+          && rows[i].genre == NULL && rows[i].codec == NULL,
+          "Q3: list row id %" PRId64 " carries a non-projected text field", rows[i].id);
+  }
   db_track_rows_free(rows, n);
 
   db_query_artists(gdb, &names, &nn);
@@ -2455,6 +2512,7 @@ int main(int argc, char ** argv)
     test_list_cap();
     test_list_latency();
     test_list_untagged();
+    test_list_path_tiebreak();
     test_list_grouping();
     test_fts_prefix_index();
     test_schema_migrate();

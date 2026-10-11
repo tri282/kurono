@@ -22,7 +22,13 @@
 
 /* Order key <K> of the four list statements (design IV.2, D2). */
 #define LIST_ORDER " ORDER BY artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, " \
-                   "album, disc_no, track_no, path"
+                   "album, disc_no, track_no, tracks.path"
+
+/* Columns of the four list statements, in list_row_from_stmt's order (Q3).
+   path is selected only for untitled rows (the label falls back to its
+   basename); tracks.path in LIST_ORDER keeps the sort on the real column. */
+#define LIST_COLS "id, artist, album, year, disc_no, track_no, title, duration_ms, " \
+                  "CASE WHEN title IS NULL THEN path END AS path"
 
 /*
  * SQL_TRACKS_FTS_DDL: the tracks_fts virtual table definition, shared
@@ -621,15 +627,15 @@ prepare_all_statements(Db * db)
      the texts cannot drift; fts_query_test's list_cmp is the other half.
      No index serves it: the All sort is a temp B-tree, the policy noted
      above for every NOCASE ORDER BY (Q1). The FTS shapes carry no rank. */
-  PREP(query_list_all, "SELECT * FROM tracks" LIST_ORDER);
-  PREP(query_list_artist, "SELECT * FROM tracks WHERE artist = ?1" LIST_ORDER);
+  PREP(query_list_all, "SELECT " LIST_COLS " FROM tracks" LIST_ORDER);
+  PREP(query_list_artist, "SELECT " LIST_COLS " FROM tracks WHERE artist = ?1" LIST_ORDER);
   PREP(query_list_all_fts,
-       "SELECT t.* FROM tracks t "
+       "SELECT " LIST_COLS " FROM tracks "
        "JOIN (SELECT rowid AS rid FROM tracks_fts "
-       "       WHERE tracks_fts MATCH ?1 LIMIT " DB_STR(DB_MATCH_CAP) ") x ON t.id = x.rid"
+       "       WHERE tracks_fts MATCH ?1 LIMIT " DB_STR(DB_MATCH_CAP) ") x ON tracks.id = x.rid"
        LIST_ORDER);
   PREP(query_list_artist_fts,
-       "SELECT * FROM tracks WHERE artist = ?2 AND id IN "
+       "SELECT " LIST_COLS " FROM tracks WHERE artist = ?2 AND id IN "
        "(SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1)"
        LIST_ORDER " LIMIT " DB_STR(DB_MATCH_CAP));
   PREP(count_tracks, "SELECT count(*) FROM tracks");
@@ -933,6 +939,40 @@ row_from_stmt(sqlite3_stmt * stmt, DbTrackRow * row)
 } /* row_from_stmt */
 
 /*
+ * list_row_from_stmt: fill *row from the current row of a list statement
+ * (LIST_COLS order, Q3). Only those fields are set; every other field is
+ * NULL / 0 / has_* = 0, and path is non-NULL only for an untitled row.
+ * Owned strings are freed with db_track_row_free_fields.
+ */
+static void
+list_row_from_stmt(sqlite3_stmt * stmt, DbTrackRow * row)
+{
+  memset(row, 0, sizeof(*row));
+
+  row->id = sqlite3_column_int64(stmt, 0);
+  row->artist = strdup_or_null((const char *)sqlite3_column_text(stmt, 1));
+  row->album = strdup_or_null((const char *)sqlite3_column_text(stmt, 2));
+  if (sqlite3_column_type(stmt, 3) != SQLITE_NULL) {
+    row->has_year = 1;
+    row->year = sqlite3_column_int64(stmt, 3);
+  }
+  if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+    row->has_disc_no = 1;
+    row->disc_no = sqlite3_column_int64(stmt, 4);
+  }
+  if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
+    row->has_track_no = 1;
+    row->track_no = sqlite3_column_int64(stmt, 5);
+  }
+  row->title = strdup_or_null((const char *)sqlite3_column_text(stmt, 6));
+  if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+    row->has_duration_ms = 1;
+    row->duration_ms = sqlite3_column_int64(stmt, 7);
+  }
+  row->path = strdup_or_null((const char *)sqlite3_column_text(stmt, 8));
+} /* list_row_from_stmt */
+
+/*
  * rows_from_stmt: drain an already-bound, already-reset statement into
  * a growable DbTrackRow array. A mid-scan SQLITE_ERROR (a malformed FTS5
  * MATCH string is the one every caller here can hit) is reported as
@@ -941,10 +981,12 @@ row_from_stmt(sqlite3_stmt * stmt, DbTrackRow * row)
  * query in this file (DESIGN.md XI.7 -- a query path degrades, it does
  * not abort). An allocation failure while growing the array stops the
  * scan and returns whatever was collected so far, per the same policy.
+ * `reader` fills one row from the statement's current row.
  * Always resets `stmt` before returning. Always returns 0.
  */
 static int
-rows_from_stmt(Db * db, sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * out_n)
+rows_from_stmt(Db * db, sqlite3_stmt * stmt, void (*reader)(sqlite3_stmt *, DbTrackRow *),
+               DbTrackRow ** out_rows, size_t * out_n)
 {
   DbTrackRow * rows = NULL;
   size_t       n = 0, cap = 0;
@@ -963,7 +1005,7 @@ rows_from_stmt(Db * db, sqlite3_stmt * stmt, DbTrackRow ** out_rows, size_t * ou
       rows = grown;
       cap = new_cap;
     }
-    row_from_stmt(stmt, &rows[n]);
+    reader(stmt, &rows[n]);
     n++;
   }
   (void)rc;
@@ -1065,7 +1107,7 @@ db_query_tracks_for_artist_album(Db * db, const char * artist, const char * albu
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 2, album, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, row_from_stmt, out_rows, out_n);
 } /* db_query_tracks_for_artist_album */
 
 /*
@@ -1078,7 +1120,7 @@ db_query_tracks_in_dir(Db * db, const char * dir, DbTrackRow ** out_rows, size_t
   db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, row_from_stmt, out_rows, out_n);
 } /* db_query_tracks_in_dir */
 
 /*
@@ -1091,7 +1133,7 @@ db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows, siz
   db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, row_from_stmt, out_rows, out_n);
 } /* db_query_tracks_under_dir */
 
 /*
@@ -1125,7 +1167,7 @@ db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size
   db_reset(db, stmt);
   sqlite3_clear_bindings(stmt);
   sqlite3_bind_text(stmt, 1, match_string, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, row_from_stmt, out_rows, out_n);
 } /* db_query_search */
 
 /*
@@ -1161,7 +1203,7 @@ db_query_tracks_list(Db * db, const char * artist, const char * match,
   } else if (artist != NULL) {
     sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
   }
-  return rows_from_stmt(db, stmt, out_rows, out_n);
+  return rows_from_stmt(db, stmt, list_row_from_stmt, out_rows, out_n);
 } /* db_query_tracks_list */
 
 /*
