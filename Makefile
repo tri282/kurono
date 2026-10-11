@@ -331,6 +331,8 @@ tools/keymap_test: build/default/tools/keymap_test.o build/default/ui/keymap.o \
 # defines its own, the first test double for a program symbol in this
 # tree. See the stub's comment in tools/fts_query_test.c for why that is
 # sound here and what it does not cover.
+# browser.o joins for the Library listing assertions, design XI.2.
+
 # Pure, dependency-free (DESIGN.md XII.2's testable tier), and that is
 # the whole point of what it tests: audio/testsrc.c is the file that
 # lets the ring, the callback and the boundary path run with no ffmpeg,
@@ -343,7 +345,7 @@ tools/testsrc_test: build/default/tools/testsrc_test.o build/default/audio/tests
 fts-query-test: tools/fts_query_test
 
 tools/fts_query_test: build/default/tools/fts_query_test.o build/default/library/query.o \
-                     build/default/library/db.o
+                     build/default/library/db.o build/default/ui/browser.o
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(shell pkg-config --libs sqlite3)
 
 build/default/tools/fts_query_test.o: tools/fts_query_test.c

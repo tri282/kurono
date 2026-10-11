@@ -21,10 +21,13 @@
 
 #include "../include/library/db.h"
 
+#include "../include/ui/browser.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -831,7 +834,8 @@ build_raw_fixture(sqlite3 ** out_conn, size_t n)
 
   if (sqlite3_exec(conn,
       "CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, "
-      "title TEXT, artist TEXT, album TEXT, album_artist TEXT);"
+      "title TEXT, artist TEXT, album TEXT, album_artist TEXT, "
+      "year INTEGER, disc_no INTEGER, track_no INTEGER);"
       "CREATE VIRTUAL TABLE tracks_fts USING fts5("
       "  title, artist, album, album_artist,"
       "  content='tracks', content_rowid='id',"
@@ -1452,6 +1456,973 @@ test_schema_migrate(void)
   unlink(path);
 } /* test_schema_migrate */
 
+/* ---------------------------------------------------------------------
+ * Library listing (design IV.2-IV.3, XI.2 F1-F8, decisions Q2).
+ * ------------------------------------------------------------------- */
+
+/* The order key <K> as db.c's LIST_ORDER spells it; F5 builds raw
+   statements from it. design IV.2. */
+#define T_LIST_ORDER \
+  " ORDER BY artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, " \
+  "album, disc_no, track_no, path"
+
+/* Header text pieces (design IV.3), spelled as bytes so the file stays ASCII. */
+#define T_SEP_ARTIST " \xe2\x80\x94 "
+#define T_SEP_YEAR   " \xc2\xb7 "
+
+/*
+ * cmp_nocase_null: ASCII-NOCASE compare, NULL first (SQLite ascending).
+ * Takes two nullable strings, returns <0, 0 or >0.
+ */
+static int
+cmp_nocase_null(const char * a, const char * b)
+{
+  if (a == NULL || b == NULL) {
+    return (a == b) ? 0 : (a == NULL ? -1 : 1);
+  }
+  for (; *a != '\0' && *b != '\0'; a++, b++) {
+    int x = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a;
+    int y = (*b >= 'A' && *b <= 'Z') ? *b + 32 : *b;
+    if (x != y) {
+      return (x < y) ? -1 : 1;
+    }
+  }
+  return (*a == *b) ? 0 : ((*a == '\0') ? -1 : 1);
+} /* cmp_nocase_null */
+
+/*
+ * cmp_bin_null: strcmp with NULL first. Takes two nullable strings.
+ */
+static int
+cmp_bin_null(const char * a, const char * b)
+{
+  if (a == NULL || b == NULL) {
+    return (a == b) ? 0 : (a == NULL ? -1 : 1);
+  }
+  return strcmp(a, b);
+} /* cmp_bin_null */
+
+/*
+ * cmp_int_null: numeric compare, NULL (has == 0) first.
+ */
+static int
+cmp_int_null(int ha, int64_t a, int hb, int64_t b)
+{
+  if (!ha || !hb) {
+    return (ha == hb) ? 0 : (!ha ? -1 : 1);
+  }
+  return (a < b) ? -1 : ((a > b) ? 1 : 0);
+} /* cmp_int_null */
+
+/*
+ * list_cmp: design IV.2 <K>; the SQL order in db.c is the other half.
+ * Per name term NULL first, then ASCII-NOCASE, then strcmp; integers
+ * NULL first then numeric; path strcmp. Takes two rows, returns <0, 0, >0.
+ */
+static int
+list_cmp(const DbTrackRow * a, const DbTrackRow * b)
+{
+  int c;
+
+  if ((c = cmp_nocase_null(a->artist, b->artist)) != 0) return c;
+  if ((c = cmp_bin_null(a->artist, b->artist)) != 0) return c;
+  if ((c = cmp_int_null(a->has_year, a->year, b->has_year, b->year)) != 0) return c;
+  if ((c = cmp_nocase_null(a->album, b->album)) != 0) return c;
+  if ((c = cmp_bin_null(a->album, b->album)) != 0) return c;
+  if ((c = cmp_int_null(a->has_disc_no, a->disc_no, b->has_disc_no, b->disc_no)) != 0) return c;
+  if ((c = cmp_int_null(a->has_track_no, a->track_no, b->has_track_no, b->track_no)) != 0) return c;
+  return strcmp(a->path, b->path);
+} /* list_cmp */
+
+/*
+ * check_list_sorted: assert `rows` is strictly increasing under
+ * list_cmp (path is unique, so equal is also a failure). Takes a label
+ * for the message and the rows.
+ */
+static void
+check_list_sorted(const char * what, const DbTrackRow * rows, size_t n)
+{
+  for (size_t i = 1; i < n; i++) {
+    if (list_cmp(&rows[i - 1], &rows[i]) >= 0) {
+      CHECK(0, "%s: row %zu (%s) does not follow row %zu (%s) under <K>",
+            what, i, rows[i].path, i - 1, rows[i - 1].path);
+      return;
+    }
+  }
+} /* check_list_sorted */
+
+/*
+ * gf_add: upsert one group-fixture row. Takes the Db, the path, parent
+ * directory, artist, album and title (NULL for an absent tag), year
+ * (-1 absent) and disc and track numbers (-1 absent); returns 0 or -1.
+ */
+static int
+gf_add(Db * db, const char * path, const char * parent, const char * artist,
+       const char * album, const char * title, int year, int disc, int track)
+{
+  static int64_t seq = 0;
+  int64_t        y = year, d = disc, t = track;
+  DbTrackWrite   w;
+
+  memset(&w, 0, sizeof w);
+  w.path = path;
+  w.parent_dir = parent;
+  w.mtime = ++seq;
+  w.size = 1000 + seq;
+  w.title = title;
+  w.artist = artist;
+  w.album = album;
+  w.year = (year >= 0) ? &y : NULL;
+  w.disc_no = (disc >= 0) ? &d : NULL;
+  w.track_no = (track >= 0) ? &t : NULL;
+  w.scan_gen = 1;
+  return db_track_upsert(db, &w);
+} /* gf_add */
+
+/*
+ * build_group_fixture: a small in-memory Db for the grouping checks: one
+ * artist with two albums whose year order differs from their name order,
+ * a two-disc album, an album-less track, case variants of one artist
+ * (abc, ABC, Abc) sharing an album name and inserted so that path order
+ * interleaves them, and one row with every tag NULL
+ * (/music/untagged/x.flac). Returns 0 and sets *out_db, or -1.
+ */
+static int
+build_group_fixture(Db ** out_db)
+{
+  const char * roots[] = { "/music" };
+  Db *         db = db_open(":memory:", roots, 1, NULL);
+  int          rc = 0;
+
+  if (db == NULL) {
+    return -1;
+  }
+
+  rc |= gf_add(db, "/music/beta/s1.flac", "/music/beta", "Beta", "Second", "S One", 2001, 1, 1);
+  rc |= gf_add(db, "/music/beta/s2.flac", "/music/beta", "Beta", "Second", "S Two", 2001, 1, 2);
+  rc |= gf_add(db, "/music/beta/f1.flac", "/music/beta", "Beta", "First", "F One", 1999, 1, 1);
+  rc |= gf_add(db, "/music/beta/f2.flac", "/music/beta", "Beta", "First", "F Two", 1999, 1, 2);
+  rc |= gf_add(db, "/music/beta/f3.flac", "/music/beta", "Beta", "First", "F Three", 1999, 1, 3);
+  rc |= gf_add(db, "/music/beta/loose.flac", "/music/beta", "Beta", NULL, "Loose", -1, -1, -1);
+  rc |= gf_add(db, "/music/gamma/d1t1.flac", "/music/gamma", "Gamma", "Two Discs", "D1 T1", 2005, 1, 1);
+  rc |= gf_add(db, "/music/gamma/d1t2.flac", "/music/gamma", "Gamma", "Two Discs", "D1 T2", 2005, 1, 2);
+  rc |= gf_add(db, "/music/gamma/d2t1.flac", "/music/gamma", "Gamma", "Two Discs", "D2 T1", 2005, 2, 1);
+  rc |= gf_add(db, "/music/gamma/d2t2.flac", "/music/gamma", "Gamma", "Two Discs", "D2 T2", 2005, 2, 2);
+  rc |= gf_add(db, "/music/alpha/a1.flac", "/music/alpha", "Alpha", "Aardvark", "A One", 1990, 1, 1);
+  /* Same track number and year across the variants: only the BINARY
+     tiebreak on `artist` keeps each variant's rows together. */
+  rc |= gf_add(db, "/music/case/t1-a.flac", "/music/case", "abc", "Same", "Same 1", 2000, 1, 1);
+  rc |= gf_add(db, "/music/case/t1-b.flac", "/music/case", "ABC", "Same", "Same 1", 2000, 1, 1);
+  rc |= gf_add(db, "/music/case/t1-c.flac", "/music/case", "Abc", "Same", "Same 1", 2000, 1, 1);
+  rc |= gf_add(db, "/music/case/t2-a.flac", "/music/case", "abc", "Same", "Same 2", 2000, 1, 2);
+  rc |= gf_add(db, "/music/case/t2-b.flac", "/music/case", "ABC", "Same", "Same 2", 2000, 1, 2);
+  rc |= gf_add(db, "/music/case/t2-c.flac", "/music/case", "Abc", "Same", "Same 2", 2000, 1, 2);
+  rc |= gf_add(db, "/music/untagged/x.flac", "/music/untagged", NULL, NULL, NULL, -1, -1, -1);
+
+  if (rc != 0) {
+    db_close(db);
+    return -1;
+  }
+  *out_db = db;
+  return 0;
+} /* build_group_fixture */
+
+static Db * g_group_fixture_db = NULL;
+
+/*
+ * group_fixture_db: lazily build, then reuse, the group fixture.
+ * Returns NULL on build failure.
+ */
+static Db *
+group_fixture_db(void)
+{
+  if (g_group_fixture_db == NULL) {
+    build_group_fixture(&g_group_fixture_db);
+  }
+  return g_group_fixture_db;
+} /* group_fixture_db */
+
+/*
+ * ids_sorted: the ids of `rows`, ascending, in a fresh array. Takes the
+ * rows; returns the array (NULL when n == 0 or on allocation failure).
+ */
+static int64_t *
+ids_sorted(const DbTrackRow * rows, size_t n)
+{
+  int64_t * ids = (n > 0) ? malloc(n * sizeof *ids) : NULL;
+
+  for (size_t i = 0; ids != NULL && i < n; i++) {
+    ids[i] = rows[i].id;
+  }
+  if (ids != NULL) {
+    qsort(ids, n, sizeof *ids, cmp_id_qsort);
+  }
+  return ids;
+} /* ids_sorted */
+
+/*
+ * raw_fts_ids: every rowid matching `match` in the raw fixture, ascending,
+ * uncapped. Takes the connection, the match and an out-param for a fresh
+ * array; returns the count.
+ */
+static size_t
+raw_fts_ids(sqlite3 * raw, const char * match, int64_t ** out)
+{
+  sqlite3_stmt * st = NULL;
+  int64_t *      ids = NULL;
+  size_t         n = 0, cap = 0;
+
+  if (sqlite3_prepare_v2(raw,
+        "SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1 ORDER BY rowid",
+        -1, &st, NULL) != SQLITE_OK) {
+    *out = NULL;
+    return 0;
+  }
+  sqlite3_bind_text(st, 1, match, -1, SQLITE_TRANSIENT);
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    if (n == cap) {
+      int64_t * grown = realloc(ids, (cap ? cap * 2 : 64) * sizeof *ids);
+      if (grown == NULL) {
+        break;
+      }
+      ids = grown;
+      cap = cap ? cap * 2 : 64;
+    }
+    ids[n++] = sqlite3_column_int64(st, 0);
+  }
+  sqlite3_finalize(st);
+  *out = ids;
+  return n;
+} /* raw_fts_ids */
+
+/*
+ * raw_artist_of: strdup of the artist of track `id` in the raw fixture,
+ * or NULL.
+ */
+static char *
+raw_artist_of(sqlite3 * raw, int64_t id)
+{
+  sqlite3_stmt * st = NULL;
+  char *         out = NULL;
+
+  if (sqlite3_prepare_v2(raw, "SELECT artist FROM tracks WHERE id = ?1", -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0) != NULL) {
+      out = strdup((const char *) sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+  }
+  return out;
+} /* raw_artist_of */
+
+/*
+ * test_list_order: F1. Each of the four list statements over the 20k
+ * fixture, and All (plus one case-variant artist) over the group
+ * fixture, is strictly increasing under list_cmp.
+ */
+static void
+test_list_order(void)
+{
+  Db *         db = search_fixture_db();
+  Db *         gdb = group_fixture_db();
+  char **      names = NULL;
+  size_t       nn = 0;
+  char *       match = query_build_match("a");
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+
+  if (db == NULL || gdb == NULL || match == NULL) {
+    CHECK(0, "fixtures unavailable for F1");
+    free(match);
+    return;
+  }
+
+  db_query_artists(db, &names, &nn);
+  CHECK(nn > 0, "20k fixture has no artists");
+  if (nn > 0) {
+    const char * artist = names[0];
+
+    db_query_tracks_list(db, NULL, NULL, &rows, &n);
+    CHECK(n == SEARCH_FIXTURE_N, "All listing has %zu rows, want %d", n, SEARCH_FIXTURE_N);
+    check_list_sorted("F1 All", rows, n);
+    db_track_rows_free(rows, n);
+
+    db_query_tracks_list(db, artist, NULL, &rows, &n);
+    CHECK(n > 0, "F1 artist listing is empty");
+    check_list_sorted("F1 artist", rows, n);
+    db_track_rows_free(rows, n);
+
+    db_query_tracks_list(db, NULL, match, &rows, &n);
+    CHECK(n > 0, "F1 All+FTS listing is empty");
+    check_list_sorted("F1 All+FTS", rows, n);
+    db_track_rows_free(rows, n);
+
+    db_query_tracks_list(db, artist, match, &rows, &n);
+    CHECK(n > 0, "F1 artist+FTS listing is empty");
+    check_list_sorted("F1 artist+FTS", rows, n);
+    db_track_rows_free(rows, n);
+  }
+  db_names_free(names, nn);
+
+  db_query_tracks_list(gdb, NULL, NULL, &rows, &n);
+  CHECK(n == 18, "group fixture All listing has %zu rows, want 18", n);
+  check_list_sorted("F1 group All", rows, n);
+  db_track_rows_free(rows, n);
+
+  db_query_tracks_list(gdb, "Abc", NULL, &rows, &n);
+  CHECK(n == 2, "group fixture artist \"Abc\" has %zu rows, want 2", n);
+  check_list_sorted("F1 group artist", rows, n);
+  db_track_rows_free(rows, n);
+
+  free(match);
+} /* test_list_order */
+
+/*
+ * count_artist_in_all: rows of `db`'s All listing whose artist equals
+ * `artist` byte for byte; the independent oracle for the group fixture.
+ */
+static size_t
+count_artist_in_all(Db * db, const char * artist)
+{
+  DbTrackRow * rows = NULL;
+  size_t       n = 0, hits = 0;
+
+  db_query_tracks_list(db, NULL, NULL, &rows, &n);
+  for (size_t i = 0; i < n; i++) {
+    if (rows[i].artist != NULL && strcmp(rows[i].artist, artist) == 0) {
+      hits++;
+    }
+  }
+  db_track_rows_free(rows, n);
+  return hits;
+} /* count_artist_in_all */
+
+/*
+ * test_list_artist: F2. The artist-only count equals a raw
+ * SELECT count(*) ... WHERE artist = ? for three 20k-fixture artists,
+ * and equals an exact-match count for the three case variants in the
+ * group fixture (the 20k fixture is lower-case, so a case-insensitive
+ * match could not fail there).
+ */
+static void
+test_list_artist(void)
+{
+  Db *           db = search_fixture_db();
+  Db *           gdb = group_fixture_db();
+  sqlite3 *      raw = search_fixture_raw();
+  char **        names = NULL;
+  size_t         nn = 0;
+  const char *   variants[] = { "abc", "ABC", "Abc" };
+
+  if (db == NULL || gdb == NULL || raw == NULL) {
+    CHECK(0, "fixtures unavailable for F2");
+    return;
+  }
+
+  db_query_artists(db, &names, &nn);
+  CHECK(nn >= 3, "20k fixture has %zu artists, want >= 3", nn);
+  for (size_t k = 0; k < 3 && nn >= 3; k++) {
+    const char *   artist = names[(k * (nn - 1)) / 2];
+    sqlite3_stmt * st = NULL;
+    int64_t        want = -1;
+    DbTrackRow *   rows = NULL;
+    size_t         n = 0;
+
+    if (sqlite3_prepare_v2(raw, "SELECT count(*) FROM tracks WHERE artist = ?1",
+                           -1, &st, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(st, 1, artist, -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(st) == SQLITE_ROW) {
+        want = sqlite3_column_int64(st, 0);
+      }
+      sqlite3_finalize(st);
+    }
+    db_query_tracks_list(db, artist, NULL, &rows, &n);
+    CHECK((int64_t) n == want && want > 0,
+          "artist \"%s\": list returned %zu rows, raw count %lld", artist, n, (long long) want);
+    db_track_rows_free(rows, n);
+  }
+  db_names_free(names, nn);
+
+  for (size_t k = 0; k < 3; k++) {
+    DbTrackRow * rows = NULL;
+    size_t       n = 0;
+    size_t       want = count_artist_in_all(gdb, variants[k]);
+
+    db_query_tracks_list(gdb, variants[k], NULL, &rows, &n);
+    CHECK(want == 2 && n == want, "artist \"%s\": list returned %zu rows, want %zu (2)",
+          variants[k], n, want);
+    db_track_rows_free(rows, n);
+  }
+} /* test_list_artist */
+
+/*
+ * test_list_compose: F3. For an artist and a selective query, the
+ * artist+FTS id set equals the artist-only ids intersected with the raw,
+ * uncapped FTS ids. The artist is taken from the first match, and the
+ * candidate is accepted only if the match set spans more than that
+ * artist, so dropping the artist term cannot go unseen.
+ */
+static void
+test_list_compose(void)
+{
+  Db *      db = search_fixture_db();
+  sqlite3 * raw = search_fixture_raw();
+  int       done = 0;
+
+  if (db == NULL || raw == NULL) {
+    CHECK(0, "fixtures unavailable for F3");
+    return;
+  }
+
+  for (size_t ci = 0; ci < sizeof g_selective_candidates / sizeof g_selective_candidates[0] && !done; ci++) {
+    char *       match = query_build_match(g_selective_candidates[ci]);
+    int64_t *    raw_ids = NULL;
+    size_t       nraw = (match != NULL) ? raw_fts_ids(raw, match, &raw_ids) : 0;
+    char *       artist = (nraw > 0) ? raw_artist_of(raw, raw_ids[0]) : NULL;
+    DbTrackRow * arows = NULL, * grows = NULL;
+    size_t       an = 0, gn = 0;
+    int64_t *    a_ids = NULL, * g_ids = NULL, * inter = NULL;
+    size_t       ninter = 0;
+
+    if (artist != NULL) {
+      db_query_tracks_list(db, artist, NULL, &arows, &an);
+      a_ids = ids_sorted(arows, an);
+      inter = malloc(nraw * sizeof *inter);
+      for (size_t i = 0, j = 0; inter != NULL && a_ids != NULL && i < nraw && j < an; ) {
+        if (raw_ids[i] == a_ids[j]) {
+          inter[ninter++] = raw_ids[i];
+          i++;
+          j++;
+        } else if (raw_ids[i] < a_ids[j]) {
+          i++;
+        } else {
+          j++;
+        }
+      }
+      if (inter != NULL && ninter > 0 && ninter < nraw && ninter < DB_MATCH_CAP) {
+        done = 1;
+        db_query_tracks_list(db, artist, match, &grows, &gn);
+        g_ids = ids_sorted(grows, gn);
+        CHECK(gn == ninter, "artist \"%s\" + \"%s\": %zu rows, want %zu",
+              artist, g_selective_candidates[ci], gn, ninter);
+        for (size_t i = 0; g_ids != NULL && i < gn && i < ninter; i++) {
+          CHECK(g_ids[i] == inter[i], "compose id %zu: got %lld, want %lld",
+                i, (long long) g_ids[i], (long long) inter[i]);
+        }
+      }
+    }
+    db_track_rows_free(arows, an);
+    db_track_rows_free(grows, gn);
+    free(a_ids);
+    free(g_ids);
+    free(inter);
+    free(artist);
+    free(raw_ids);
+    free(match);
+  }
+  CHECK(done, "no selective candidate gave a usable artist/FTS intersection");
+} /* test_list_compose */
+
+/*
+ * test_list_cap: F4. FTS-filtered listings return at most DB_MATCH_CAP
+ * rows; All+FTS "a" returns exactly DB_MATCH_CAP, and they are the
+ * lowest-rowid matches (port of test_search_cap's "which 200").
+ */
+static void
+test_list_cap(void)
+{
+  Db *         db = search_fixture_db();
+  sqlite3 *    raw = search_fixture_raw();
+  char *       match = query_build_match("a");
+  char **      names = NULL;
+  size_t       nn = 0;
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+
+  if (db == NULL || raw == NULL || match == NULL) {
+    CHECK(0, "fixtures unavailable for F4");
+    free(match);
+    return;
+  }
+
+  db_query_artists(db, &names, &nn);
+  if (nn > 0) {
+    db_query_tracks_list(db, names[0], match, &rows, &n);
+    CHECK(n <= DB_MATCH_CAP, "artist+FTS returned %zu rows, cap %d", n, DB_MATCH_CAP);
+    db_track_rows_free(rows, n);
+  }
+  db_names_free(names, nn);
+
+  db_query_tracks_list(db, NULL, match, &rows, &n);
+  CHECK(n == DB_MATCH_CAP, "All+FTS \"a\" returned %zu rows, want %d", n, DB_MATCH_CAP);
+  if (n == DB_MATCH_CAP) {
+    int64_t * got = ids_sorted(rows, n);
+    int64_t * all = NULL;
+    size_t    nall = raw_fts_ids(raw, match, &all);
+
+    CHECK(nall > DB_MATCH_CAP, "query \"a\"* matched %zu rows, want > %d -- fixture drifted",
+          nall, DB_MATCH_CAP);
+    for (size_t i = 0; got != NULL && all != NULL && i < n && i < nall; i++) {
+      CHECK(got[i] == all[i],
+            "cap row %zu: got id %lld, want %lld -- the rows are not the lowest-rowid "
+            "matches, so the LIMIT is not inside the subquery",
+            i, (long long) got[i], (long long) all[i]);
+    }
+    free(got);
+    free(all);
+  }
+  db_track_rows_free(rows, n);
+  free(match);
+} /* test_list_cap */
+
+/*
+ * time_stmt_best: best-of-five wall time of draining `sql` with ?1 bound
+ * to `match`. Returns seconds, or -1 on a prepare failure.
+ */
+static double
+time_stmt_best(sqlite3 * conn, const char * sql, const char * match)
+{
+  sqlite3_stmt * st = NULL;
+  double         best = -1.0;
+
+  if (sqlite3_prepare_v2(conn, sql, -1, &st, NULL) != SQLITE_OK) {
+    return -1.0;
+  }
+  for (int rep = 0; rep < 5; rep++) {
+    struct timespec t0, t1;
+    double          dt;
+
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
+    sqlite3_bind_text(st, 1, match, -1, SQLITE_TRANSIENT);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (sqlite3_step(st) == SQLITE_ROW) { }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    dt = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (best < 0.0 || dt < best) {
+      best = dt;
+    }
+  }
+  sqlite3_finalize(st);
+  return best;
+} /* time_stmt_best */
+
+/*
+ * time_list_best: best-of-five wall time of db_query_tracks_list for one
+ * shape on the Db fixture. Returns seconds.
+ */
+static double
+time_list_best(Db * db, const char * artist, const char * match)
+{
+  double best = -1.0;
+
+  for (int rep = 0; rep < 5; rep++) {
+    struct timespec t0, t1;
+    DbTrackRow *    rows = NULL;
+    size_t          n = 0;
+    double          dt;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    db_query_tracks_list(db, artist, match, &rows, &n);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    db_track_rows_free(rows, n);
+    dt = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (best < 0.0 || dt < best) {
+      best = dt;
+    }
+  }
+  return best;
+} /* time_list_best */
+
+/*
+ * test_list_latency: F5. On the raw fixture, the All+FTS text with the
+ * LIMIT inside the subquery against the same text with the LIMIT moved
+ * outside; best of five, ratio >= 2.0 (port of test_search_latency).
+ * Also prints best-of-five times for the four list shapes on the Db
+ * fixture.
+ */
+static void
+test_list_latency(void)
+{
+  sqlite3 *    raw = search_fixture_raw();
+  Db *         db = search_fixture_db();
+  char *       match = query_build_match("a");
+  char **      names = NULL;
+  size_t       nn = 0;
+  double       fast, slow, ratio;
+
+  if (raw == NULL || db == NULL || match == NULL) {
+    CHECK(0, "fixtures unavailable for F5");
+    free(match);
+    return;
+  }
+
+  fast = time_stmt_best(raw,
+      "SELECT t.* FROM tracks t JOIN (SELECT rowid AS rid FROM tracks_fts "
+      "WHERE tracks_fts MATCH ?1 LIMIT 200) x ON t.id = x.rid" T_LIST_ORDER, match);
+  slow = time_stmt_best(raw,
+      "SELECT t.* FROM tracks t JOIN (SELECT rowid AS rid FROM tracks_fts "
+      "WHERE tracks_fts MATCH ?1) x ON t.id = x.rid" T_LIST_ORDER " LIMIT 200", match);
+  CHECK(fast >= 0.0 && slow >= 0.0, "failed to prepare the F5 statements");
+
+  ratio = (fast > 0.0) ? slow / fast : 0.0;
+  printf("fts_query_test: list latency outer-limit=%.3fms inner-limit=%.3fms ratio=%.2fx\n",
+         slow * 1000.0, fast * 1000.0, ratio);
+
+  /* If this fails on CI with no db.c change, demote to a printed figure
+     -- do not re-tune the gate upward (decide R7). */
+  CHECK(ratio >= 2.0, "list latency ratio %.2fx, want >= 2.0x (outer=%.3fms inner=%.3fms)",
+        ratio, slow * 1000.0, fast * 1000.0);
+
+  db_query_artists(db, &names, &nn);
+  if (nn > 0) {
+    printf("fts_query_test: list shapes @%d rows: all=%.3fms artist=%.3fms "
+           "all+fts=%.3fms artist+fts=%.3fms\n", SEARCH_FIXTURE_N,
+           time_list_best(db, NULL, NULL) * 1000.0,
+           time_list_best(db, names[0], NULL) * 1000.0,
+           time_list_best(db, NULL, match) * 1000.0,
+           time_list_best(db, names[0], match) * 1000.0);
+  }
+  db_names_free(names, nn);
+  free(match);
+} /* test_list_latency */
+
+/*
+ * test_list_untagged: F6 and Q2. The all-NULL row is in the All listing
+ * and in no artist's listing, and it is the first row of the All listing
+ * (decisions Q2: NULL sorts first).
+ */
+static void
+test_list_untagged(void)
+{
+  Db *         gdb = group_fixture_db();
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+  int64_t      id = 0;
+  char **      names = NULL;
+  size_t       nn = 0;
+
+  if (gdb == NULL) {
+    CHECK(0, "group fixture unavailable for F6");
+    return;
+  }
+
+  db_query_tracks_list(gdb, NULL, NULL, &rows, &n);
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(rows[i].path, "/music/untagged/x.flac") == 0) {
+      id = rows[i].id;
+    }
+  }
+  CHECK(id != 0, "F6: the untagged row is missing from the All listing");
+  CHECK(n > 0 && strcmp(rows[0].path, "/music/untagged/x.flac") == 0,
+        "Q2: the first row of All is %s, want the untagged row", n > 0 ? rows[0].path : "(none)");
+  db_track_rows_free(rows, n);
+
+  db_query_artists(gdb, &names, &nn);
+  CHECK(nn > 0, "group fixture has no artists");
+  for (size_t a = 0; a < nn; a++) {
+    db_query_tracks_list(gdb, names[a], NULL, &rows, &n);
+    for (size_t i = 0; i < n; i++) {
+      CHECK(rows[i].id != id, "F6: the untagged row is listed under artist \"%s\"", names[a]);
+    }
+    db_track_rows_free(rows, n);
+  }
+  db_names_free(names, nn);
+} /* test_list_untagged */
+
+/*
+ * test_name_contains: F7. Pure. ASCII letters fold, bytes >= 0x80 match
+ * exactly, empty needle matches all, NULL hay matches only an empty needle.
+ */
+static void
+test_name_contains(void)
+{
+  CHECK(query_name_contains("Aphex Twin", "twin") == 1, "Aphex Twin / twin");
+  CHECK(query_name_contains("AC/DC", "c/d") == 1, "AC/DC / c/d");
+  CHECK(query_name_contains("Bj\xc3\xb6rk", "BJ\xc3\x96RK") == 0, "Bj\xc3\xb6rk / BJ\xc3\x96RK folded a non-ASCII letter");
+  CHECK(query_name_contains("Bj\xc3\xb6rk", "Bj\xc3\xb6") == 1, "Bj\xc3\xb6rk / Bj\xc3\xb6");
+  CHECK(query_name_contains("x", "") == 1, "x / empty");
+  CHECK(query_name_contains(NULL, "") == 1, "NULL / empty");
+  CHECK(query_name_contains(NULL, "a") == 0, "NULL / a");
+  CHECK(query_name_contains("abc", "abcd") == 0, "abc / abcd");
+} /* test_name_contains */
+
+/*
+ * header_text: the label design IV.3 gives the header of a run starting
+ * at `t`, spelled independently of browser.c. Takes the row, whether the
+ * listing is artist-scoped and an out buffer.
+ */
+static void
+header_text(const DbTrackRow * t, int scoped, char * buf, size_t cap)
+{
+  size_t w = 0;
+
+  buf[0] = '\0';
+  if (!scoped) {
+    w += (size_t) snprintf(buf + w, cap - w, "%s" T_SEP_ARTIST,
+                           t->artist != NULL ? t->artist : "(unknown artist)");
+  }
+  w += (size_t) snprintf(buf + w, cap - w, "%s", t->album != NULL ? t->album : "(no album)");
+  if (t->has_year) {
+    snprintf(buf + w, cap - w, T_SEP_YEAR "%lld", (long long) t->year);
+  }
+} /* header_text */
+
+/*
+ * check_listing: assert the grouping invariants of one LIB_KEY_LIST
+ * listing: row 0 is a header, a header precedes each (artist, album) run
+ * and only there, is_dir is set on headers and on nothing else, every
+ * header is followed by a track, and each header reads as header_text
+ * says. Takes the Db, the source, the rows, whether the listing is
+ * artist-scoped and a label; returns the header count.
+ */
+static size_t
+check_listing(Db * db, const BrowserSource * src, const BrowserRow * rows, size_t n,
+              int scoped, const char * what)
+{
+  DbTrackRow prev;
+  int        have_prev = 0;
+  size_t     headers = 0;
+
+  memset(&prev, 0, sizeof prev);
+  CHECK(n > 0 && rows[0].is_dir, "%s: row 0 is not a header", what);
+
+  for (size_t i = 0; i < n; i++) {
+    int is_header = (rows[i].key[0] == 'H');
+
+    CHECK(rows[i].is_dir == is_header, "%s: row %zu (%s) is_dir=%d, header=%d",
+          what, i, rows[i].name, rows[i].is_dir, is_header);
+    if (is_header) {
+      headers++;
+      CHECK(i + 1 < n && rows[i + 1].key[0] == 'I', "%s: header %zu is not followed by a track", what, i);
+      continue;
+    }
+
+    DbTrackRow cur;
+    char       want[1200];
+    int        after_header = (i > 0 && rows[i - 1].key[0] == 'H');
+
+    if (db_query_track_by_id(db, browser_library_track_id(src, rows[i].key), &cur) != 1) {
+      CHECK(0, "%s: row %zu names no track", what, i);
+      continue;
+    }
+    int boundary = !have_prev || cmp_bin_null(prev.artist, cur.artist) != 0
+                              || cmp_bin_null(prev.album, cur.album) != 0;
+    CHECK(boundary == after_header,
+          "%s: row %zu (%s): group boundary=%d but header before it=%d",
+          what, i, rows[i].name, boundary, after_header);
+    if (after_header) {
+      header_text(&cur, scoped, want, sizeof want);
+      CHECK(strcmp(rows[i - 1].name, want) == 0, "%s: header \"%s\", want \"%s\"",
+            what, rows[i - 1].name, want);
+    }
+    if (have_prev) {
+      db_track_row_free_fields(&prev);
+    }
+    prev = cur;
+    have_prev = 1;
+  }
+  if (have_prev) {
+    db_track_row_free_fields(&prev);
+  }
+  return headers;
+} /* check_listing */
+
+/*
+ * has_ci: 1 when `needle` occurs in `hay` ignoring ASCII case; an
+ * independent oracle for the facet filter (strncasecmp, not
+ * query_name_contains).
+ */
+static int
+has_ci(const char * hay, const char * needle)
+{
+  size_t m = strlen(needle);
+
+  if (m == 0) {
+    return 1;
+  }
+  for (; *hay != '\0'; hay++) {
+    if (strncasecmp(hay, needle, m) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+} /* has_ci */
+
+/*
+ * check_facet: load the facet root for `filter` and assert row 0 is
+ * "All (N)" with N == db_count_tracks and the All list key, and that the
+ * remaining rows are exactly the artists containing `filter` (oracle
+ * has_ci), in db_query_artists' order.
+ */
+static void
+check_facet(Db * db, const BrowserSource * src, const char * filter)
+{
+  BrowserRow * rows = NULL;
+  size_t       n = 0;
+  char **      names = NULL;
+  size_t       nn = 0, want = 0;
+  char         label[64];
+  char *       fk = browser_library_facet_key(filter);
+  char *       allkey = browser_library_list_key(NULL, "");
+
+  CHECK(fk != NULL && allkey != NULL && src->load(src->self, BROWSER_COL_MAIN, fk, &rows, &n) == 0,
+        "facet load failed for filter \"%s\"", filter);
+  db_query_artists(db, &names, &nn);
+
+  snprintf(label, sizeof label, "All (%lld)", (long long) db_count_tracks(db));
+  CHECK(n > 0 && strcmp(rows[0].name, label) == 0, "facet \"%s\": row 0 is \"%s\", want \"%s\"",
+        filter, n > 0 ? rows[0].name : "(none)", label);
+  CHECK(n > 0 && allkey != NULL && strcmp(rows[0].key, allkey) == 0 && rows[0].is_dir,
+        "facet \"%s\": the All row key or is_dir is wrong", filter);
+
+  for (size_t i = 0; i < nn; i++) {
+    if (has_ci(names[i], filter)) {
+      CHECK(n > 1 + want && strcmp(rows[1 + want].name, names[i]) == 0,
+            "facet \"%s\": artist row %zu is \"%s\", want \"%s\"", filter, want,
+            n > 1 + want ? rows[1 + want].name : "(none)", names[i]);
+      want++;
+    }
+  }
+  CHECK(n == 1 + want, "facet \"%s\": %zu rows, want %zu", filter, n, 1 + want);
+
+  db_names_free(names, nn);
+  src->free_rows(src->self, rows, n);
+  free(fk);
+  free(allkey);
+} /* check_facet */
+
+/*
+ * test_list_grouping: F8. Group-fixture listings through the library
+ * source: the All listing and an artist-scoped one satisfy
+ * check_listing; the untagged header heads All (Q2); a filtered key
+ * carries its query; list and group keys load nothing outside the main
+ * column; the facet root lists All (N) first; browser_reroot swaps the
+ * root and leaves the browser alone on a failed load.
+ */
+static void
+test_list_grouping(void)
+{
+  Db *               gdb = group_fixture_db();
+  const char *       roots[] = { "/music" };
+  BrowserSource      src;
+  BrowserRow *       rows = NULL;
+  size_t             n = 0;
+  char *             key;
+
+  if (gdb == NULL) {
+    CHECK(0, "group fixture unavailable for F8");
+    return;
+  }
+  browser_library_source(&src, BROWSER_SRC_LIBRARY, gdb, roots, 1);
+
+  key = browser_library_list_key(NULL, "");
+  CHECK(key != NULL && src.load(src.self, BROWSER_COL_MAIN, key, &rows, &n) == 0, "All list load failed");
+  if (key != NULL && rows != NULL) {
+    size_t headers = check_listing(gdb, &src, rows, n, 0, "F8 All");
+    CHECK(headers == 9, "F8 All: %zu headers, want 9", headers);
+    CHECK(strcmp(rows[0].name, "(unknown artist)" T_SEP_ARTIST "(no album)") == 0,
+          "Q2: row 0 of All is \"%s\", want the untagged header", rows[0].name);
+
+    BrowserRow * none = NULL;
+    size_t       nn = 99;
+    CHECK(src.load(src.self, BROWSER_COL_MAIN, rows[0].key, &none, &nn) == 0 && nn == 0,
+          "a header key must load zero rows");
+    src.free_rows(src.self, none, nn);
+    none = NULL;
+    nn = 99;
+    CHECK(src.load(src.self, BROWSER_COL_PREVIEW, key, &none, &nn) == 0 && nn == 0,
+          "a list key in the preview column must load zero rows");
+    src.free_rows(src.self, none, nn);
+  }
+  src.free_rows(src.self, rows, n);
+  rows = NULL;
+  free(key);
+
+  check_facet(gdb, &src, "");
+  check_facet(gdb, &src, "ab");
+  check_facet(gdb, &src, "AB");
+  check_facet(gdb, &src, "zzz");
+
+  /* Artist scope: the key of the "Beta" row of the facet root. */
+  {
+    char * fk = browser_library_facet_key("");
+    char * beta = NULL;
+
+    CHECK(fk != NULL && src.load(src.self, BROWSER_COL_MAIN, fk, &rows, &n) == 0, "facet load failed");
+    for (size_t i = 0; i < n; i++) {
+      if (strcmp(rows[i].name, "Beta") == 0) {
+        beta = strdup(rows[i].key);
+      }
+    }
+    src.free_rows(src.self, rows, n);
+    rows = NULL;
+    free(fk);
+    CHECK(beta != NULL, "no Beta row in the facet root");
+
+    if (beta != NULL) {
+      key = browser_library_list_key(beta, "");
+      CHECK(key != NULL && src.load(src.self, BROWSER_COL_MAIN, key, &rows, &n) == 0, "Beta list load failed");
+      if (rows != NULL) {
+        size_t headers = check_listing(gdb, &src, rows, n, 1, "F8 Beta");
+        CHECK(headers == 3 && n == 3 + 6, "F8 Beta: %zu headers, %zu rows, want 3, 9", headers, n);
+      }
+      src.free_rows(src.self, rows, n);
+      rows = NULL;
+      free(key);
+
+      key = browser_library_list_key(beta, "First");
+      CHECK(key != NULL && src.load(src.self, BROWSER_COL_MAIN, key, &rows, &n) == 0, "Beta+First load failed");
+      CHECK(n == 4, "F8 Beta+\"First\": %zu rows, want 4 (header and 3 tracks)", n);
+      if (rows != NULL) {
+        check_listing(gdb, &src, rows, n, 1, "F8 Beta+First");
+      }
+      src.free_rows(src.self, rows, n);
+      rows = NULL;
+      free(key);
+    }
+    free(beta);
+  }
+
+  /* browser_reroot: the listing and the root change together; a failed
+     load leaves both alone. */
+  {
+    char *    fk = browser_library_facet_key("");
+    Browser * b = (fk != NULL) ? browser_create(&src, fk) : NULL;
+
+    key = browser_library_list_key(NULL, "");
+    CHECK(b != NULL && key != NULL, "browser_create failed");
+    if (b != NULL && key != NULL) {
+      browser_cursor_move(b, 1);
+      CHECK(browser_cursor(b) == 1, "facet browser cursor did not move");
+      CHECK(browser_reroot(b, key) == 0, "browser_reroot failed");
+      CHECK(strcmp(browser_cwd(b), key) == 0, "browser_reroot: cwd is not the new key");
+      CHECK(browser_count(b) == 18 + 9, "browser_reroot: %zu rows, want 27", browser_count(b));
+      CHECK(browser_cursor(b) == 0, "browser_reroot: cursor not at 0");
+      CHECK(browser_ascend(b) == 0, "browser_reroot: the new key is not the ceiling");
+
+      CHECK(browser_reroot(b, "?") == -1, "browser_reroot accepted a key the source refuses");
+      CHECK(strcmp(browser_cwd(b), key) == 0 && browser_count(b) == 27,
+            "a failed browser_reroot changed the browser");
+    }
+    browser_destroy(b);
+    free(key);
+    free(fk);
+  }
+} /* test_list_grouping */
+
+/*
+ * group_fixture_cleanup: release the group fixture. Called once from main.
+ */
+static void
+group_fixture_cleanup(void)
+{
+  if (g_group_fixture_db != NULL) {
+    db_close(g_group_fixture_db);
+    g_group_fixture_db = NULL;
+  }
+} /* group_fixture_cleanup */
+
 /*
  * main: runs the pure tests always and the FTS5 mode unless --pure is
  * given -- the FTS5 mode now also covers the prefix-range precondition,
@@ -1467,6 +2438,7 @@ int main(int argc, char ** argv)
   test_match_big();
   test_match_utf8();
   test_name_cmp();
+  test_name_contains();
   test_collapse();
   test_collapse_wide();
 
@@ -1477,9 +2449,17 @@ int main(int argc, char ** argv)
     test_search_order_preserved();
     test_search_cap();
     test_search_latency();
+    test_list_order();
+    test_list_artist();
+    test_list_compose();
+    test_list_cap();
+    test_list_latency();
+    test_list_untagged();
+    test_list_grouping();
     test_fts_prefix_index();
     test_schema_migrate();
     search_fixture_cleanup();
+    group_fixture_cleanup();
   }
 
   if (g_failures != 0) {

@@ -298,6 +298,27 @@ int db_query_tracks_under_dir(Db * db, const char * dir, DbTrackRow ** out_rows,
  */
 int db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row);
 
+/* Rows an FTS-filtered listing returns at most (design IV.6). Part of
+   the contract: the SQL text and callers both use it. */
+#define DB_MATCH_CAP 200
+
+/*
+ * db_query_tracks_list: the Library listing (design IV.2), ordered by
+ * artist, year, album, disc, track, path. `artist` NULL lists every
+ * artist; `match` NULL or "" applies no FTS filter. An FTS-filtered
+ * listing returns at most DB_MATCH_CAP rows; an unfiltered one is
+ * complete. Fills rows the caller frees with db_track_rows_free;
+ * returns 0, or -1 with neither set. A malformed match is 0 rows.
+ */
+int     db_query_tracks_list(Db * db, const char * artist, const char * match,
+                             DbTrackRow ** out_rows, size_t * out_n);
+
+/*
+ * db_count_tracks: the number of tracks in the index (the facet's
+ * All (N)), or -1 on error.
+ */
+int64_t db_count_tracks(Db * db);
+
 /*
  * db_query_search: SELECT t.* FROM tracks t JOIN (SELECT rowid AS rid,
  * rank AS r FROM tracks_fts WHERE tracks_fts MATCH ?1 LIMIT 200) x ON

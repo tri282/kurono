@@ -17,6 +17,13 @@
  */
 #define KURONO_SCHEMA_VERSION 2
 
+#define DB_STR_(x) #x
+#define DB_STR(x)  DB_STR_(x)
+
+/* Order key <K> of the four list statements (design IV.2, D2). */
+#define LIST_ORDER " ORDER BY artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, " \
+                   "album, disc_no, track_no, path"
+
 /*
  * SQL_TRACKS_FTS_DDL: the tracks_fts virtual table definition, shared
  * between SQL_SCHEMA (fresh databases) and migrate's case 1 (existing
@@ -108,6 +115,11 @@ sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_tracks_under_dir;
   sqlite3_stmt * query_track_by_id;
   sqlite3_stmt * query_search;
+  sqlite3_stmt * query_list_all;
+  sqlite3_stmt * query_list_artist;
+  sqlite3_stmt * query_list_all_fts;
+  sqlite3_stmt * query_list_artist_fts;
+  sqlite3_stmt * count_tracks;
   int            corrupt;
   int            truncated;
 };
@@ -605,6 +617,22 @@ prepare_all_statements(Db * db)
        "       WHERE tracks_fts MATCH ?1 "
        "       LIMIT 200) x ON t.id = x.rid "
        "ORDER BY x.r, x.rid");
+  /* The Library listing (design IV.2, D2). One order key for all four so
+     the texts cannot drift; fts_query_test's list_cmp is the other half.
+     No index serves it: the All sort is a temp B-tree, the policy noted
+     above for every NOCASE ORDER BY (Q1). The FTS shapes carry no rank. */
+  PREP(query_list_all, "SELECT * FROM tracks" LIST_ORDER);
+  PREP(query_list_artist, "SELECT * FROM tracks WHERE artist = ?1" LIST_ORDER);
+  PREP(query_list_all_fts,
+       "SELECT t.* FROM tracks t "
+       "JOIN (SELECT rowid AS rid FROM tracks_fts "
+       "       WHERE tracks_fts MATCH ?1 LIMIT " DB_STR(DB_MATCH_CAP) ") x ON t.id = x.rid"
+       LIST_ORDER);
+  PREP(query_list_artist_fts,
+       "SELECT * FROM tracks WHERE artist = ?2 AND id IN "
+       "(SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1)"
+       LIST_ORDER " LIMIT " DB_STR(DB_MATCH_CAP));
+  PREP(count_tracks, "SELECT count(*) FROM tracks");
 
 #undef PREP
 } /* prepare_all_statements */
@@ -689,6 +717,11 @@ db_close(Db * db)
   sqlite3_finalize(db->query_tracks_under_dir);
   sqlite3_finalize(db->query_track_by_id);
   sqlite3_finalize(db->query_search);
+  sqlite3_finalize(db->query_list_all);
+  sqlite3_finalize(db->query_list_artist);
+  sqlite3_finalize(db->query_list_all_fts);
+  sqlite3_finalize(db->query_list_artist_fts);
+  sqlite3_finalize(db->count_tracks);
 
   /* Refresh sqlite_stat1 for the query planner before close. */
   sqlite3_exec(db->conn, "PRAGMA optimize;", NULL, NULL, NULL);
@@ -1094,6 +1127,63 @@ db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size
   sqlite3_bind_text(stmt, 1, match_string, -1, SQLITE_TRANSIENT);
   return rows_from_stmt(db, stmt, out_rows, out_n);
 } /* db_query_search */
+
+/*
+ * db_query_tracks_list: see include/library/db.h. Takes the optional
+ * artist and match, picks one of the four list statements by which are
+ * present, binds and drains it. Returns 0, or -1 for a NULL handle or
+ * out-param.
+ */
+int
+db_query_tracks_list(Db * db, const char * artist, const char * match,
+                     DbTrackRow ** out_rows, size_t * out_n)
+{
+  if (db == NULL || out_rows == NULL || out_n == NULL) {
+    return -1;
+  }
+
+  int            fts = (match != NULL && match[0] != '\0');
+  sqlite3_stmt * stmt;
+
+  if (artist != NULL) {
+    stmt = fts ? db->query_list_artist_fts : db->query_list_artist;
+  } else {
+    stmt = fts ? db->query_list_all_fts : db->query_list_all;
+  }
+
+  db_reset(db, stmt);
+  sqlite3_clear_bindings(stmt);
+  if (fts) {
+    sqlite3_bind_text(stmt, 1, match, -1, SQLITE_TRANSIENT);
+    if (artist != NULL) {
+      sqlite3_bind_text(stmt, 2, artist, -1, SQLITE_TRANSIENT);
+    }
+  } else if (artist != NULL) {
+    sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
+  }
+  return rows_from_stmt(db, stmt, out_rows, out_n);
+} /* db_query_tracks_list */
+
+/*
+ * db_count_tracks: see include/library/db.h.
+ */
+int64_t
+db_count_tracks(Db * db)
+{
+  if (db == NULL) {
+    return -1;
+  }
+
+  sqlite3_stmt * stmt = db->count_tracks;
+  int64_t        n = -1;
+
+  db_reset(db, stmt);
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    n = sqlite3_column_int64(stmt, 0);
+  }
+  db_reset(db, stmt);
+  return n;
+} /* db_count_tracks */
 
 /*
  * db_names_free: see include/library/db.h.

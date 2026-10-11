@@ -107,4 +107,12 @@ int query_name_cmp(const char * a, const char * b);
  */
 char * query_build_match(const char * raw);
 
+/*
+ * query_name_contains: 1 when `needle` occurs in `hay`, comparing ASCII
+ * letters case-insensitively and every byte >= 0x80 exactly; 0 otherwise.
+ * An empty needle matches everything; a NULL hay matches only an empty
+ * needle. The facet filter (design IV.1).
+ */
+int query_name_contains(const char * hay, const char * needle);
+
 #endif // KURONO_LIBRARY_QUERY_H

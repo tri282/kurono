@@ -345,6 +345,13 @@ browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore)
  *   A<len>:<name>         an artist
  *   B<len>:<a><len>:<alb> an album, qualified by the name above it
  *   I<id>                 one track, by primary key
+ *   L[<len>:<a>]<len>:<q> the Library listing: optional artist, then the
+ *                         filter text (one segment = query only)
+ *   H<f><segs>            a group header; <f> is '0'-'3', bit 0 artist
+ *                         present, bit 1 album present, so NULL and ""
+ *                         are different keys
+ *   R<filter>             the Library facet root (raw payload; empty in
+ *                         the Directory view and the old Artists view)
  *
  * The length prefix is the point. A slash-joined key cannot survive
  * "AC/DC" or an album called "Live 1/2", and the failure is a listing of
@@ -358,6 +365,15 @@ browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore)
 #define LIB_KEY_NAME   'A'
 #define LIB_KEY_ALBUM  'B'
 #define LIB_KEY_TRACK  'I'
+#define LIB_KEY_LIST   'L'
+#define LIB_KEY_GROUP  'H'
+
+/* Library listing labels (design IV.3). */
+#define LIB_LABEL_NO_ARTIST "(unknown artist)"
+#define LIB_LABEL_NO_ALBUM  "(no album)"
+#define LIB_LABEL_ALL       "All"
+#define LIB_SEP_ARTIST      " \xe2\x80\x94 "
+#define LIB_SEP_YEAR        " \xc2\xb7 "
 
 /*
  * LibSource: one per view. `roots` is Config's array, borrowed, and is
@@ -627,6 +643,135 @@ lib_preview_track(LibSource * s, int64_t id,
 } /* lib_preview_track */
 
 /*
+ * str_same: byte equality with NULL equal to NULL and different from "".
+ * Takes two nullable strings, returns 1 or 0.
+ */
+static int
+str_same(const char * a, const char * b)
+{
+  if (a == NULL || b == NULL) {
+    return a == b;
+  }
+  return strcmp(a, b) == 0;
+} /* str_same */
+
+/*
+ * group_key: the LIB_KEY_GROUP key for an (artist, album) pair, either
+ * of which may be NULL. Takes the pair, returns an owned key or NULL on
+ * allocation failure.
+ */
+static char *
+group_key(const char * artist, const char * album)
+{
+  size_t need = 3; /* kind + flags + NUL */
+  char * key;
+  char * p;
+
+  if (artist != NULL) {
+    need += seg_len(strlen(artist));
+  }
+  if (album != NULL) {
+    need += seg_len(strlen(album));
+  }
+  key = malloc(need);
+  if (key == NULL) {
+    return NULL;
+  }
+  key[0] = LIB_KEY_GROUP;
+  key[1] = (char) ('0' + (artist != NULL ? 1 : 0) + (album != NULL ? 2 : 0));
+  p = key + 2;
+  if (artist != NULL) {
+    p = seg_put(p, artist);
+  }
+  if (album != NULL) {
+    p = seg_put(p, album);
+  }
+  *p = '\0';
+  return key;
+} /* group_key */
+
+/*
+ * push_group_header: append the header row for the run starting at `t`.
+ * Takes the out-array bookkeeping, the first track of the run and
+ * whether the listing is artist-scoped (header omits the artist part);
+ * returns 0 or -1.
+ */
+static int
+push_group_header(BrowserRow ** rows, size_t * count, size_t * cap,
+                  const DbTrackRow * t, int artist_scoped)
+{
+  char         buf[1024];
+  size_t       w = 0;
+  const char * album = (t->album != NULL) ? t->album : LIB_LABEL_NO_ALBUM;
+
+  if (!artist_scoped) {
+    w = (size_t) snprintf(buf, sizeof buf, "%s" LIB_SEP_ARTIST,
+                          (t->artist != NULL) ? t->artist : LIB_LABEL_NO_ARTIST);
+  }
+  if (w < sizeof buf) {
+    w += (size_t) snprintf(buf + w, sizeof buf - w, "%s", album);
+  }
+  if (t->has_year && w < sizeof buf) {
+    snprintf(buf + w, sizeof buf - w, LIB_SEP_YEAR "%" PRId64, t->year);
+  }
+  return rows_push(rows, count, cap, strdup(buf), group_key(t->artist, t->album), 1);
+} /* push_group_header */
+
+/*
+ * lib_load_list: the Library listing for a LIB_KEY_LIST payload (design
+ * IV.2-IV.3): the ordered tracks with a header row before each
+ * (artist, album) run. Takes the source, the key payload (after the
+ * kind byte) and the out-array bookkeeping; returns 0 or -1.
+ */
+static int
+lib_load_list(LibSource * s, const char * payload,
+              BrowserRow ** rows, size_t * count, size_t * cap)
+{
+  char *       first = NULL;
+  char *       second = NULL;
+  char *       match = NULL;
+  DbTrackRow * tracks = NULL;
+  size_t       nt = 0;
+  int          rc = 0;
+  const char * p = seg_get(payload, &first);
+
+  if (p == NULL) {
+    return -1;
+  }
+  if (*p != '\0' && seg_get(p, &second) == NULL) {
+    free(first);
+    return -1;
+  }
+
+  const char * artist = (second != NULL) ? first : NULL;
+  const char * query  = (second != NULL) ? second : first;
+
+  match = query_build_match(query);
+  if (match != NULL) {
+    db_query_tracks_list(s->db, artist, match, &tracks, &nt);
+    s->truncated |= db_result_truncated(s->db);
+
+    for (size_t i = 0; i < nt && rc == 0; i++) {
+      if (i == 0 || !str_same(tracks[i].artist, tracks[i - 1].artist)
+                 || !str_same(tracks[i].album, tracks[i - 1].album)) {
+        rc = push_group_header(rows, count, cap, &tracks[i], artist != NULL);
+      }
+      if (rc == 0) {
+        rc = push_tracks(rows, count, cap, &tracks[i], 1);
+      }
+    }
+    db_track_rows_free(tracks, nt);
+  } else {
+    rc = -1;
+  }
+
+  free(match);
+  free(first);
+  free(second);
+  return rc;
+} /* lib_load_list */
+
+/*
  * lib_load_dir: the Directory view's listing for one directory -- the
  * immediate child directories, then the tracks in it. The children come
  * from db_query_dirs, which returns descendants at every depth, through
@@ -682,8 +827,6 @@ static int
 lib_load(void * self, int column, const char * parent_key,
          BrowserRow ** out, size_t * n)
 {
-  (void) column;
-
   LibSource *  s = (LibSource *) self;
   BrowserRow * rows = NULL;
   size_t       count = 0, cap = 0;
@@ -704,13 +847,25 @@ lib_load(void * self, int column, const char * parent_key,
                          lib_key(LIB_KEY_DIR, s->roots[i], NULL), 1);
         }
       } else {
-        char ** names = NULL;
-        size_t  nn = 0;
+        char **      names = NULL;
+        size_t       nn = 0;
+        const char * filter = parent_key + 1;
+        int64_t      total = db_count_tracks(s->db);
+        char         label[64];
+
+        /* Row 0 is the All row; the rest are the artists whose name
+           contains the facet filter (design IV.1). */
+        snprintf(label, sizeof label, LIB_LABEL_ALL " (%" PRId64 ")", total > 0 ? total : 0);
+        rc = rows_push(&rows, &count, &cap, strdup(label),
+                       browser_library_list_key(NULL, ""), 1);
 
         db_query_artists(s->db, &names, &nn);
         s->truncated |= db_result_truncated(s->db);
 
         for (size_t i = 0; i < nn && rc == 0; i++) {
+          if (!query_name_contains(names[i], filter)) {
+            continue;
+          }
           rc = rows_push(&rows, &count, &cap, strdup(names[i]),
                          lib_key(LIB_KEY_NAME, names[i], NULL), 1);
         }
@@ -768,6 +923,17 @@ lib_load(void * self, int column, const char * parent_key,
       rc = lib_preview_track(s, (int64_t) strtoll(parent_key + 1, NULL, 10),
                              &rows, &count, &cap);
       break;
+
+    case LIB_KEY_LIST:
+      /* Main column only: a list key in the parent or preview column
+         would run the full listing per cursor move (design IV.1). */
+      if (column == BROWSER_COL_MAIN) {
+        rc = lib_load_list(s, parent_key + 1, &rows, &count, &cap);
+      }
+      break;
+
+    case LIB_KEY_GROUP:
+      break; /* a header has no contents, in any column */
 
     default:
       return -1;
@@ -1054,7 +1220,7 @@ browser_library_expand(const BrowserSource * src, const char * row_key,
     }
 
     default:
-      break; /* ROOT, TRACK, and anything malformed: zero rows, not an error */
+      break; /* ROOT, LIST, GROUP, TRACK, malformed: zero rows, not an error */
   }
 
   if (rc != 0) {
@@ -1106,6 +1272,42 @@ browser_library_root(int src, const char * const * roots, size_t nroots)
   }
   return lib_key(LIB_KEY_ROOT, NULL, NULL);
 } /* browser_library_root */
+
+/*
+ * browser_library_facet_key: see include/ui/browser.h.
+ */
+char *
+browser_library_facet_key(const char * filter)
+{
+  size_t n = (filter != NULL) ? strlen(filter) : 0;
+  char * key = malloc(n + 2);
+
+  if (key == NULL) {
+    return NULL;
+  }
+  key[0] = LIB_KEY_ROOT;
+  memcpy(key + 1, (filter != NULL) ? filter : "", n);
+  key[n + 1] = '\0';
+  return key;
+} /* browser_library_facet_key */
+
+/*
+ * browser_library_list_key: see include/ui/browser.h.
+ */
+char *
+browser_library_list_key(const char * facet_row_key, const char * query)
+{
+  char * artist = NULL;
+  char * key;
+
+  if (facet_row_key != NULL && facet_row_key[0] == LIB_KEY_NAME
+      && seg_get(facet_row_key + 1, &artist) == NULL) {
+    return NULL;
+  }
+  key = lib_key(LIB_KEY_LIST, artist, (query != NULL) ? query : "");
+  free(artist);
+  return key;
+} /* browser_library_list_key */
 
 int
 browser_library_truncated(const BrowserSource * src)
@@ -1384,6 +1586,33 @@ browser_reload(Browser * b)
   clamp(b);
   return 0;
 } /* browser_reload */
+
+/*
+ * browser_reroot: see include/ui/browser.h.
+ */
+int
+browser_reroot(Browser * b, const char * key)
+{
+  if (b == NULL || key == NULL) {
+    return -1;
+  }
+
+  char * root = strdup(key);
+  char * cwd  = strdup(key);
+  if (root == NULL || cwd == NULL || load_into(b, key) != 0) {
+    free(root);
+    free(cwd);
+    return -1;
+  }
+
+  free(b->root);
+  free(b->cwd);
+  b->root   = root;
+  b->cwd    = cwd;
+  b->cursor = 0;
+  clamp(b);
+  return 0;
+} /* browser_reroot */
 
 /*
  * browser_cursor_move: see include/ui/browser.h. Wraps on |delta| == 1,

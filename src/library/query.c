@@ -202,3 +202,42 @@ char * query_build_match(const char * raw)
   out[w] = '\0';
   return out;
 } /* query_build_match */
+
+/*
+ * fold_ascii: lower-case 'A'-'Z' and leave every other byte alone. Not
+ * tolower(3), which is locale-dependent above 0x7f.
+ */
+static unsigned char
+fold_ascii(unsigned char c)
+{
+  return (c >= 'A' && c <= 'Z') ? (unsigned char) (c + ('a' - 'A')) : c;
+} /* fold_ascii */
+
+/*
+ * query_name_contains: see query.h.
+ */
+int query_name_contains(const char * hay, const char * needle)
+{
+  if (needle[0] == '\0') {
+    return 1;
+  }
+  if (hay == NULL) {
+    return 0;
+  }
+
+  /* ponytail: O(n*m) scan, artist names are short; Boyer-Moore if a
+     facet ever lists names of kilobytes. */
+  for (; *hay != '\0'; hay++) {
+    const unsigned char * h = (const unsigned char *) hay;
+    const unsigned char * n = (const unsigned char *) needle;
+
+    while (*n != '\0' && *h != '\0' && fold_ascii(*h) == fold_ascii(*n)) {
+      h++;
+      n++;
+    }
+    if (*n == '\0') {
+      return 1;
+    }
+  }
+  return 0;
+} /* query_name_contains */

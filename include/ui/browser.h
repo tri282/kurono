@@ -135,6 +135,22 @@ char * browser_library_root(int src, const char * const * roots, size_t nroots);
 int    browser_library_truncated(const BrowserSource * src);
 
 /*
+ * browser_library_facet_key: the root key of the Library facet browser
+ * for the facet filter text (NULL is ""). Its listing is the All row
+ * followed by the artists whose name contains the filter. Returns an
+ * owned key, or NULL on allocation failure.
+ *
+ * browser_library_list_key: the key of the Library track listing.
+ * `facet_row_key` is the facet browser's selected row key: an artist
+ * row restricts the listing to that artist, NULL or any other key (the
+ * All row's) lists every artist. `query` is the main filter text (NULL
+ * is ""). Returns an owned key, or NULL on allocation failure or a
+ * malformed artist key.
+ */
+char * browser_library_facet_key(const char * filter);
+char * browser_library_list_key(const char * facet_row_key, const char * query);
+
+/*
  * browser_library_locate: the pair of keys naming where `track` sits in
  * this source's view, for browser_goto. Takes a library source, a track
  * row, and out-params for the parent key and the row key; returns 0 with
@@ -209,6 +225,15 @@ void      browser_destroy(Browser * b);
  * empty a column that was fine a moment ago.
  */
 int browser_reload(Browser * b);
+
+/*
+ * browser_reroot: list `key` and make it both the root and the current
+ * directory, cursor 0, derived columns invalidated. Returns 0, or -1
+ * with the browser unchanged (a failed load keeps the old listing).
+ * browser_goto refuses keys outside the root, and a Library listing's
+ * root is its filter, so a filter change reroots instead.
+ */
+int browser_reroot(Browser * b, const char * key);
 
 /*
  * Cursor movement. None can move the cursor out of range or leave the
