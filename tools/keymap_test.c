@@ -206,7 +206,6 @@ test_readme_bindings(void)
     { TB_KEY_TAB, 0, ACT_VIEW_NEXT, 0 },
     { 0, '1', ACT_VIEW_SET,        0 },
     { 0, '2', ACT_VIEW_SET,        1 },
-    { 0, '3', ACT_VIEW_SET,        2 },
     { 0, 'q', ACT_QUIT,            0 },
     /* Raw mode means the terminal does not turn this into SIGINT -- see
        the row's comment in keymap.c. Checked here because an unbound

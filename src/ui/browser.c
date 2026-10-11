@@ -332,7 +332,7 @@ browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore)
 /* ---------------------------------------------------------------------
  * The library source (phase 16).
  *
- * One source serving three views over library/db.c. Everything specific
+ * One source serving two views over library/db.c. Everything specific
  * to a view is chosen at construction and read from LibSource; nothing
  * in the widget, the draw code, or lib_load's control flow branches on
  * "which view is this" -- lib_load branches on what a key *is*, which is
@@ -342,7 +342,7 @@ browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore)
  *
  *   R                     the top of this view
  *   D<path>               a directory (Directory view)
- *   A<len>:<name>         an artist, or an album artist
+ *   A<len>:<name>         an artist
  *   B<len>:<a><len>:<alb> an album, qualified by the name above it
  *   I<id>                 one track, by primary key
  *
@@ -373,7 +373,7 @@ typedef struct {
   int    truncated;
 } LibSource;
 
-static LibSource g_lib_source[BROWSER_VIEW_COUNT];
+static LibSource g_lib_source[BROWSER_SRC_COUNT];
 
 /*
  * seg_len: how many bytes "<len>:<text>" needs for a segment of `n`
@@ -695,7 +695,7 @@ lib_load(void * self, int column, const char * parent_key,
 
   switch (parent_key[0]) {
     case LIB_KEY_ROOT: {
-      if (s->view == BROWSER_VIEW_DIRECTORY) {
+      if (s->view == BROWSER_SRC_DIRECTORY) {
         /* Amendment 01's synthetic level. A root that did not resolve is
            listed and marked, never hidden: a missing mount must be
            visible. */
@@ -707,11 +707,7 @@ lib_load(void * self, int column, const char * parent_key,
         char ** names = NULL;
         size_t  nn = 0;
 
-        if (s->view == BROWSER_VIEW_ARTISTS) {
-          db_query_artists(s->db, &names, &nn);
-        } else {
-          db_query_album_artists(s->db, &names, &nn);
-        }
+        db_query_artists(s->db, &names, &nn);
         s->truncated |= db_result_truncated(s->db);
 
         for (size_t i = 0; i < nn && rc == 0; i++) {
@@ -735,11 +731,7 @@ lib_load(void * self, int column, const char * parent_key,
       if (seg_get(parent_key + 1, &name) == NULL) {
         return -1;
       }
-      if (s->view == BROWSER_VIEW_ARTISTS) {
-        db_query_albums_for(s->db, name, &albums, &na);
-      } else {
-        db_query_albums_for_album_artist(s->db, name, &albums, &na);
-      }
+      db_query_albums_for(s->db, name, &albums, &na);
       s->truncated |= db_result_truncated(s->db);
 
       for (size_t i = 0; i < na && rc == 0; i++) {
@@ -762,11 +754,7 @@ lib_load(void * self, int column, const char * parent_key,
         free(name);
         return -1;
       }
-      if (s->view == BROWSER_VIEW_ARTISTS) {
-        db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
-      } else {
-        db_query_tracks_for_album(s->db, name, album, &tracks, &nt);
-      }
+      db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
       s->truncated |= db_result_truncated(s->db);
 
       rc = push_tracks(&rows, &count, &cap, tracks, nt);
@@ -871,11 +859,10 @@ lib_parent_key(void * self, const char * key)
  * BrowserSource.parent_key was added to close -- the same argument,
  * applied in the other direction.
  *
- * The row key is the same in all three views: a track is addressed by
- * id. The parent differs, and the difference is the whole point of the
- * views -- the same track is inside a directory, inside its artist's
- * album, and inside its album artist's album, and those are three
- * different rows in three different listings.
+ * The row key is the same in both views: a track is addressed by
+ * id. The parent differs -- the same track is inside a directory and
+ * inside its artist's album, two different rows in two different
+ * listings.
  *
  * A track whose tags do not place it in the current view -- no artist in
  * the Artists view, no album anywhere -- returns -1. That is "this track
@@ -902,25 +889,18 @@ browser_library_locate(const BrowserSource * src, const DbTrackRow * t,
   char *      parent = NULL;
 
   switch (s->view) {
-    case BROWSER_VIEW_DIRECTORY:
+    case BROWSER_SRC_DIRECTORY:
       if (t->parent_dir == NULL) {
         return -1;
       }
       parent = lib_key(LIB_KEY_DIR, t->parent_dir, NULL);
       break;
 
-    case BROWSER_VIEW_ARTISTS:
+    case BROWSER_SRC_LIBRARY:
       if (t->artist == NULL || t->album == NULL) {
         return -1;
       }
       parent = lib_key(LIB_KEY_ALBUM, t->artist, t->album);
-      break;
-
-    case BROWSER_VIEW_ALBUM_ARTISTS:
-      if (t->album_artist == NULL || t->album == NULL) {
-        return -1;
-      }
-      parent = lib_key(LIB_KEY_ALBUM, t->album_artist, t->album);
       break;
 
     default:
@@ -1037,14 +1017,7 @@ browser_library_expand(const BrowserSource * src, const char * row_key,
         free(name);
         return -1;
       }
-      /* The same view split lib_load makes, and for the same reason: an
-         Album Artists row filtered on `artist` misses every
-         compilation. */
-      if (s->view == BROWSER_VIEW_ARTISTS) {
-        db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
-      } else {
-        db_query_tracks_for_album(s->db, name, album, &tracks, &nt);
-      }
+      db_query_tracks_for_artist_album(s->db, name, album, &tracks, &nt);
       s->truncated |= db_result_truncated(s->db);
       rc = rows_take(&acc, &count, tracks, nt);
       free(name);
@@ -1065,21 +1038,13 @@ browser_library_expand(const BrowserSource * src, const char * row_key,
       if (seg_get(row_key + 1, &name) == NULL) {
         return -1;
       }
-      if (s->view == BROWSER_VIEW_ARTISTS) {
-        db_query_albums_for(s->db, name, &albums, &na);
-      } else {
-        db_query_albums_for_album_artist(s->db, name, &albums, &na);
-      }
+      db_query_albums_for(s->db, name, &albums, &na);
       s->truncated |= db_result_truncated(s->db);
 
       for (size_t i = 0; i < na && rc == 0; i++) {
         DbTrackRow * tracks = NULL;
         size_t       nt = 0;
-        if (s->view == BROWSER_VIEW_ARTISTS) {
-          db_query_tracks_for_artist_album(s->db, name, albums[i], &tracks, &nt);
-        } else {
-          db_query_tracks_for_album(s->db, name, albums[i], &tracks, &nt);
-        }
+        db_query_tracks_for_artist_album(s->db, name, albums[i], &tracks, &nt);
         s->truncated |= db_result_truncated(s->db);
         rc = rows_take(&acc, &count, tracks, nt);
       }
@@ -1117,13 +1082,13 @@ lib_free_rows(void * self, BrowserRow * rows, size_t n)
  * see include/ui/browser.h.
  */
 void
-browser_library_source(BrowserSource * out, int view, Db * db,
+browser_library_source(BrowserSource * out, int src, Db * db,
                        const char * const * roots, size_t nroots)
 {
-  LibSource * s = &g_lib_source[(view >= 0 && view < BROWSER_VIEW_COUNT) ? view : 0];
+  LibSource * s = &g_lib_source[(src >= 0 && src < BROWSER_SRC_COUNT) ? src : 0];
 
   s->db     = db;
-  s->view   = view;
+  s->view   = src;
   s->roots  = roots;
   s->nroots = nroots;
 
@@ -1134,9 +1099,9 @@ browser_library_source(BrowserSource * out, int view, Db * db,
 } /* browser_library_source */
 
 char *
-browser_library_root(int view, const char * const * roots, size_t nroots)
+browser_library_root(int src, const char * const * roots, size_t nroots)
 {
-  if (view == BROWSER_VIEW_DIRECTORY && nroots == 1) {
+  if (src == BROWSER_SRC_DIRECTORY && nroots == 1) {
     return lib_key(LIB_KEY_DIR, roots[0], NULL);
   }
   return lib_key(LIB_KEY_ROOT, NULL, NULL);
@@ -1543,7 +1508,7 @@ browser_ascend(Browser * b)
  * shares" -- which stopped being true when phase 16 shipped library keys
  * as a kind byte and length-prefixed segments. It survived because the
  * Directory view's keys are a byte plus a path, so a prefix test happens
- * to work on them; the Artists and Album Artists views, whose root is
+ * to work on them; the Artists view, whose root is
  * the single byte "R" and whose album keys start with "B", failed every
  * check. That made browser_goto silently unreachable in two of the three
  * views -- the third place the widget assumed a key was a path, after

@@ -105,20 +105,14 @@ typedef struct Browser Browser;
  */
 void browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignore);
 
-/*
- * The three views (DESIGN.md VIII.4). They are not screens and not
- * modes: each is a BrowserSource plus a label, and the widget never
- * learns which one it is showing. Adding Genres post-v1 is a fourth
- * entry here, a query, and one Binding row.
- */
-#define BROWSER_VIEW_DIRECTORY     0
-#define BROWSER_VIEW_ARTISTS       1
-#define BROWSER_VIEW_ALBUM_ARTISTS 2
-#define BROWSER_VIEW_COUNT         3
+/* Browser data-source ordinals, not view ids (design II.1). */
+#define BROWSER_SRC_DIRECTORY 0
+#define BROWSER_SRC_LIBRARY   1
+#define BROWSER_SRC_COUNT     2
 
 /*
- * browser_library_source: the source over library/db.c for one view.
- * Takes an out-param for the source, the view, the database, and
+ * browser_library_source: the source over library/db.c for one data source.
+ * Takes an out-param for the source, the source ordinal, the database, and
  * Config's root array (borrowed, and only consulted at the Directory
  * view's synthetic top level). One instance per view is kept
  * internally, so calling this twice for the same view reconfigures that
@@ -135,9 +129,9 @@ void browser_fs_source(BrowserSource * out, char * const * ignore, size_t nignor
  * last call, for the status bar to report. Reading it clears it, so
  * exactly one caller may drain it.
  */
-void  browser_library_source(BrowserSource * out, int view, Db * db,
+void  browser_library_source(BrowserSource * out, int src, Db * db,
                              const char * const * roots, size_t nroots);
-char * browser_library_root(int view, const char * const * roots, size_t nroots);
+char * browser_library_root(int src, const char * const * roots, size_t nroots);
 int    browser_library_truncated(const BrowserSource * src);
 
 /*

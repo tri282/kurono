@@ -254,39 +254,15 @@ int db_query_dirs(Db * db, const char * parent, char *** out_names, size_t * out
 /* db_query_artists: every distinct non-NULL artist, sorted (backed by idx_tracks_artist). */
 int db_query_artists(Db * db, char *** out_names, size_t * out_n);
 
-/* db_query_album_artists: every distinct non-NULL album_artist, sorted (backed by idx_tracks_album_artist). */
-int db_query_album_artists(Db * db, char *** out_names, size_t * out_n);
-
 /* db_query_albums_for: every distinct non-NULL album for the given artist, sorted. */
 int db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t * out_n);
 
 /*
- * db_query_albums_for_album_artist: the album_artist twin of the above,
- * for the Album Artists view. Same shape, different column, and it must
- * be a different statement: filtering on `artist` returns nothing for a
- * compilation, whose album_artist ("Various Artists") is usually not any
- * track's artist. Backed by idx_tracks_album_artist's leading column.
- */
-int db_query_albums_for_album_artist(Db * db, const char * album_artist,
-                                      char *** out_names, size_t * out_n);
-
-/*
- * db_query_tracks_for_album: every track with this album_artist/album,
- * ordered by disc_no, track_no -- idx_tracks_album_artist(album_artist,
- * album, disc_no, track_no) covers the sort, so no separate ORDER BY
- * step is needed at the storage layer. Always returns 0 -- see
+ * db_query_tracks_for_artist_album: every track with this artist/album,
+ * ordered by disc_no, track_no. idx_tracks_artist covers only the lookup,
+ * so this sorts -- an album's worth of rows. Always returns 0 -- see
  * db_query_dirs above for the degrade-not-report-error policy. Caller
  * frees with db_track_rows_free.
- */
-int db_query_tracks_for_album(Db * db, const char * album_artist, const char * album,
-                               DbTrackRow ** out_rows, size_t * out_n);
-
-/*
- * db_query_tracks_for_artist_album: the `artist` twin of the above, for
- * the Artists view, which reaches an album through a track's artist
- * rather than the album's album_artist. Ordered the same way, but
- * idx_tracks_artist covers only the lookup, so this one sorts -- an
- * album's worth of rows.
  */
 int db_query_tracks_for_artist_album(Db * db, const char * artist, const char * album,
                                       DbTrackRow ** out_rows, size_t * out_n);
@@ -342,7 +318,7 @@ int db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row);
  */
 int db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size_t * out_n);
 
-/* db_names_free: free an array returned by db_query_dirs/artists/album_artists/albums_for. */
+/* db_names_free: free an array returned by db_query_dirs/artists/albums_for. */
 void db_names_free(char ** names, size_t n);
 
 /* db_track_row_free_fields: free the owned strings inside *row (not row itself). */

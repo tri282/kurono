@@ -114,7 +114,6 @@ static const Binding g_bindings_normal[] = {
   { TB_KEY_TAB, 0, 0, ACT_VIEW_NEXT,  0 },
   { 0, '1',  0, ACT_VIEW_SET,         0 },
   { 0, '2',  0, ACT_VIEW_SET,         1 },
-  { 0, '3',  0, ACT_VIEW_SET,         2 },
 
   { 0, 'q',  0, ACT_QUIT,             0 },
 

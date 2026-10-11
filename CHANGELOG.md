@@ -4,6 +4,14 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- The Album Artists view. Every track is still reachable under its own
+  artist, and the album artist tag is still shown in the track details and
+  matched by search.
+
 ## [1.3.1] — 2026-10-09
 
 ### Fixed

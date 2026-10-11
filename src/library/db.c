@@ -102,10 +102,7 @@ struct Db {
   sqlite3_stmt * tracks_sweep;
   sqlite3_stmt * query_dirs;
   sqlite3_stmt * query_artists;
-  sqlite3_stmt * query_album_artists;
   sqlite3_stmt * query_albums_for;
-sqlite3_stmt * query_albums_for_album_artist;
-  sqlite3_stmt * query_tracks_for_album;
 sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_tracks_in_dir;
   sqlite3_stmt * query_tracks_under_dir;
@@ -571,30 +568,11 @@ prepare_all_statements(Db * db)
      index. */
   PREP(query_artists, "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL "
                       "ORDER BY artist COLLATE NOCASE");
-  PREP(query_album_artists,
-       "SELECT DISTINCT album_artist FROM tracks WHERE album_artist IS NOT NULL "
-       "ORDER BY album_artist COLLATE NOCASE");
   PREP(query_albums_for, "SELECT DISTINCT album FROM tracks WHERE artist = ?1 AND album IS NOT NULL "
                          "ORDER BY album COLLATE NOCASE");
-  /* The album_artist twin of the line above. Both views ask "which
-     albums belong to this name", but they mean different columns, and
-     one statement cannot serve both: an Album Artists view filtered on
-     `artist` misses every compilation, where album_artist is "Various
-     Artists" and no track carries that as its artist. Covered by
-     idx_tracks_album_artist's leading column, so DISTINCT needs no
-     sort. */
-  PREP(query_albums_for_album_artist,
-       "SELECT DISTINCT album FROM tracks WHERE album_artist = ?1 AND album IS NOT NULL "
-       "ORDER BY album COLLATE NOCASE");
-  PREP(query_tracks_for_album,
-       "SELECT * FROM tracks WHERE album_artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
-  /* The artist twin, for the Artists view, which reaches an album
-     through a track's `artist` rather than the album's `album_artist`.
-     Filtering on album_artist there returns nothing for a compilation
-     -- a silent empty column 3, which is why this exists as its own
-     statement. idx_tracks_artist covers the lookup but not the order,
-     so this one does pay a sort; at v1 scale that is an album's worth
-     of rows. */
+  /* Keyed on a track's `artist`, so a compilation lists under each
+     performer. idx_tracks_artist covers the lookup but not the order,
+     so this pays a sort; an album's worth of rows. */
   PREP(query_tracks_for_artist_album,
        "SELECT * FROM tracks WHERE artist = ?1 AND album = ?2 ORDER BY disc_no, track_no");
   PREP(query_tracks_in_dir, "SELECT * FROM tracks WHERE parent_dir = ?1 ORDER BY path COLLATE NOCASE");
@@ -705,10 +683,7 @@ db_close(Db * db)
   sqlite3_finalize(db->tracks_sweep);
   sqlite3_finalize(db->query_dirs);
   sqlite3_finalize(db->query_artists);
-  sqlite3_finalize(db->query_album_artists);
   sqlite3_finalize(db->query_albums_for);
-  sqlite3_finalize(db->query_albums_for_album_artist);
-  sqlite3_finalize(db->query_tracks_for_album);
   sqlite3_finalize(db->query_tracks_for_artist_album);
   sqlite3_finalize(db->query_tracks_in_dir);
   sqlite3_finalize(db->query_tracks_under_dir);
@@ -1033,17 +1008,6 @@ db_query_artists(Db * db, char *** out_names, size_t * out_n)
 } /* db_query_artists */
 
 /*
- * db_query_album_artists: see include/library/db.h.
- */
-int
-db_query_album_artists(Db * db, char *** out_names, size_t * out_n)
-{
-  sqlite3_stmt * stmt = db->query_album_artists;
-  db_reset(db, stmt);
-  return names_from_stmt(db, stmt, out_names, out_n);
-} /* db_query_album_artists */
-
-/*
  * db_query_albums_for: see include/library/db.h.
  */
 int
@@ -1055,35 +1019,6 @@ db_query_albums_for(Db * db, const char * artist, char *** out_names, size_t * o
   sqlite3_bind_text(stmt, 1, artist, -1, SQLITE_TRANSIENT);
   return names_from_stmt(db, stmt, out_names, out_n);
 } /* db_query_albums_for */
-
-/*
- * db_query_albums_for_album_artist: see include/library/db.h.
- */
-int
-db_query_albums_for_album_artist(Db * db, const char * album_artist,
-                                  char *** out_names, size_t * out_n)
-{
-  sqlite3_stmt * stmt = db->query_albums_for_album_artist;
-  db_reset(db, stmt);
-  sqlite3_clear_bindings(stmt);
-  sqlite3_bind_text(stmt, 1, album_artist, -1, SQLITE_TRANSIENT);
-  return names_from_stmt(db, stmt, out_names, out_n);
-} /* db_query_albums_for_album_artist */
-
-/*
- * db_query_tracks_for_album: see include/library/db.h.
- */
-int
-db_query_tracks_for_album(Db * db, const char * album_artist, const char * album,
-                           DbTrackRow ** out_rows, size_t * out_n)
-{
-  sqlite3_stmt * stmt = db->query_tracks_for_album;
-  db_reset(db, stmt);
-  sqlite3_clear_bindings(stmt);
-  sqlite3_bind_text(stmt, 1, album_artist, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(stmt, 2, album, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, out_rows, out_n);
-} /* db_query_tracks_for_album */
 
 /*
  * db_query_tracks_for_artist_album: see include/library/db.h.

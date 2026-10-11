@@ -428,8 +428,8 @@ typedef struct {
      array must outlive the browsers, not the construction block that
      builds it. */
   const char **   rootv;
-  BrowserSource   brsrc[BROWSER_VIEW_COUNT];
-  Browser *       brv[BROWSER_VIEW_COUNT];
+  BrowserSource   brsrc[BROWSER_SRC_COUNT];
+  Browser *       brv[BROWSER_SRC_COUNT];
   int             view;              /* index into brv, the active view */
   Browser *       br;                /* == brv[view]; NULL on every headless run */
   Queue *         q;                 /* NULL on every headless run */
@@ -818,11 +818,11 @@ action_dispatch(Action a, int32_t arg)
       if (a == ACT_VIEW_SET) {
         next = arg;
       } else {
-        int step = (a == ACT_VIEW_NEXT) ? 1 : BROWSER_VIEW_COUNT - 1;
-        next = (p->view + step) % BROWSER_VIEW_COUNT;
+        int step = (a == ACT_VIEW_NEXT) ? 1 : BROWSER_SRC_COUNT - 1;
+        next = (p->view + step) % BROWSER_SRC_COUNT;
       }
 
-      if (next < 0 || next >= BROWSER_VIEW_COUNT || p->brv[next] == NULL) {
+      if (next < 0 || next >= BROWSER_SRC_COUNT || p->brv[next] == NULL) {
         player_report(p, "view unavailable");
       } else {
         p->view = next;
@@ -3053,7 +3053,7 @@ player_rescan(Player * p)
      The queue itself is not touched -- an entry whose id is dangling
      falls back to its path, which is the branch DESIGN.md III.2 has
      carried since phase 9 and which this is the v1 consumer of. */
-  for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+  for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
     if (p->brv[v] != NULL) {
       (void) browser_reload(p->brv[v]);
     }
@@ -3585,7 +3585,7 @@ shutdown_all(Player * p)
   player_search_free(p);
   queueview_free();
 
-  for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+  for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
     browser_destroy(p->brv[v]);
     p->brv[v] = NULL;
   }
@@ -4109,7 +4109,7 @@ run_tui(void)
     }
     const char ** rootv = p.rootv;
 
-    for (int v = 0; v < BROWSER_VIEW_COUNT; v++) {
+    for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
       browser_library_source(&p.brsrc[v], v, p.db, rootv, p.cfg.nroots);
 
       char * rootkey = browser_library_root(v, rootv, p.cfg.nroots);
@@ -4121,7 +4121,7 @@ run_tui(void)
         fprintf(stderr, "kurono: view %d unavailable -- browsing disabled\n", v);
       }
     }
-    p.view = BROWSER_VIEW_DIRECTORY;
+    p.view = BROWSER_SRC_DIRECTORY;
     p.br   = p.brv[p.view];
   }
 

@@ -62,7 +62,7 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
    drawn, playing or idle: losing it the moment playback starts is the
    defect this exists to fix (v1.0.1 #14), and it is worst on a narrow
    terminal, which is where a drop-below-floor rule would drop it.
-   Fourteen columns fits "album artists" plus its separator. */
+   Fourteen columns leaves room for the longest view label plus its separator. */
 #define VIEW_FIELD_W 14
 
 /* Below this budget the ellipsis is more of the field than the content
@@ -318,19 +318,18 @@ fmt_clock(int64_t ms, char * buf, size_t bufsz)
 
 
 /*
- * View labels, drawn over column 1. Sized by BROWSER_VIEW_COUNT and
+ * View labels, drawn over column 1. Sized by BROWSER_SRC_COUNT and
  * checked below, the same mechanism g_mode_label and g_action_name use:
  * a view added without a label fails the build rather than drawing an
  * empty heading. This table is the whole of what the draw code knows
  * about views -- there is no branch on the id anywhere below.
  */
-static const char * const g_view_label[BROWSER_VIEW_COUNT] = {
-  [BROWSER_VIEW_DIRECTORY]     = "directory",
-  [BROWSER_VIEW_ARTISTS]       = "artists",
-  [BROWSER_VIEW_ALBUM_ARTISTS] = "album artists",
+static const char * const g_view_label[] = {
+  [BROWSER_SRC_DIRECTORY] = "directory",
+  [BROWSER_SRC_LIBRARY]   = "artists",
 };
 
-_Static_assert(sizeof(g_view_label) / sizeof(g_view_label[0]) == BROWSER_VIEW_COUNT,
+_Static_assert(sizeof(g_view_label) / sizeof(g_view_label[0]) == BROWSER_SRC_COUNT,
                "g_view_label must have one entry per browser view");
 
 /*
@@ -368,7 +367,7 @@ draw_header(const TuiModel * m)
   /* The view label gets its own fixed field so starting playback -- which
      overwrites `what` above -- never erases it (v1.0.1 #14). Composed
      independently of now_playing/browser state above. */
-  const char * view = (m->view >= 0 && m->view < BROWSER_VIEW_COUNT)
+  const char * view = (m->view >= 0 && m->view < BROWSER_SRC_COUNT)
                         ? g_view_label[m->view]
                         : "";
   draw_text(1, 0, VIEW_FIELD_W - 1, STYLE_HEADER, view);
