@@ -63,19 +63,22 @@ typedef enum {
      label and the queue is neither -- it is a flat editable list whose
      rows have no parent to ascend to. */
   ACT_QUEUE_TOGGLE,
+  /* v2.0.0: Library's `f`, shows or hides the artist column (design III.1). */
+  ACT_FACET_TOGGLE,
   ACT_COUNT
 } Action;
 
 /*
  * UiMode: what is on top of the input stack (amendment 04 decision 3).
  * The stack lives in ui/tui.c and nothing outside that file writes it;
- * main.c reads the top through ui_mode(). HELP, MENU and SEARCH each
- * resolve against one exclusive context (keymap_chain).
+ * main.c reads the top through ui_mode(). HELP and MENU each resolve
+ * against one exclusive context (keymap_chain); filter editing is a
+ * context, not a mode (design III.1).
  *
  * MODE_COUNT is not a mode. It sizes the name array in tui.c.
  */
 typedef enum {
-  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_SEARCH, MODE_COUNT
+  MODE_NORMAL = 0, MODE_HELP, MODE_MENU, MODE_COUNT
 } UiMode;
 
 /*
@@ -141,6 +144,16 @@ const Binding * keymap_table(KeyCtx ctx, size_t * out_count);
 const char * action_name(Action a);
 
 /*
+ * keymap_filter_consumes: whether filter editing keeps `a` for itself.
+ * Takes a resolved action; returns 0 for the two it hands on to
+ * action_dispatch (cursor up/down move the edited region), 1 for every
+ * other, ACT_QUIT included: with no mode to pop, a dispatched ACT_QUIT
+ * would end the run on the first ctrl-c (decide D16). Pure, so
+ * keymap_test asserts it.
+ */
+int keymap_filter_consumes(Action a);
+
+/*
  * Renders one Binding's key as text for the help overlay -- `up` for an
  * arrow, `enter`, `ctrl-c`, `space`, a `shift+` prefix for TB_MOD_SHIFT,
  * and a printable ch as itself. Returns a pointer to static storage that
@@ -152,33 +165,5 @@ const char * key_name(const Binding * b);
 /* Lives in main.c -- it needs every subsystem, and ui/ never calls back
    into the layers below it except through this one entry point. */
 void action_dispatch(Action a, int32_t arg);
-
-/*
- * search_dispatch: the second entry point from ui/ into main.c, and it
- * exists for the same reason action_dispatch does -- running a search
- * needs library/, and ui/ never reaches library/ itself.
- *
- * `query` is the raw text the user has typed so far, borrowed for the
- * duration of the call. main.c puts it through query_build_match and
- * db_query_search and keeps the results for the next repaint. NULL means
- * the search ended: drop the results and show nothing.
- *
- * It is called on every keystroke, which is what DESIGN.md V.6 step 4's
- * prepared statement is for. Never fatal: an unparseable query, an empty
- * one, and a residual SQLITE_ERROR all mean zero results.
- */
-void search_dispatch(const char * query);
-
-/*
- * search_confirm: move the browser to the search result at `index`, in
- * whichever view is showing, and report if it has no row there. Takes
- * the index into the rows the last search_dispatch produced; out of
- * range is a no-op.
- *
- * Separate from search_dispatch because it is a different operation on
- * the same result set, and because it is the point where a search stops
- * being a list and becomes a position.
- */
-void search_confirm(size_t index);
 
 #endif // KURONO_UI_KEYMAP_H

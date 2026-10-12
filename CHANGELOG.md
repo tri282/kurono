@@ -15,6 +15,11 @@ Notable changes to `kurono`. Format based on
 - Settings view: the effective configuration, read-only.
 - `?` opens help, like `h`. Page keys (`pgup`, `pgdn`, `home`, `end`) work
   in every list.
+- Library view, the default: an artist column narrows an album-grouped
+  track list, with the selected track's details beside it. `←`/`→` move
+  between the artist column and the track list; `f` hides or shows the
+  artist column. `enter` or `a` on an album heading plays or queues the
+  tracks listed under it.
 
 ### Changed
 
@@ -26,12 +31,16 @@ Notable changes to `kurono`. Format based on
 - `d` and `C` act only in the Playlists view, where the entry they act on
   is visible.
 - The help overlay lists the keys of the view it was opened from.
+- The Artists view is now the artist column of the Library view.
+- `/` filters the focused Library column as you type, from any view.
+  `enter` keeps the filter, `esc` clears it, `ctrl-c` clears it and a
+  second `ctrl-c` quits. It replaces search, which jumped to a result.
 
 ### Removed
 
 - The Album Artists view. Every track is still reachable under its own
   artist, and the album artist tag is still shown in the track details and
-  matched by search.
+  matched by the Library filter.
 - The queue pane. The queue is the Playlists view.
 
 ## [1.3.1] — 2026-10-09
@@ -211,9 +220,10 @@ through those.
 - Holding a single-step cursor key at the end of a list runs off the end and
   continues from the other side, because nothing distinguishes a held key from
   repeated presses. Page keys clamp and can be used to stop at an end.
-- Search returns at most 200 rows, and a query matching more than that returns
-  the first 200 in scan order rather than the 200 most relevant. Narrowing the
-  query is the fix; anything matching under 200 rows is ranked normally.
+- A filtered listing shows at most 200 matching tracks, the first 200 in scan
+  order, marked `200+`; the last album under the cap may be partial.
+- In the Library's All listing a compilation lists as one group per
+  performer, because grouping is by track artist.
 - The decode buffer is sized by a guess (about 2.7 s at 48 kHz). The exit
   summary now reports the measured steady-state headroom; the figure and any
   resulting change will be recorded once enough listening time exists.

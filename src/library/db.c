@@ -128,7 +128,6 @@ sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_tracks_in_dir;
   sqlite3_stmt * query_tracks_under_dir;
   sqlite3_stmt * query_track_by_id;
-  sqlite3_stmt * query_search;
   sqlite3_stmt * query_list_all;
   sqlite3_stmt * query_list_artist;
   sqlite3_stmt * query_list_all_fts;
@@ -619,18 +618,6 @@ prepare_all_statements(Db * db)
                                 "   OR (parent_dir > ?1 || '/' AND parent_dir < ?1 || '0') "
                                 "ORDER BY path COLLATE NOCASE");
   PREP(query_track_by_id, "SELECT * FROM tracks WHERE id = ?1");
-  /* LIMIT sits inside the subquery, so FTS5 scores only the 200 rows it
-     returns rather than every match before the outer LIMIT trims it --
-     a subquery carrying LIMIT is never flattened into the join, so the
-     bound is structural (DESIGN.md V.6). x.rid is a tie-break: bm25
-     ties are common and FTS5's own tie order is unspecified. */
-  PREP(query_search,
-       "SELECT t.* FROM tracks t "
-       "JOIN (SELECT rowid AS rid, rank AS r "
-       "        FROM tracks_fts "
-       "       WHERE tracks_fts MATCH ?1 "
-       "       LIMIT 200) x ON t.id = x.rid "
-       "ORDER BY x.r, x.rid");
   /* The Library listing (design IV.2, D2). One order key for all four so
      the texts cannot drift; fts_query_test's list_cmp is the other half.
      No index serves it: the All sort is a temp B-tree, the policy noted
@@ -736,7 +723,6 @@ db_close(Db * db)
   sqlite3_finalize(db->query_tracks_in_dir);
   sqlite3_finalize(db->query_tracks_under_dir);
   sqlite3_finalize(db->query_track_by_id);
-  sqlite3_finalize(db->query_search);
   sqlite3_finalize(db->query_list_all);
   sqlite3_finalize(db->query_list_artist);
   sqlite3_finalize(db->query_list_all_fts);
@@ -1170,19 +1156,6 @@ db_query_track_by_id(Db * db, int64_t id, DbTrackRow * out_row)
   db_reset(db, stmt);
   return found;
 } /* db_query_track_by_id */
-
-/*
- * db_query_search: see include/library/db.h.
- */
-int
-db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size_t * out_n)
-{
-  sqlite3_stmt * stmt = db->query_search;
-  db_reset(db, stmt);
-  sqlite3_clear_bindings(stmt);
-  sqlite3_bind_text(stmt, 1, match_string, -1, SQLITE_TRANSIENT);
-  return rows_from_stmt(db, stmt, row_from_stmt, out_rows, out_n);
-} /* db_query_search */
 
 /*
  * db_query_tracks_list: see include/library/db.h. Takes the optional

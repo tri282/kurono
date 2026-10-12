@@ -29,7 +29,7 @@ typedef struct {
   size_t             n, cursor, scroll;
   int                playing;  /* row overdrawn in STYLE_PLAYING, -1 for none */
   const char *       empty;    /* drawn dim when n == 0; may be NULL */
-  int                capped;   /* filled in phase 5 */
+  int                capped;   /* MAIN filter hit DB_MATCH_CAP: `200+` (design IV.5) */
   int                centre;   /* centre each row (Now playing) */
 } TuiList;
 
@@ -66,12 +66,6 @@ typedef struct {
   /* The resolved music directory, for library_empty. Borrowed from
      Config; NULL on a run with no root. */
   const char *    music_dir;
-
-  /* Search results, drawn into INFO while MODE_SEARCH is on top (decide
-     D22). Borrowed from the Player, which owns the rows and frees them
-     when the search ends. Removed in phase 5. */
-  const BrowserRow * search_rows;
-  size_t             search_n;
 
   /* DESIGN.md XI.6: a visible underrun counter is worth more than any
      amount of reasoning about whether underruns are happening. Shown
@@ -116,13 +110,38 @@ void   ui_mode_pop(void);
  *
  * ui_view returns the current view. ui_view_set stores `v`, recomputes
  * the layout and marks the screen dirty; the caller validates the range.
- * ui_focus returns the role that owns the cursor: ROLE_MAIN in Library
- * and Directories, ROLE_QUEUE in Playlists, ROLE_COUNT (none) in Now
- * playing and Settings.
+ * ui_focus returns the role that owns the cursor: ROLE_FACET or
+ * ROLE_MAIN in Library, ROLE_MAIN in Directories, ROLE_QUEUE in
+ * Playlists, ROLE_COUNT (none) in Now playing and Settings.
  */
 UiView     ui_view(void);
 void       ui_view_set(UiView v);
 RegionRole ui_focus(void);
+
+/*
+ * ui_focus_set: move Library focus to `r` (ROLE_FACET or ROLE_MAIN).
+ * Ignored outside Library and for a role the layout did not allocate.
+ * Takes the role, returns nothing.
+ */
+void       ui_focus_set(RegionRole r);
+
+/*
+ * ui_facet_on: 1 while the Library artist column is switched on (it may
+ * still be dropped below 62 columns). ui_facet_toggle flips it and
+ * recomputes the layout. Neither takes anything.
+ */
+int        ui_facet_on(void);
+void       ui_facet_toggle(void);
+
+/*
+ * ui_filter: the Library filter text of FACET or MAIN, "" for any other
+ * role; never NULL. Borrowed until the next key event. main.c reads it
+ * at repaint (design IV.4).
+ */
+const char * ui_filter(RegionRole r);
+
+/* ui_filter_editing: 1 while KEYCTX_FILTER is the chain (design II.7). */
+int        ui_filter_editing(void);
 
 void tui_get_fds(int * ttyfd, int * resizefd);
 

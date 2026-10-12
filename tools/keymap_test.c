@@ -306,19 +306,7 @@ test_mode_tables(void)
   CHECK(resolve_ctx(KEYCTX_HELP, &ev, &arg) == ACT_QUIT,
         "Esc must quit (pop) in help mode");
   CHECK(resolve_ctx(KEYCTX_FILTER, &ev, &arg) == ACT_SEARCH_CANCEL,
-        "Esc cancels a search rather than popping -- column 3 has to come back");
-
-  /* The text-entry contract, now [FILTER]'s (design III.2; plan gap
-     G8): anything not in its own table resolves ACT_NONE, which tui.c
-     reads as "insert this codepoint". */
-  const uint32_t typed[] = { 'j', 'q', 'h', ' ', '/' };
-  for (size_t i = 0; i < sizeof typed / sizeof typed[0]; i++) {
-    ev  = synth_event(0, typed[i], 0);
-    arg = -1;
-    CHECK(resolve_ctx(KEYCTX_FILTER, &ev, &arg) == ACT_NONE,
-          "'%c' in search mode is literal text, not an action",
-          (char) typed[i]);
-  }
+        "Esc cancels a filter edit rather than popping");
 
   /* Every overlay table must offer a way out, or the mode is a trap. */
   const KeyCtx closable[] = { KEYCTX_HELP, KEYCTX_MENU };
@@ -387,6 +375,8 @@ test_action_names(void)
   }
   CHECK(strcmp(action_name((Action) ACT_COUNT), "invalid") == 0,
         "ACT_COUNT itself must report invalid");
+  CHECK(strcmp(action_name(ACT_FACET_TOGGLE), "facet_toggle") == 0,
+        "ACT_FACET_TOGGLE must be named facet_toggle (design III.1)");
 } /* test_action_names */
 
 /*
@@ -449,7 +439,7 @@ test_key_names_are_named(void)
     const Binding * t = keymap_table((KeyCtx) c, &n);
 
     if (t == NULL) {
-      continue;   /* a context with no rows (KEYCTX_LIBRARY until phase 5) */
+      continue;   /* a context with no rows */
     }
 
     for (size_t i = 0; i < n; i++) {
@@ -982,7 +972,7 @@ expect_chain(UiMode mode, int editing, int view, KeyCtx out[KEYCTX_CHAIN_MAX])
     out[0] = KEYCTX_MENU;
     return 1;
   }
-  if (editing || mode == MODE_SEARCH) {
+  if (editing) {
     out[0] = KEYCTX_FILTER;
     return 1;
   }
@@ -1009,7 +999,7 @@ expect_chain(UiMode mode, int editing, int view, KeyCtx out[KEYCTX_CHAIN_MAX])
 static void
 test_chains(void)
 {
-  const UiMode modes[] = { MODE_NORMAL, MODE_HELP, MODE_MENU, MODE_SEARCH };
+  const UiMode modes[] = { MODE_NORMAL, MODE_HELP, MODE_MENU };
 
   for (size_t mi = 0; mi < sizeof modes / sizeof modes[0]; mi++) {
     for (int ed = 0; ed <= 1; ed++) {
@@ -1102,6 +1092,9 @@ test_view_coverage(void)
 {
   struct { int view; uint16_t key; uint32_t ch; Action want; } cases[] = {
     { VIEW_LIBRARY,     0,                  '/', ACT_SEARCH    },
+    { VIEW_LIBRARY,     0,                  'f', ACT_FACET_TOGGLE },
+    { VIEW_DIRECTORIES, 0,                  'f', ACT_NONE      },
+    { VIEW_PLAYLISTS,   0,                  'f', ACT_NONE      },
     { VIEW_LIBRARY,     0,                  'a', ACT_ENQUEUE   },
     { VIEW_LIBRARY,     TB_KEY_ENTER,       0,   ACT_PLAY_NOW  },
     { VIEW_LIBRARY,     TB_KEY_ARROW_LEFT,  0,   ACT_COL_LEFT  },
@@ -1150,6 +1143,52 @@ test_view_coverage(void)
 } /* test_view_coverage */
 
 /*
+ * test_filter_entry: K15. Under {FILTER} every printable ASCII character
+ * is literal text (ACT_NONE) and the six keys of design III.5 resolve as
+ * tabled; filter editing consumes everything except the two cursor keys,
+ * ACT_QUIT included, so ctrl-c while typing clears instead of quitting
+ * (decide D16).
+ */
+static void
+test_filter_entry(void)
+{
+  struct tb_event ev;
+  int32_t         arg = -1;
+
+  for (uint32_t c = 0x20; c <= 0x7e; c++) {
+    ev = synth_event(0, c, 0);
+    Action a = resolve_ctx(KEYCTX_FILTER, &ev, &arg);
+    CHECK(a == ACT_NONE, "filter: '%c' resolves %s, must be literal text",
+          (char) c, action_name(a));
+  }
+
+  struct { uint16_t key; Action want; } keys[] = {
+    { TB_KEY_ESC,        ACT_SEARCH_CANCEL },
+    { TB_KEY_ENTER,      ACT_CONFIRM       },
+    { TB_KEY_BACKSPACE2, ACT_REMOVE        },
+    { TB_KEY_ARROW_UP,   ACT_CURSOR_UP     },
+    { TB_KEY_ARROW_DOWN, ACT_CURSOR_DOWN   },
+    { TB_KEY_CTRL_C,     ACT_QUIT          },
+  };
+  for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+    ev = synth_event(keys[i].key, 0, 0);
+    Action a = resolve_ctx(KEYCTX_FILTER, &ev, &arg);
+    CHECK(a == keys[i].want, "filter: key %u resolves %s, expected %s",
+          (unsigned) keys[i].key, action_name(a), action_name(keys[i].want));
+  }
+
+  /* D16: the only actions filter editing hands to action_dispatch are
+     the cursor moves; a forwarded ACT_QUIT ends the run. */
+  for (int a = 0; a < ACT_COUNT; a++) {
+    int fwd = (a == ACT_CURSOR_UP || a == ACT_CURSOR_DOWN);
+    CHECK(keymap_filter_consumes((Action) a) == !fwd,
+          "filter editing %s %s%s", fwd ? "consumes" : "forwards",
+          action_name((Action) a),
+          (a == ACT_QUIT) ? ": ctrl-c would end the run (decide D16)" : "");
+  }
+} /* test_filter_entry */
+
+/*
  * main: runs every check, returns 0 when all passed and 1 otherwise.
  */
 int
@@ -1179,6 +1218,7 @@ main(void)
   test_no_shadowing();
   test_global_reach();
   test_view_coverage();
+  test_filter_entry();
 
   size_t n = 0;
   (void) keymap_table(KEYCTX_GLOBAL, &n);

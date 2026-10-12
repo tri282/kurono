@@ -245,9 +245,8 @@ int db_tracks_sweep(Db * db, int64_t gen);
  * spelling no caller produces. db_query_tracks_under_dir below carries
  * the identical range and the identical precondition. Always returns 0: a
  * database error degrades to zero results rather than being reported,
- * the same never-fatal-query policy db_query_search documents below,
- * applied uniformly to every query in this file rather than only to
- * search (DESIGN.md XI.7).
+ * the same never-fatal-query policy db_query_tracks_list documents,
+ * applied uniformly to every query in this file (DESIGN.md XI.7).
  */
 int db_query_dirs(Db * db, const char * parent, char *** out_names, size_t * out_n);
 
@@ -318,26 +317,6 @@ int     db_query_tracks_list(Db * db, const char * artist, const char * match,
  * All (N)), or -1 on error.
  */
 int64_t db_count_tracks(Db * db);
-
-/*
- * db_query_search: SELECT t.* FROM tracks t JOIN (SELECT rowid AS rid,
- * rank AS r FROM tracks_fts WHERE tracks_fts MATCH ?1 LIMIT 200) x ON
- * t.id = x.rid ORDER BY x.r, x.rid (DESIGN.md V.6 step 3), using the one
- * statement prepared once at open and reused for every keystroke
- * (DESIGN.md V.6 step 4). `match_string` must already be the
- * escaped/quoted form phase 15's transform produces -- db.c binds it as
- * a parameter and never concatenates it. LIMIT 200 sits inside the
- * subquery, so it bounds both the rows returned and the rows bm25
- * scores; a match set over 200 rows is truncated by rowid before
- * ranking, not by rank, so the returned 200 are not always the global
- * top 200 by relevance. A residual SQLITE_ERROR from MATCH on a
- * malformed string is reported as zero rows (return 0, *out_n = 0), not
- * as an error -- DESIGN.md V.6 warns this must never be treated as
- * fatal. Always returns 0; every other query function in this file
- * applies the same policy uniformly rather than singling search out
- * (DESIGN.md XI.7).
- */
-int db_query_search(Db * db, const char * match_string, DbTrackRow ** out_rows, size_t * out_n);
 
 /* db_names_free: free an array returned by db_query_dirs/artists/albums_for. */
 void db_names_free(char ** names, size_t n);

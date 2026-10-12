@@ -417,12 +417,13 @@ typedef struct {
   Engine *      e;
   EventLoop *   el;
 
-  /* One source and one Browser per data source (DESIGN.md VIII.4). `br`
-     is the browser that owns the focused region of the current view, or
-     NULL in a view without one (player_view_browser); it is what every
-     navigation action touches. Each browser keeps its own cursor by
-     construction: switching away and back restores position because the
-     widget was never torn down (phase-16-browser.md I.2). */
+  /* One source per data source and one Browser per region that lists
+     one (DESIGN.md VIII.4): brv[BROWSER_SRC_LIBRARY] is the Library's
+     artist facet, lib_main its track list over the same source (design
+     IV.1). player_focus_browser picks the one the cursor is on. Each
+     browser keeps its own cursor by construction: switching away and
+     back restores position because the widget was never torn down
+     (phase-16-browser.md I.2). */
   /* Borrowed by every library source for the lifetime of the run: the
      source keeps the pointer rather than copying (browser.h), so this
      array must outlive the browsers, not the construction block that
@@ -430,7 +431,8 @@ typedef struct {
   const char **   rootv;
   BrowserSource   brsrc[BROWSER_SRC_COUNT];
   Browser *       brv[BROWSER_SRC_COUNT];
-  Browser *       br;                /* focused view's browser; NULL on every headless run */
+  Browser *       lib_main;          /* NULL on every headless run */
+  int             library_empty;     /* db_count_tracks == 0, per scan (design X) */
   int             prev_view;         /* where `v` returns from Playlists (decide D26) */
 
   /* INFO detail caches, keyed by track id and rebuilt at repaint only
@@ -573,15 +575,6 @@ typedef struct {
   /* The library index. Opened at startup step 3 and closed at teardown
      step 7, so it outlives every other subsystem that might query it. */
   Db * db;
-
-  /* The current search's results, owned here and rebuilt on every
-     keystroke by search_dispatch. Freed when the search ends and again
-     at teardown, because a run can end with a search still open.
-     Deliberately not inside the Browser: the browser's preview cache is
-     what the search draws over, and keeping the two apart is what makes
-     cancelling a search free rather than a restore. */
-  BrowserRow * search_rows;
-  size_t       search_n;
 } Player;
 
 /*
@@ -613,27 +606,42 @@ static void player_on_notify(void * user, int notification_type);
    it. Navigation is the exception and stays inline: it reaches nothing
    but browser.c. */
 static void player_action(Player * p, Action a, int32_t arg);
+static int  library_action(Player * p, Action a);
 
 /*
- * player_view_browser: the browser that owns the focused region of the
- * current view. Takes the Player, returns brv[] for Library and
- * Directories (Library shows the Artists browser until phase 5) and NULL
- * for every other view.
+ * player_role_browser: the browser behind region `r` of the current view.
+ * Takes the Player and a role; returns the facet or lib_main for Library
+ * FACET/MAIN, the Directories browser for its MAIN, NULL otherwise.
  */
 static Browser *
-player_view_browser(const Player * p)
+player_role_browser(const Player * p, RegionRole r)
 {
   switch (ui_view()) {
-    case VIEW_LIBRARY:     return p->brv[BROWSER_SRC_LIBRARY];
-    case VIEW_DIRECTORIES: return p->brv[BROWSER_SRC_DIRECTORY];
-    default:               return NULL;
+    case VIEW_LIBRARY:
+      return (r == ROLE_FACET) ? p->brv[BROWSER_SRC_LIBRARY]
+           : (r == ROLE_MAIN)  ? p->lib_main : NULL;
+    case VIEW_DIRECTORIES:
+      return (r == ROLE_MAIN) ? p->brv[BROWSER_SRC_DIRECTORY] : NULL;
+    default:
+      return NULL;
   }
-} /* player_view_browser */
+} /* player_role_browser */
 
 /*
- * player_view_src: the source behind p->br. Takes the Player, returns
- * the Directories source in Directories and the library source in every
- * other view; callers reach it only with p->br != NULL.
+ * player_focus_browser: the browser the cursor is on, asked of tui.c at
+ * each use rather than cached, since tui.c changes view and focus itself
+ * (plan G13). Takes the Player, returns it or NULL.
+ */
+static Browser *
+player_focus_browser(const Player * p)
+{
+  return player_role_browser(p, ui_focus());
+} /* player_focus_browser */
+
+/*
+ * player_view_src: the source behind the focused browser. Takes the
+ * Player, returns the Directories source in Directories and the library
+ * source in every other view.
  */
 static const BrowserSource *
 player_view_src(const Player * p)
@@ -659,19 +667,22 @@ player_view_rows(void)
 } /* player_view_rows */
 
 /*
- * player_view_viewports: tell the browser that owns an allocated region
- * of the current view how many list rows it has (design VII). Takes the
- * Player, returns nothing. Run after every resize drain and view switch.
+ * player_view_viewports: tell each browser behind an allocated region of
+ * the current view how many list rows it has (design VII). Takes the
+ * Player, returns nothing. Run after every resize drain and view switch,
+ * and at the top of every repaint, since tui.c can change the layout
+ * itself (plan G13).
  */
 static void
 player_view_viewports(Player * p)
 {
-  if (p->br == NULL) {
-    return;
-  }
-  const Region * r = layout_find(tui_layout(), ROLE_MAIN);
-  if (r != NULL) {
-    browser_set_viewport(p->br, r->h - layout_list_top(ui_view(), ROLE_MAIN));
+  const TuiLayout * l = tui_layout();
+  for (int i = 0; i < l->nregions; i++) {
+    const Region * r = &l->region[i];
+    Browser *      b = player_role_browser(p, r->role);
+    if (b != NULL) {
+      browser_set_viewport(b, r->h - layout_list_top(ui_view(), r->role));
+    }
   }
 } /* player_view_viewports */
 
@@ -684,7 +695,6 @@ static void
 player_view_switch(Player * p, UiView v)
 {
   ui_view_set(v);
-  p->br = player_view_browser(p);
   player_view_viewports(p);
   tui_mark_dirty();
 } /* player_view_switch */
@@ -903,6 +913,11 @@ action_dispatch(Action a, int32_t arg)
     page = 1;
   }
 
+  if (ui_view() == VIEW_LIBRARY && library_action(p, a)) {
+    tui_mark_dirty();
+    return;
+  }
+
   if (ui_view() == VIEW_PLAYLISTS) {
     if (queue_cursor_action(a, page)) {
       tui_mark_dirty();
@@ -916,35 +931,36 @@ action_dispatch(Action a, int32_t arg)
   /* Navigation. Every one of these is a pure cursor move inside
      browser.c -- nothing here reaches the engine, and a browser that
      failed to build leaves them all no-ops rather than special cases. */
-  if (p->br != NULL) {
+  Browser * b = player_focus_browser(p);
+  if (b != NULL) {
     switch (a) {
       case ACT_CURSOR_UP:
-        browser_cursor_move(p->br, -1);
+        browser_cursor_move(b, -1);
         tui_mark_dirty();
         return;
       case ACT_CURSOR_DOWN:
-        browser_cursor_move(p->br, 1);
+        browser_cursor_move(b, 1);
         tui_mark_dirty();
         return;
       case ACT_CURSOR_PAGE_UP:
-        browser_cursor_move(p->br, -page);
+        browser_cursor_move(b, -page);
         tui_mark_dirty();
         return;
       case ACT_CURSOR_PAGE_DOWN:
-        browser_cursor_move(p->br, page);
+        browser_cursor_move(b, page);
         tui_mark_dirty();
         return;
       case ACT_CURSOR_HOME:
-        browser_cursor_home(p->br);
+        browser_cursor_home(b);
         tui_mark_dirty();
         return;
       case ACT_CURSOR_END:
-        browser_cursor_end(p->br);
+        browser_cursor_end(b);
         tui_mark_dirty();
         return;
 
       case ACT_COL_LEFT:
-        if (browser_ascend(p->br) < 0) {
+        if (browser_ascend(b) < 0) {
           player_report(p, "cannot read parent directory");
         }
         tui_mark_dirty();
@@ -953,13 +969,13 @@ action_dispatch(Action a, int32_t arg)
       case ACT_COL_RIGHT: {
         /* A file is not an error here -- right on a track simply does
            nothing, and ACT_PLAY_NOW is what acts on one. */
-        if (browser_descend(p->br) < 0) {
+        if (browser_descend(b) < 0) {
           /* Read the selection AFTER the failure, not before: a failed
              descend leaves the rows untouched, so it is still valid,
              and a successful one would have freed the array the pointer
              is into. Naming browser_cwd here instead would report the
              parent -- the directory that is readable. */
-          const BrowserRow * sel = browser_selection(p->br);
+          const BrowserRow * sel = browser_selection(b);
           player_report(p, "cannot read %s",
                         (sel != NULL) ? sel->name : "directory");
         }
@@ -1062,6 +1078,34 @@ player_enqueue_rows(Player * p, const DbTrackRow * rows, size_t n, size_t * out_
 } /* player_enqueue_rows */
 
 /*
+ * player_append_rows: append a container's tracks and report the count.
+ * Takes the Player, the rows (still the caller's), their count and the
+ * container's name for the message; returns nothing.
+ */
+static void
+player_append_rows(Player * p, const DbTrackRow * rows, size_t n, const char * name)
+{
+  size_t added = 0;
+
+  if (player_enqueue_rows(p, rows, n, &added) != 0) {
+    player_report(p, "could not queue %s", name);
+    return;
+  }
+  /* The skipped count is reported rather than swallowed: an album that
+     queues 11 of 12 tracks has a reason, and silence here would make the
+     missing one look like a scan bug later. */
+  player_queue_changed(p);
+  if (added < n) {
+    player_report(p, "queued %zu of %zu tracks from %s (%zu in queue)",
+                  added, n, name, queue_count(p->q));
+  } else {
+    player_report(p, "queued %zu tracks from %s (%zu in queue)", added,
+                  name, queue_count(p->q));
+  }
+  tui_mark_dirty();
+} /* player_append_rows */
+
+/*
  * player_enqueue_row: ACT_ENQUEUE's whole body, for one browser row of
  * any kind. Takes the Player and the selected row, returns nothing --
  * every outcome is a status-bar line.
@@ -1076,27 +1120,10 @@ player_enqueue_row(Player * p, const BrowserRow * sel)
 {
   DbTrackRow * rows = NULL;
   size_t       n = 0;
-  size_t       added = 0;
 
   if (browser_library_expand(player_view_src(p), sel->key, &rows, &n) == 0 && n > 0) {
-    int rc = player_enqueue_rows(p, rows, n, &added);
+    player_append_rows(p, rows, n, sel->name);
     db_track_rows_free(rows, n);
-    if (rc != 0) {
-      player_report(p, "could not queue %s", sel->name);
-      return;
-    }
-    /* The skipped count is reported rather than swallowed: an album that
-       queues 11 of 12 tracks has a reason, and silence here would make
-       the missing one look like a scan bug later. */
-    player_queue_changed(p);
-    if (added < n) {
-      player_report(p, "queued %zu of %zu tracks from %s (%zu in queue)",
-                    added, n, sel->name, queue_count(p->q));
-    } else {
-      player_report(p, "queued %zu tracks from %s (%zu in queue)", added,
-                    sel->name, queue_count(p->q));
-    }
-    tui_mark_dirty();
     return;
   }
   db_track_rows_free(rows, n);
@@ -1131,6 +1158,44 @@ player_enqueue_row(Player * p, const BrowserRow * sel)
 } /* player_enqueue_row */
 
 /*
+ * player_play_rows: insert `rows` after the queue cursor and play the
+ * first of them. Takes the Player, the rows (still the caller's), their
+ * count and a name for the messages; returns nothing.
+ */
+static void
+player_play_rows(Player * p, const DbTrackRow * rows, size_t n, const char * name)
+{
+  size_t added = 0;
+  size_t at    = (queue_count(p->q) == 0) ? 0 : queue_cursor(p->q) + 1;
+
+  for (size_t i = 0; i < n; i++) {
+    if (rows[i].path == NULL) {
+      continue;
+    }
+    if (queue_insert(p->q, at + added, rows[i].id, rows[i].path) == 0) {
+      added++;
+    }
+  }
+
+  if (added == 0) {
+    player_report(p, "could not queue %s", name);
+    return;
+  }
+
+  /* Set the cursor explicitly: queue_insert adjusts it to keep referring
+     to whatever was current *before* the insert, which is the opposite
+     of what playing the first new entry needs. */
+  if (queue_set_cursor(p->q, at) != 0) {
+    player_report(p, "could not select %s", name);
+    return;
+  }
+  p->fail_count = 0; /* an explicit user action starts a fresh streak */
+  player_queue_changed(p);
+  player_report(p, "playing %s (%zu tracks)", name, added);
+  (void) player_play_entry(p, queue_at(p->q, at));
+} /* player_play_rows */
+
+/*
  * player_play_container: ACT_PLAY_NOW on a directory, album or artist
  * row -- insert everything it holds after the cursor and start the first
  * of it. Takes the Player and the row, returns nothing.
@@ -1148,185 +1213,122 @@ player_play_container(Player * p, const BrowserRow * sel)
 {
   DbTrackRow * rows = NULL;
   size_t       n = 0;
-  size_t       added = 0;
 
   if (browser_library_expand(player_view_src(p), sel->key, &rows, &n) != 0 || n == 0) {
     db_track_rows_free(rows, n);
     player_report(p, "%s holds no tracks", sel->name);
     return;
   }
-
-  size_t at = (queue_count(p->q) == 0) ? 0 : queue_cursor(p->q) + 1;
-  for (size_t i = 0; i < n; i++) {
-    if (rows[i].path == NULL) {
-      continue;
-    }
-    if (queue_insert(p->q, at + added, rows[i].id, rows[i].path) == 0) {
-      added++;
-    }
-  }
+  player_play_rows(p, rows, n, sel->name);
   db_track_rows_free(rows, n);
-
-  if (added == 0) {
-    player_report(p, "could not queue %s", sel->name);
-    return;
-  }
-
-  /* Set the cursor explicitly: queue_insert adjusts it to keep referring
-     to whatever was current *before* the insert, which is the opposite
-     of what playing the first new entry needs. */
-  if (queue_set_cursor(p->q, at) != 0) {
-    player_report(p, "could not select %s", sel->name);
-    return;
-  }
-  p->fail_count = 0; /* an explicit user action starts a fresh streak */
-  player_queue_changed(p);
-  player_report(p, "playing %s (%zu tracks)", sel->name, added);
-  (void) player_play_entry(p, queue_at(p->q, at));
 } /* player_play_container */
 
 /*
- * player_search_free: drop the current result set. Takes the Player,
- * returns nothing. Idempotent, and a no-op when no search has run.
+ * library_header_tracks: the tracks a Library header row stands for, which
+ * are the track rows listed beneath it in the current listing (design
+ * III.6, decide D10), so a header never queues a track the user cannot
+ * see. Takes the Player and out-params for rows the caller frees with
+ * db_track_rows_free (only id and path set); returns 0, or -1 with
+ * neither set. A row that does not resolve keeps a NULL path and is
+ * skipped by the queueing helpers.
  */
-static void
-player_search_free(Player * p)
+static int
+library_header_tracks(Player * p, DbTrackRow ** out, size_t * n)
 {
-  for (size_t i = 0; i < p->search_n; i++) {
-    free(p->search_rows[i].name);
-    free(p->search_rows[i].key);
+  const Browser * b     = p->lib_main;
+  size_t          first = browser_cursor(b) + 1;
+  size_t          count = 0;
+
+  while (browser_row(b, first + count) != NULL && !browser_row(b, first + count)->is_dir) {
+    count++;
   }
-  free(p->search_rows);
-  p->search_rows = NULL;
-  p->search_n    = 0;
-} /* player_search_free */
+
+  DbTrackRow * rows = calloc((count > 0) ? count : 1, sizeof *rows);
+  if (rows == NULL) {
+    return -1;
+  }
+  for (size_t i = 0; i < count; i++) {
+    char *  path = NULL;
+    int64_t id   = 0;
+    if (player_row_target(p, browser_row(b, first + i), &path, &id) == 0) {
+      rows[i].path = path;
+      rows[i].id   = id;
+    }
+  }
+  *out = rows;
+  *n   = count;
+  return 0;
+} /* library_header_tracks */
 
 /*
- * search_dispatch: see include/ui/keymap.h. Runs one query and keeps its
- * rows for the next repaint. Takes the raw query text or NULL, returns
- * nothing.
- *
- * Three inputs produce zero results and none of them is an error: NULL
- * (the search ended), a query with no tokens in it -- a bare quote, a
- * bare star, spaces -- and a query that matches nothing. The middle case
- * is why query_build_match returns an owned empty string rather than
- * NULL: the caller can tell "nothing to search for" from "allocation
- * failed" and skip the query instead of handing FTS5 a string it would
- * reject. DESIGN.md V.6 is explicit that a residual SQLITE_ERROR here
- * must never be fatal, and db_query_search already reports one as zero
- * rows.
+ * library_action: the Library arms of design III.4 and III.6 -- focus
+ * moves, the facet toggle, the All row's report and header-row play and
+ * enqueue. Takes the Player and the action; returns 1 when handled, 0 to
+ * carry on with the shared path (tracks and artist rows take v1's).
  */
-void
-search_dispatch(const char * query)
+static int
+library_action(Player * p, Action a)
 {
-  Player * p = g_ui_player;
-  if (p == NULL) {
-    return;
-  }
+  RegionRole f = ui_focus();
 
-  player_search_free(p);
-  tui_mark_dirty();
+  switch (a) {
+    case ACT_COL_LEFT:
+      if (f == ROLE_MAIN) {
+        ui_focus_set(ROLE_FACET);
+      }
+      return 1;
 
-  if (query == NULL || p->db == NULL) {
-    return;
-  }
+    case ACT_COL_RIGHT:
+      if (f == ROLE_FACET) {
+        ui_focus_set(ROLE_MAIN);
+      }
+      return 1;
 
-  char * match = query_build_match(query);
-  if (match == NULL) {
-    player_report(p, "out of memory, search skipped");
-    return;
-  }
-  if (match[0] == '\0') {
-    free(match);
-    return;  /* nothing to match on yet; not a query and not an error */
-  }
+    case ACT_FACET_TOGGLE:
+      ui_facet_toggle();
+      return 1;
 
-  DbTrackRow * rows = NULL;
-  size_t       n    = 0;
-  (void) db_query_search(p->db, match, &rows, &n);
-  free(match);
+    case ACT_JUMP_TO_PLAYING:
+      ui_focus_set(ROLE_MAIN);
+      return 0;
 
-  /* DESIGN.md XI.7, read here rather than at the repaint because the
-     flag is non-sticky: the next query overwrites it.
+    case ACT_PLAY_NOW:
+    case ACT_ENQUEUE: {
+      Browser *          b   = player_focus_browser(p);
+      const BrowserRow * sel = (b != NULL) ? browser_selection(b) : NULL;
+      if (sel == NULL || p->q == NULL) {
+        return 0;
+      }
+      if (f == ROLE_FACET && browser_cursor(b) == 0) {
+        /* All is not a container (design III.6). */
+        player_report(p, "nothing to queue in %s", sel->name);
+        return 1;
+      }
+      if (f != ROLE_MAIN || !sel->is_dir) {
+        return 0;
+      }
 
-     Worded identically to the browser source's report on purpose. Both
-     read the same Db-level flag, so one truncating search can be
-     reported twice -- once here, and again when the next library load
-     latches the flag this call left set. Two wordings for one event
-     would read as two failures; one wording makes the duplicate
-     invisible, and neither report can be dropped: this one is the only
-     one guaranteed to run when no library load follows. */
-  if (db_result_truncated(p->db)) {
-    player_report(p, "out of memory, result truncated");
-  }
-
-  if (n == 0) {
-    db_track_rows_free(rows, n);
-    return;
-  }
-
-  p->search_rows = calloc(n, sizeof *p->search_rows);
-  if (p->search_rows == NULL) {
-    player_report(p, "out of memory, search skipped");
-    db_track_rows_free(rows, n);
-    return;
-  }
-
-  for (size_t i = 0; i < n; i++) {
-    /* One line per hit, in the shape the columns already use: what it is
-       called, and who by when that is known. A track with no tags at all
-       still has a path, and showing the path beats showing a blank. */
-    char line[512];
-    const char * title = (rows[i].title != NULL) ? rows[i].title : rows[i].path;
-    if (rows[i].artist != NULL) {
-      snprintf(line, sizeof line, "%s - %s", rows[i].artist, title);
-    } else {
-      snprintf(line, sizeof line, "%s", (title != NULL) ? title : "");
+      DbTrackRow * rows = NULL;
+      size_t       n    = 0;
+      if (library_header_tracks(p, &rows, &n) != 0) {
+        player_report(p, "out of memory, %s not queued", sel->name);
+        return 1;
+      }
+      if (n == 0) {
+        player_report(p, "%s holds no tracks", sel->name);
+      } else if (a == ACT_ENQUEUE) {
+        player_append_rows(p, rows, n, sel->name);
+      } else {
+        player_play_rows(p, rows, n, sel->name);
+      }
+      db_track_rows_free(rows, n);
+      return 1;
     }
 
-    /* The key is the library id, not the path: a track is addressed by
-       id everywhere since phase 16, and confirming a hit hands this
-       straight to player_locate. Decimal text rather than a parallel
-       int64_t array, because BrowserRow already owns a string here and a
-       second allocation per row would buy nothing. */
-    char idbuf[32];
-    snprintf(idbuf, sizeof idbuf, "%" PRId64, rows[i].id);
-
-    p->search_rows[i].name   = strdup(line);
-    p->search_rows[i].key    = strdup(idbuf);
-    p->search_rows[i].is_dir = 0;
-
-    if (p->search_rows[i].name == NULL || p->search_rows[i].key == NULL) {
-      /* The same degrade every other result set applies: keep what was
-         built, say so, and draw a short list rather than none. */
-      player_report(p, "out of memory, result truncated");
-      break;
-    }
-    p->search_n = i + 1;
+    default:
+      return 0;
   }
-
-  db_track_rows_free(rows, n);
-} /* search_dispatch */
-
-/*
- * search_confirm: see include/ui/keymap.h. Move the browser to the
- * result at `index`. Takes the index, returns nothing.
- *
- * The second consumer of the locate path, and the reason that path is a
- * function rather than something inlined into the jump: finding a track
- * by searching for it and finding the one that is playing are the same
- * move, and the encoding they both need belongs to browser.c either way.
- */
-void
-search_confirm(size_t index)
-{
-  Player * p = g_ui_player;
-  if (p == NULL || index >= p->search_n || p->search_rows[index].key == NULL) {
-    return;
-  }
-  player_locate(p, (int64_t) strtoll(p->search_rows[index].key, NULL, 10),
-                p->search_rows[index].name);
-} /* search_confirm */
+} /* library_action */
 
 /*
  * trace_report_and_shutdown: teardown step 10 (DESIGN.md IV.9.b) --
@@ -2689,11 +2691,10 @@ player_queue_confirm(Player * p)
  * whichever view is showing. Takes the Player, the id and a name for the
  * message, returns nothing.
  *
- * Two callers: ACT_JUMP_TO_PLAYING and confirming a search hit. They are
- * the same operation with a different track, and are one function rather
- * than two because the part worth getting right -- the three-way "where
- * does this track sit in this view" -- is shared, and a second copy of
- * it would be a second thing to update when a fourth view lands.
+ * One caller since search became a filter: ACT_JUMP_TO_PLAYING. Kept a
+ * function because the part worth getting right -- "where does this
+ * track sit in this view" -- belongs to browser.c either way. In Library
+ * it reports "cannot reach" until phase 6 (plan G4).
  *
  * The keys come from browser.c and not from here. Until now this
  * function took strrchr of the path and passed the halves to
@@ -2705,7 +2706,8 @@ player_queue_confirm(Player * p)
 static void
 player_locate(Player * p, int64_t track_id, const char * label)
 {
-  if (p->br == NULL) {
+  Browser * b = player_focus_browser(p);
+  if (b == NULL) {
     player_report(p, "nothing to browse");
     return;
   }
@@ -2736,7 +2738,7 @@ player_locate(Player * p, int64_t track_id, const char * label)
     return;
   }
 
-  rc = browser_goto(p->br, parent, row);
+  rc = browser_goto(b, parent, row);
   free(parent);
   free(row);
 
@@ -2774,7 +2776,7 @@ player_jump_to_playing(Player * p)
       break;
   }
 
-  if (p->br == NULL) {
+  if (player_focus_browser(p) == NULL) {
     player_report(p, "nothing to browse");
     return;
   }
@@ -2967,11 +2969,12 @@ player_action(Player * p, Action a, int32_t arg)
       return;
 
     case ACT_ENQUEUE: {
-      if (p->br == NULL || p->q == NULL) {
+      Browser * b = player_focus_browser(p);
+      if (b == NULL || p->q == NULL) {
         player_report(p, "nothing to queue");
         return;
       }
-      const BrowserRow * sel = browser_selection(p->br);
+      const BrowserRow * sel = browser_selection(b);
       if (sel == NULL) {
         player_report(p, "nothing selected");
         return;
@@ -2981,11 +2984,12 @@ player_action(Player * p, Action a, int32_t arg)
     }
 
     case ACT_PLAY_NOW: {
-      if (p->br == NULL || p->q == NULL) {
+      Browser * b = player_focus_browser(p);
+      if (b == NULL || p->q == NULL) {
         player_report(p, "nothing to play");
         return;
       }
-      const BrowserRow * sel = browser_selection(p->br);
+      const BrowserRow * sel = browser_selection(b);
       if (sel == NULL) {
         player_report(p, "nothing selected");
         return;
@@ -3151,6 +3155,10 @@ player_rescan(Player * p)
       (void) browser_reload(p->brv[v]);
     }
   }
+  if (p->lib_main != NULL) {
+    (void) browser_reload(p->lib_main);
+  }
+  p->library_empty = (db_count_tracks(p->db) == 0);
   queueview_rebuild(p->q, p->db);
   /* Tags may have changed behind the same ids (decide D21). */
   p->info_id = -1;
@@ -3580,6 +3588,109 @@ player_view_details(Player * p)
 } /* player_view_details */
 
 /*
+ * library_sync: make the facet and the track list match the filter
+ * buffers and the facet selection (design IV.4). Takes the Player,
+ * returns nothing. Runs from player_repaint only while Library is the
+ * view (decide D20), so a held key or a paste costs one query per frame;
+ * a key that matches the listing already shown costs a string compare.
+ */
+static void
+library_sync(Player * p)
+{
+  Browser * facet = p->brv[BROWSER_SRC_LIBRARY];
+  int       fail  = 0;
+
+  if (facet != NULL) {
+    const char * filter = ui_filter(ROLE_FACET);
+    char *       key    = browser_library_facet_key(filter);
+    if (key == NULL) {
+      fail = 1;
+    } else if (strcmp(key, browser_cwd(facet)) != 0) {
+      if (browser_reroot(facet, key) != 0) {
+        fail = 1;
+      } else if (filter[0] != '\0' && browser_count(facet) > 1) {
+        browser_cursor_move(facet, 1);  /* first matching artist, past All */
+      }
+    }
+    free(key);
+  }
+
+  if (p->lib_main != NULL) {
+    /* The selection applies iff the facet is on screen (decide D9). */
+    const BrowserRow * sel = (facet != NULL && layout_find(tui_layout(), ROLE_FACET) != NULL)
+                               ? browser_selection(facet) : NULL;
+    char * key = browser_library_list_key((sel != NULL) ? sel->key : NULL,
+                                          ui_filter(ROLE_MAIN));
+    if (key == NULL
+        || (strcmp(key, browser_cwd(p->lib_main)) != 0
+            && browser_reroot(p->lib_main, key) != 0)) {
+      fail = 1;
+    }
+    free(key);
+  }
+
+  if (fail) {
+    player_report(p, "cannot list library");
+  }
+} /* library_sync */
+
+/*
+ * library_fill: the Library view's lists (design IV.1, IV.5): facet,
+ * track list with its `200+` flag, and the selected track's detail.
+ * Takes the Player and the model, returns nothing.
+ */
+static void
+library_fill(Player * p, TuiModel * m)
+{
+  Browser * facet = p->brv[BROWSER_SRC_LIBRARY];
+  Browser * lm    = p->lib_main;
+
+  TuiList * fl = &m->list[ROLE_FACET];
+  fl->empty = "(unavailable)";
+  if (facet != NULL) {
+    fl->rows   = browser_rows(facet);
+    fl->n      = browser_count(facet);
+    fl->cursor = browser_cursor(facet);
+    fl->scroll = browser_scroll(facet);
+    if (layout_find(tui_layout(), ROLE_FACET) != NULL && fl->cursor != 0) {
+      const BrowserRow * sel = browser_selection(facet);
+      m->crumb = (sel != NULL) ? sel->name : NULL;
+    }
+  }
+
+  m->library_empty = p->library_empty;
+  TuiList * ml = &m->list[ROLE_MAIN];
+  ml->empty = "(unavailable)";
+  if (lm == NULL) {
+    return;
+  }
+  ml->rows   = browser_rows(lm);
+  ml->n      = browser_count(lm);
+  ml->cursor = browser_cursor(lm);
+  ml->scroll = browser_scroll(lm);
+
+  /* Filtered means the text has a token: a whitespace-only filter lists
+     everything, uncapped (design IV.6). */
+  char * match    = query_build_match(ui_filter(ROLE_MAIN));
+  int    filtered = (match != NULL && match[0] != '\0');
+  free(match);
+
+  ml->empty = filtered ? "(no matches)" : "(empty)";
+  if (filtered) {
+    size_t tracks = 0;
+    for (size_t i = 0; i < ml->n; i++) {
+      tracks += !ml->rows[i].is_dir;
+    }
+    ml->capped = (tracks >= DB_MATCH_CAP);
+  }
+
+  TuiList * il = &m->list[ROLE_INFO];
+  il->rows   = browser_preview_rows(lm);
+  il->n      = browser_preview_count(lm);
+  il->cursor = il->n;
+} /* library_fill */
+
+/*
  * player_fill_lists: one TuiList per role the current view draws (design
  * II.5, V). Takes the Player and the model, returns nothing.
  */
@@ -3592,8 +3703,11 @@ player_fill_lists(Player * p, TuiModel * m)
 
   switch (ui_view()) {
     case VIEW_LIBRARY:
+      library_fill(p, m);
+      break;
+
     case VIEW_DIRECTORIES: {
-      Browser * b = p->br;
+      Browser * b = p->brv[BROWSER_SRC_DIRECTORY];
       if (b == NULL) {
         m->list[ROLE_MAIN].empty = "(unavailable)";
         break;
@@ -3691,8 +3805,6 @@ player_fill_model(Player * p, TuiModel * out)
   m.paused      = (p->play == PLAY_PAUSED);
   m.volume_pct  = p->vol_pct;
   m.muted       = p->muted;
-  m.search_rows = p->search_rows;
-  m.search_n    = p->search_n;
   m.music_dir   = (p->cfg.nroots > 0) ? p->cfg.roots[0].path : NULL;
   player_fill_lists(p, &m);
 
@@ -3739,8 +3851,13 @@ player_repaint(Player * p)
      (phase-16-browser.md III, "Column reload"). It is also deliberately
      not in player_fill_model: the scan-progress repaint shares the fill
      and must not re-query the database while a scan holds the write
-     transaction open. */
-  browser_refresh_derived(p->br);
+     transaction open. Viewports first: tui.c may have changed the layout
+     since the last action (plan G13). Never for the facet (design IV.1). */
+  player_view_viewports(p);
+  if (ui_view() == VIEW_LIBRARY) {
+    library_sync(p);
+  }
+  browser_refresh_derived(player_role_browser(p, ROLE_MAIN));
   player_view_details(p);
   player_fill_model(p, &m);
   tui_draw(&m);
@@ -3876,13 +3993,8 @@ shutdown_all(Player * p)
         the fs source borrows Config's ignore list, and freeing the list
         under a live source is the kind of ordering error this table
         exists to make unwriteable. */
-  /* Before the browsers only for tidiness -- the results borrow nothing
-     from them. A run can end with a search still open, which is the only
-     reason this is here at all. The queue view's rows and the view
-     caches are in the same position and freed for the same reason: they
-     borrow nothing. All must go before db_close, though, which is step 7
-     below -- the rows were built from it. */
-  player_search_free(p);
+  /* Before the browsers only for tidiness: the queue view's rows and the
+     view caches borrow nothing from them. */
   queueview_free();
   player_view_detail(p, 0, &p->info_id, &p->info_rows, &p->info_n);
   player_view_detail(p, 0, &p->np_id, &p->np_rows, &p->np_n);
@@ -3894,12 +4006,12 @@ shutdown_all(Player * p)
     browser_destroy(p->brv[v]);
     p->brv[v] = NULL;
   }
-  p->br = NULL;
+  browser_destroy(p->lib_main);
+  p->lib_main = NULL;
   /* After the browsers, never before: every library source holds this
      array and a destroy can still touch it. */
   free(p->rootv);
   p->rootv = NULL;
-  p->br = NULL;
 
   /* The queue owns copies of its paths and borrows nothing, so its
      position here is free choice rather than a constraint -- it sits
@@ -4412,7 +4524,11 @@ run_tui(void)
     for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
       browser_library_source(&p.brsrc[v], v, p.db, rootv, p.cfg.nroots);
 
-      char * rootkey = browser_library_root(v, rootv, p.cfg.nroots);
+      /* The Library source's own browser is the artist facet (design
+         IV.1). */
+      char * rootkey = (v == BROWSER_SRC_LIBRARY)
+                         ? browser_library_facet_key("")
+                         : browser_library_root(v, rootv, p.cfg.nroots);
       if (rootkey != NULL) {
         p.brv[v] = browser_create(&p.brsrc[v], rootkey);
         free(rootkey);
@@ -4421,6 +4537,16 @@ run_tui(void)
         fprintf(stderr, "kurono: view %d unavailable -- browsing disabled\n", v);
       }
     }
+
+    char * listkey = browser_library_list_key(NULL, "");
+    if (listkey != NULL) {
+      p.lib_main = browser_create(&p.brsrc[BROWSER_SRC_LIBRARY], listkey);
+      free(listkey);
+    }
+    if (p.lib_main == NULL) {
+      fprintf(stderr, "kurono: library list unavailable\n");
+    }
+    p.library_empty = (db_count_tracks(p.db) == 0);
   }
 
   /* The queue. Seeded from the clock rather than internally, because

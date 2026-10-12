@@ -55,7 +55,7 @@ _Static_assert(TB_OPT_ATTR_W == 32, "kurono requires 32-bit termbox attributes")
    (amendment 04 decision 8). Always drawn, MODE_NORMAL included: a field
    that disappears shifts every element right of it, and the status bar's
    remaining width feeds the progress bar's cell count. Twelve columns
-   fits "-- SEARCH --" exactly. */
+   fits "-- FILTER --" exactly. */
 #define MODE_FIELD_W 12
 
 /* The view indicator's fixed field at the left of the header. Always
@@ -112,52 +112,36 @@ static UiView g_view = VIEW_LIBRARY;
 static int g_overlay_scroll = 0;
 
 /*
- * The search query, as typed. It lives here rather than in main.c
- * because it is terminal text state -- built one codepoint at a time out
- * of key events this file already owns, and drawn by the prompt below.
- * main.c never sees it except as the argument to search_dispatch.
- *
- * Bounded and truncating rather than growing: a query longer than this
- * has no useful FTS5 meaning, and a fixed buffer keeps text entry out of
- * the allocator entirely.
+ * Library input state (design II.7, IV.7a): which of FACET and MAIN has
+ * the cursor, whether the artist column is switched on, whether a filter
+ * is being edited, and the two filter buffers. Terminal text state, so it
+ * lives here; main.c reads it through ui_focus/ui_facet_on/ui_filter at
+ * repaint. Fixed buffers keep text entry out of the allocator; a full
+ * buffer drops the keystroke.
  */
-#define SEARCH_MAX 256
-static char   g_search[SEARCH_MAX];
-static size_t g_search_len = 0;
+#define FILTER_MAX 256
+static RegionRole g_focus    = ROLE_MAIN;
+static int        g_facet_on = 1;
+static int        g_editing  = 0;
+static char       g_filter_facet[FILTER_MAX];
+static char       g_filter_main[FILTER_MAX];
+
+/* The `200+` marker on MAIN's filter line (design IV.5). */
+#define FILTER_CAP_MARK "200+"
 
 /*
- * The cursor over the results, and the row count the last draw saw.
- * The count is kept because the cursor is moved from the input path,
- * which has no model to ask -- clamping it there against a stale count
- * is what a search that just shrank its results would need, and the
- * draw is the only place that knows the current one. Both reset with
- * the query.
+ * filter_buf: the writable filter buffer for `r`. Takes a role, returns
+ * the FACET or MAIN buffer, or NULL for any other role.
  */
-static size_t g_search_cursor = 0;
-static size_t g_search_shown  = 0;
-
-/*
- * search_reset: empty the query. Takes and returns nothing.
- */
-static void
-search_reset(void)
+static char *
+filter_buf(RegionRole r)
 {
-  g_search_len    = 0;
-  g_search[0]     = '\0';
-  g_search_cursor = 0;
-  g_search_shown  = 0;
-} /* search_reset */
-
-/*
- * layout_view: the view whose variants lay out `v`. Takes the view,
- * returns the view to pass to layout_compute.
- */
-static UiView
-layout_view(UiView v)
-{
-  /* Library shows the Artists browser until phase 5 (design XII step 3). */
-  return (v == VIEW_LIBRARY) ? VIEW_DIRECTORIES : v;
-} /* layout_view */
+  switch (r) {
+    case ROLE_FACET: return g_filter_facet;
+    case ROLE_MAIN:  return g_filter_main;
+    default:         return NULL;
+  }
+} /* filter_buf */
 
 /*
  * tui_compute_layout: recompute every rectangle from the current view
@@ -168,7 +152,16 @@ layout_view(UiView v)
 static void
 tui_compute_layout(void)
 {
-  layout_compute(layout_view(g_view), tb_width(), tb_height(), 1, &g_layout);
+  layout_compute(g_view, tb_width(), tb_height(), g_facet_on, &g_layout);
+
+  /* Focus never rests on a region that is not on screen; moving it ends
+     an edit so the next keystroke cannot land in the other buffer
+     (design II.7, decide D17). */
+  if (g_view == VIEW_LIBRARY && g_focus == ROLE_FACET
+      && layout_find(&g_layout, ROLE_FACET) == NULL) {
+    g_focus   = ROLE_MAIN;
+    g_editing = 0;
+  }
 } /* tui_compute_layout */
 
 /*
@@ -495,30 +488,43 @@ draw_region(const Region * reg, const TuiList * l)
 } /* draw_region */
 
 /*
- * draw_search_results: the MODE_SEARCH results, drawn into INFO until
- * phase 5 (decide D22). Takes the region and the model; returns nothing.
+ * draw_filter_line: the top row of a Library FACET or MAIN region (design
+ * IV.5): `/` and the region's filter, a block cursor while that region is
+ * being edited, `200+` on MAIN when the listing is capped, and a dim hint
+ * when there is nothing to show. Takes the region and its list; returns
+ * nothing.
  */
 static void
-draw_search_results(const Region * info, const TuiModel * m)
+draw_filter_line(const Region * reg, const TuiList * l)
 {
-  if (m->search_n > 0 && m->search_rows != NULL) {
-    /* The clamp lives here and not in the input path because this is
-       the only place that knows how many rows there are: a keystroke can
-       shrink the result set under a cursor that was valid for the
-       previous query. */
-    g_search_shown = m->search_n;
-    if (g_search_cursor >= m->search_n) {
-      g_search_cursor = m->search_n - 1;
-    }
-    draw_list(info, 0, m->search_rows, m->search_n, g_search_cursor,
-              list_scroll_for(g_search_cursor, m->search_n, info->h),
-              1, 0, STYLE_SEARCH_MATCH, 0);
-  } else {
-    g_search_shown = 0;
-    draw_text(info->x, info->y, info->w, STYLE_DIM,
-              (g_search_len > 0) ? "(no results)" : "(type to search)");
+  const char * text    = ui_filter(reg->role);
+  int          editing = (g_editing && g_focus == reg->role);
+  int          avail   = reg->w;
+  int          mw      = (int) strlen(FILTER_CAP_MARK);
+
+  if (reg->role == ROLE_MAIN && l->capped && avail > mw + 1) {
+    draw_text(reg->x + reg->w - mw, reg->y, mw, STYLE_DIM, FILTER_CAP_MARK);
+    avail -= mw + 1;
   }
-} /* draw_search_results */
+
+  if (text[0] == '\0' && !editing) {
+    draw_text(reg->x, reg->y, avail, STYLE_DIM, "/ filter");
+    return;
+  }
+
+  char line[FILTER_MAX + 2];
+  snprintf(line, sizeof line, "/%s", text);
+  draw_text(reg->x, reg->y, avail - editing, STYLE_SEARCH_MATCH, line);
+
+  if (editing && avail > 1) {
+    int cx = text_width(line);
+    if (cx > avail - 1) {
+      cx = avail - 1;
+    }
+    tb_set_cell(reg->x + cx, reg->y, ' ', style_fg(&g_theme, STYLE_CURSOR),
+                style_bg(&g_theme, STYLE_CURSOR));
+  }
+} /* draw_filter_line */
 
 /*
  * draw_body: every allocated region by role, then the separators between
@@ -553,17 +559,12 @@ draw_body(const TuiModel * m)
         break;
       }
 
-      case ROLE_INFO:
-        if (ui_mode() == MODE_SEARCH) {
-          draw_search_results(r, m);
-        } else {
-          draw_region(r, &m->list[ROLE_INFO]);
-        }
-        break;
-
       case ROLE_MAIN: {
         const TuiList * l = &m->list[ROLE_MAIN];
         draw_region(r, l);
+        if (layout_list_top(g_view, ROLE_MAIN) > 0) {
+          draw_filter_line(r, l);
+        }
         /* DESIGN.md XI.5: an empty index is a first-run state, not an
            error state, and the thing the user needs is the path and the
            variable that changes it. */
@@ -576,8 +577,15 @@ draw_body(const TuiModel * m)
         break;
       }
 
-      case ROLE_PARENT:
       case ROLE_FACET:
+        draw_region(r, &m->list[ROLE_FACET]);
+        if (layout_list_top(g_view, ROLE_FACET) > 0) {
+          draw_filter_line(r, &m->list[ROLE_FACET]);
+        }
+        break;
+
+      case ROLE_PARENT:
+      case ROLE_INFO:
       case ROLE_QUEUE:
       default:
         draw_region(r, &m->list[r->role]);
@@ -609,8 +617,10 @@ static const char * const g_mode_label[MODE_COUNT] = {
   [MODE_NORMAL] = "-- NORMAL --",
   [MODE_HELP]   = "-- HELP --",
   [MODE_MENU]   = "-- MENU --",
-  [MODE_SEARCH] = "-- SEARCH --",
 };
+
+/* Filter editing is a context, not a mode (design II.8). */
+#define FILTER_LABEL "-- FILTER --"
 
 _Static_assert(sizeof(g_mode_label) / sizeof(g_mode_label[0]) == MODE_COUNT,
                "every UiMode needs a label in g_mode_label");
@@ -748,7 +758,8 @@ draw_statusbar(const TuiModel * m)
      survive a narrow terminal. */
   int bar_x = 1;
   if (g_layout.w >= MODE_FIELD_W + PROGRESS_W + 4) {
-    draw_text(1, y, MODE_FIELD_W, STYLE_MODE, mode_label(ui_mode()));
+    draw_text(1, y, MODE_FIELD_W, STYLE_MODE,
+              g_editing ? FILTER_LABEL : mode_label(ui_mode()));
     bar_x = MODE_FIELD_W + 1;
   }
 
@@ -795,34 +806,13 @@ draw_statusbar(const TuiModel * m)
            un);
 
   /* The right-hand field normally shows the clock/volume/shuffle/repeat
-     summary. Two things outrank it, and both are handled here rather
-     than on the row above the status bar: that row is body_h's last
-     row, shared with every column's last visible entry, and drawing
-     there is the overlap this fixes (v1.0.1 #13).
-
-     During a search, the prompt takes the left half of the field and
-     the message the right half -- found by forcing an allocation
-     failure mid-search: the query's own truncation report goes through
-     player_report like every other one, so a prompt that owns the
-     field outright makes the one message that matters here the one
-     message that cannot be seen. Outside search, a pending message
-     simply takes the whole field in place of the clock; there is
-     nothing else competing for it. */
+     summary. A pending message outranks it and takes the whole field.
+     Handled here rather than on the row above the status bar: that row
+     is body_h's last row, shared with every column's last visible entry,
+     and drawing there is the overlap this fixes (v1.0.1 #13). */
   int x     = bar_x + PROGRESS_W + 2;
   int avail = g_layout.w - x;
-  if (ui_mode() == MODE_SEARCH) {
-    char prompt[SEARCH_MAX + 2];
-    snprintf(prompt, sizeof prompt, "/%s", g_search);
-    /* The split is for the message's sake, so it only happens when there
-       is one. At TUI_MIN_W the whole field is twenty columns and half of
-       it cannot hold a query worth reading -- an unconditional split
-       would spend the common case paying for the rare one. */
-    int half = (m->message != NULL) ? avail / 2 : avail;
-    draw_text(x, y, half, STYLE_NORMAL, prompt);
-    if (m->message != NULL) {
-      draw_text(x + half, y, avail - half, STYLE_DIM, m->message);
-    }
-  } else if (m->message != NULL) {
+  if (m->message != NULL) {
     draw_text(x, y, avail, STYLE_DIM, m->message);
   } else {
     draw_text(x, y, avail, STYLE_STATUSBAR, right);
@@ -891,97 +881,69 @@ overlay_scroll_action(Action a)
 } /* overlay_scroll_action */
 
 /*
- * search_key: handle one key event while MODE_SEARCH is on top. Takes
- * the event and the action it resolved to, returns 1 when it was
- * consumed and 0 when the caller should carry on with it.
- *
- * Text entry is the ACT_NONE case, which is the contract keymap.c's
- * g_bindings_search documents: the table binds five keys and everything
- * else is literal text. That is what keeps text entry inside the binding
- * table rather than bypassing it (amendment 04 decision 4).
- *
- * Every branch that changes the query calls search_dispatch, so the
- * results on screen are always the results for what is on the prompt --
- * there is no "run the search" key and no stale-result window.
+ * filter_key: handle one key event while a Library filter is being edited
+ * (KEYCTX_FILTER, design III.5). Takes the event and the action it
+ * resolved to; returns 0 for the actions keymap_filter_consumes hands on
+ * (the edited region's cursor), which the caller dispatches, and 1 for
+ * everything else. The listing follows the buffer at the next repaint
+ * (design IV.4); nothing here calls into main.c for text.
  */
 static int
-search_key(const struct tb_event * ev, Action a)
+filter_key(const struct tb_event * ev, Action a)
 {
+  char * buf = filter_buf(g_focus);
+
+  if (!keymap_filter_consumes(a)) {
+    return 0;
+  }
+  if (buf == NULL) {
+    g_editing = 0;
+    return 1;
+  }
+
+  size_t len = strlen(buf);
   switch (a) {
-    case ACT_CONFIRM:
-      /* Enter takes the search's answer and leaves; Esc discards it. The
-         browser move happens before the mode pops so that the results
-         are still alive when search_confirm reads the selected row. */
-      if (g_search_shown > 0) {
-        search_confirm(g_search_cursor);
-      }
-      ui_mode_pop();
-      search_reset();
-      search_dispatch(NULL);
-      return 1;
-
     case ACT_SEARCH_CANCEL:
-      ui_mode_pop();
-      search_reset();
-      search_dispatch(NULL);
-      return 1;
-
-    case ACT_CURSOR_UP:
-      g_search_cursor = list_cursor_move(g_search_cursor, g_search_shown, -1);
-      return 1;
-
-    case ACT_CURSOR_DOWN:
-      /* Clamped against what the last draw showed; the draw clamps again
-         against what it is about to show. */
-      g_search_cursor = list_cursor_move(g_search_cursor, g_search_shown, 1);
-      return 1;
-
     case ACT_QUIT:
-      /* Ctrl-C during a search drops the search and is then dispatched
-         normally, so amendment 04 decision 5's rule -- quit closes what
-         is on top of the stack first -- applies here unchanged rather
-         than getting a special case. */
-      search_reset();
-      search_dispatch(NULL);
-      return 0;
+      /* ctrl-c clears and leaves like esc; consumed, because with no mode
+         to pop a dispatched ACT_QUIT ends the run (decide D16). */
+      buf[0]    = '\0';
+      g_editing = 0;
+      return 1;
+
+    case ACT_CONFIRM:
+      g_editing = 0;
+      return 1;
 
     case ACT_REMOVE:
-      /* Back over a whole codepoint, not a byte: deleting one byte of a
-         multi-byte character leaves the buffer holding a truncated
-         sequence, which is then handed to SQLite. */
-      while (g_search_len > 0) {
-        g_search_len--;
-        if (((unsigned char) g_search[g_search_len] & 0xc0) != 0x80) {
+      /* One codepoint, not one byte: a truncated sequence would reach the
+         FTS query. */
+      while (len > 0) {
+        len--;
+        if (((unsigned char) buf[len] & 0xc0) != 0x80) {
           break;
         }
       }
-      g_search[g_search_len] = '\0';
-      g_search_cursor = 0;
-      search_dispatch(g_search);
+      buf[len] = '\0';
       return 1;
 
     case ACT_NONE: {
       if (ev->ch == 0) {
         return 1;  /* an unbound non-character key: swallowed, not text */
       }
-      char   enc[8];
-      int    len = tb_utf8_unicode_to_char(enc, ev->ch);
-      if (len > 0 && g_search_len + (size_t) len < sizeof g_search) {
-        memcpy(g_search + g_search_len, enc, (size_t) len);
-        g_search_len += (size_t) len;
-        g_search[g_search_len] = '\0';
-        g_search_cursor = 0;  /* a new query starts at its best match */
-        search_dispatch(g_search);
+      char enc[8];
+      int  n = tb_utf8_unicode_to_char(enc, ev->ch);
+      if (n > 0 && len + (size_t) n < FILTER_MAX) {
+        memcpy(buf + len, enc, (size_t) n);
+        buf[len + (size_t) n] = '\0';
       }
-      /* A full buffer drops the keystroke rather than truncating a
-         codepoint or growing without bound. */
       return 1;
     }
 
     default:
-      return 0;
+      return 1;  /* exclusive context: nothing else gets through */
   }
-} /* search_key */
+} /* filter_key */
 
 /*
  * dispatch_event: route one termbox event by its type. Key events resolve
@@ -998,25 +960,24 @@ dispatch_event(const struct tb_event * ev)
       int32_t arg  = 0;
       UiMode  mode = ui_mode();
       KeyCtx  chain[KEYCTX_CHAIN_MAX];
-      size_t  nc   = keymap_chain(mode, 0, g_view, chain);
+      size_t  nc   = keymap_chain(mode, g_editing, g_view, chain);
       Action  a    = keymap_resolve(chain, nc, ev, &arg);
 
-      /* Search is handled here and not in main.c's action_dispatch
-         because the query is terminal text state and lives in this file.
-         main.c sees only the finished string, through search_dispatch. */
-      if (mode == MODE_SEARCH && search_key(ev, a)) {
+      /* Filter text is terminal state and lives in this file; main.c
+         reads the buffers at repaint (design II.7). */
+      if (g_editing && filter_key(ev, a)) {
         g_dirty = 1;
         break;
       }
-      if (mode == MODE_NORMAL && a == ACT_SEARCH) {
-        /* An empty query on entry, dispatched immediately, so column 2
-           switches to the search pane on the keystroke that opens it
-           rather than on the first character typed. */
-        if (ui_mode_toggle(MODE_SEARCH) > 0) {
-          search_reset();
-          search_dispatch(g_search);
+      if (!g_editing && mode == MODE_NORMAL && a == ACT_SEARCH) {
+        /* `/` from any view edits the Library's focused filter, resuming
+           its text (design III.5, decide D11). Refused where nothing can
+           draw. */
+        if (g_view != VIEW_LIBRARY) {
+          ui_view_set(VIEW_LIBRARY);
         }
-        g_dirty = 1;
+        g_editing = !g_layout.too_small;
+        g_dirty   = 1;
         break;
       }
 
@@ -1169,14 +1130,7 @@ ui_mode_toggle(UiMode m)
     return 0;
   }
 
-  /* MODE_SEARCH draws no box: it borrows INFO and the message row, both
-     of which exist at any size the browser itself draws at. Gating it on
-     the overlay's margins would refuse a search on a terminal that
-     renders the browser perfectly well. A terminal too small to draw
-     anything still refuses, because there would be nowhere to show the
-     prompt. */
-  int fits = (m == MODE_SEARCH) ? !g_layout.too_small : overlay_fits();
-  if (!fits || g_mode_depth >= UI_MODE_STACK_MAX) {
+  if (!overlay_fits() || g_mode_depth >= UI_MODE_STACK_MAX) {
     return -1;
   }
 
@@ -1209,12 +1163,57 @@ RegionRole
 ui_focus(void)
 {
   switch (g_view) {
-    case VIEW_LIBRARY:
+    case VIEW_LIBRARY:     return g_focus;
     case VIEW_DIRECTORIES: return ROLE_MAIN;
     case VIEW_PLAYLISTS:   return ROLE_QUEUE;
     default:               return ROLE_COUNT;
   }
 } /* ui_focus */
+
+/* ui_focus_set: see include/ui/tui.h. */
+void
+ui_focus_set(RegionRole r)
+{
+  if (g_view != VIEW_LIBRARY || (r != ROLE_FACET && r != ROLE_MAIN)
+      || layout_find(&g_layout, r) == NULL) {
+    return;
+  }
+  g_focus = r;
+  g_dirty = 1;
+} /* ui_focus_set */
+
+/* ui_facet_on: see include/ui/tui.h. */
+int
+ui_facet_on(void)
+{
+  return g_facet_on;
+} /* ui_facet_on */
+
+/* ui_facet_toggle: see include/ui/tui.h. */
+void
+ui_facet_toggle(void)
+{
+  g_facet_on = !g_facet_on;
+  if (g_active) {
+    tui_compute_layout();
+  }
+  g_dirty = 1;
+} /* ui_facet_toggle */
+
+/* ui_filter: see include/ui/tui.h. */
+const char *
+ui_filter(RegionRole r)
+{
+  const char * buf = filter_buf(r);
+  return (buf != NULL) ? buf : "";
+} /* ui_filter */
+
+/* ui_filter_editing: see include/ui/tui.h. */
+int
+ui_filter_editing(void)
+{
+  return g_editing;
+} /* ui_filter_editing */
 
 /*
  * tui_active: whether the terminal is currently claimed. Takes nothing,

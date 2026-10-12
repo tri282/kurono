@@ -615,14 +615,16 @@ static void test_upsert_preserves_id(void)
         "title was not updated by the third upsert");
   db_track_row_free_fields(&row3);
 
-  /* FTS must reflect the update too, not just the row -- a trigger this
-     change stopped firing would show up as a stale search index. */
+  /* F11 (decide D18): FTS must reflect the update too, not just the row
+     -- a trigger this change stopped firing would show up as a stale
+     filter index. Read through the All+FTS list statement. */
   char *       match = query_build_match("New Title");
   DbTrackRow * srows = NULL;
   size_t       sn = 0;
   CHECK(match != NULL, "query_build_match(\"New Title\") returned NULL");
   if (match != NULL) {
-    CHECK(db_query_search(db, match, &srows, &sn) == 0, "db_query_search returned non-zero");
+    CHECK(db_query_tracks_list(db, NULL, match, &srows, &sn) == 0,
+          "db_query_tracks_list returned non-zero");
     CHECK(sn == 1 && srows != NULL && srows[0].id == id,
           "FTS index was not updated to the new title");
     db_track_rows_free(srows, sn);
@@ -760,8 +762,8 @@ static const char * const g_fixture_words[] = {
 };
 #define FIXTURE_NWORDS (sizeof(g_fixture_words) / sizeof(g_fixture_words[0]))
 
-/* A handful of rare two-word combinations for test_search_order_preserved
-   to search among for one matching fewer than 200 of the fixture's rows. */
+/* A handful of rare two-word combinations for F3 (test_list_compose) to
+   search among for one matching fewer than 200 of the fixture's rows. */
 static const char * const g_selective_candidates[] = {
   "storm hope", "wind love", "ember dream", "elegy stanza",
   "arpeggio autumnal", "azure amber", "aria alto", "anthem symphony",
@@ -902,7 +904,7 @@ build_raw_fixture(sqlite3 ** out_conn, size_t n)
 /*
  * build_db_fixture: the same `n` rows as build_raw_fixture, inserted
  * through db_track_upsert on a real Db handle -- the production code
- * path, exercised so db_query_search is checked as the caller actually
+ * path, exercised so db_query_tracks_list is checked as the caller actually
  * calls it, not just as raw SQL. Same path/field generation as
  * build_raw_fixture, so a fresh sequential id in one lines up with the
  * other's rowid. Returns 0 and sets *out_db on success, -1 on error.
@@ -1001,286 +1003,6 @@ search_fixture_cleanup(void)
     g_search_fixture_db = NULL;
   }
 } /* search_fixture_cleanup */
-
-/*
- * test_search_order_preserved: assertion 1 (design.md 5.3, decide R7).
- * Finds a query among g_selective_candidates matching fewer than 200 of
- * the fixture's rows, runs it through db_query_search (the real Db, the
- * real production statement) and through the pre-phase-6 reference
- * shape ("ORDER BY rank, f.rowid LIMIT 200", the tie-break R7 requires)
- * against the raw fixture, and asserts identical ids in identical
- * order. Also asserts the reference has at least two distinct bm25
- * scores -- the precondition that keeps the DESC-sign mutant from being
- * invisible on a tied fixture (R7).
- */
-static void
-test_search_order_preserved(void)
-{
-  sqlite3 *    raw = search_fixture_raw();
-  Db *         db = search_fixture_db();
-  char *       match = NULL;
-  size_t       ci;
-  int64_t      ref_ids[200];
-  double       ref_ranks[200];
-  size_t       ref_n = 0;
-
-  if (raw == NULL || db == NULL) {
-    CHECK(0, "search fixture unavailable for order-preservation test");
-    return;
-  }
-
-  for (ci = 0; ci < sizeof(g_selective_candidates) / sizeof(g_selective_candidates[0]); ci++) {
-    sqlite3_stmt * probe = NULL;
-    int64_t        total = -1;
-
-    free(match);
-    match = query_build_match(g_selective_candidates[ci]);
-    if (match == NULL) {
-      continue;
-    }
-    if (sqlite3_prepare_v2(raw, "SELECT count(*) FROM tracks_fts WHERE tracks_fts MATCH ?1",
-                            -1, &probe, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(probe, 1, match, -1, SQLITE_TRANSIENT);
-      if (sqlite3_step(probe) == SQLITE_ROW) {
-        total = sqlite3_column_int64(probe, 0);
-      }
-      sqlite3_finalize(probe);
-    }
-    if (total > 0 && total < 200) {
-      break;
-    }
-  }
-  CHECK(match != NULL, "no candidate query built");
-  if (match == NULL) {
-    return;
-  }
-
-  sqlite3_stmt * ref = NULL;
-  CHECK(sqlite3_prepare_v2(raw,
-      "SELECT t.rowid, rank FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
-      "WHERE tracks_fts MATCH ?1 ORDER BY rank, f.rowid LIMIT 200",
-      -1, &ref, NULL) == SQLITE_OK, "failed to prepare the reference statement");
-  if (ref != NULL) {
-    double distinct[200];
-    size_t ndistinct = 0;
-
-    sqlite3_bind_text(ref, 1, match, -1, SQLITE_TRANSIENT);
-    while (ref_n < 200 && sqlite3_step(ref) == SQLITE_ROW) {
-      size_t k;
-      int    seen = 0;
-
-      ref_ids[ref_n] = sqlite3_column_int64(ref, 0);
-      ref_ranks[ref_n] = sqlite3_column_double(ref, 1);
-      for (k = 0; k < ndistinct; k++) {
-        if (distinct[k] == ref_ranks[ref_n]) {
-          seen = 1;
-          break;
-        }
-      }
-      if (!seen && ndistinct < 200) {
-        distinct[ndistinct++] = ref_ranks[ref_n];
-      }
-      ref_n++;
-    }
-    sqlite3_finalize(ref);
-
-    CHECK(ref_n > 0 && ref_n < 200,
-          "candidate query matched %zu rows, want 1..199 -- fixture drifted", ref_n);
-    CHECK(ndistinct >= 2,
-          "reference query has only %zu distinct bm25 score(s); a sign-error "
-          "mutant is invisible on a tied fixture (decide R7)", ndistinct);
-  }
-
-  DbTrackRow * srows = NULL;
-  size_t       sn = 0;
-  CHECK(db_query_search(db, match, &srows, &sn) == 0, "db_query_search returned non-zero");
-  CHECK(sn == ref_n, "db_query_search returned %zu rows, reference returned %zu", sn, ref_n);
-  if (srows != NULL) {
-    size_t k;
-    for (k = 0; k < sn && k < ref_n; k++) {
-      CHECK(srows[k].id == ref_ids[k],
-            "row %zu: db_query_search id %lld, reference id %lld",
-            k, (long long) srows[k].id, (long long) ref_ids[k]);
-    }
-  }
-  db_track_rows_free(srows, sn);
-  free(match);
-} /* test_search_order_preserved */
-
-/*
- * test_search_cap: assertion 2 (design.md 4.5/5.3). A query matching
- * more than 200 of the fixture's rows still returns exactly 200 through
- * db_query_search.
- */
-static void
-test_search_cap(void)
-{
-  Db *           db = search_fixture_db();
-  sqlite3 *      raw = search_fixture_raw();
-  char *         match;
-  sqlite3_stmt * count_stmt = NULL;
-  int64_t        total = -1;
-  DbTrackRow *   rows = NULL;
-  size_t         n = 0;
-
-  if (db == NULL || raw == NULL) {
-    CHECK(0, "search fixture unavailable for the >200 cap test");
-    return;
-  }
-
-  match = query_build_match("a");
-  CHECK(match != NULL, "query_build_match(\"a\") returned NULL");
-  if (match == NULL) {
-    return;
-  }
-
-  if (sqlite3_prepare_v2(raw, "SELECT count(*) FROM tracks_fts WHERE tracks_fts MATCH ?1",
-                          -1, &count_stmt, NULL) == SQLITE_OK) {
-    sqlite3_bind_text(count_stmt, 1, match, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
-      total = sqlite3_column_int64(count_stmt, 0);
-    }
-    sqlite3_finalize(count_stmt);
-  }
-  CHECK(total > 200, "query \"a\"* matched %lld of %d fixture rows, want > 200 "
-        "-- fixture drifted", (long long) total, SEARCH_FIXTURE_N);
-
-  CHECK(db_query_search(db, match, &rows, &n) == 0, "db_query_search returned non-zero");
-  CHECK(n == 200, "db_query_search returned %zu rows for a >200-match query, want 200", n);
-
-  /* Which 200, not just how many: the shipped statement caps inside the
-     subquery, so a >200-match query returns the 200 lowest rowids ranked
-     among themselves (design.md 4.5). Ranking before the cap would return
-     the global top 200 instead -- same count, different rows, and 110-200x
-     the cost at scale. Counting alone cannot tell the two apart. */
-  if (n == 200) {
-    sqlite3_stmt * want_stmt = NULL;
-    int64_t        want[200];
-    int64_t        got[200];
-    size_t         i = 0;
-
-    for (i = 0; i < n; i++) {
-      got[i] = rows[i].id;
-    }
-    qsort(got, n, sizeof got[0], cmp_id_qsort);
-
-    if (sqlite3_prepare_v2(raw,
-          "SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1 ORDER BY rowid LIMIT 200",
-          -1, &want_stmt, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(want_stmt, 1, match, -1, SQLITE_TRANSIENT);
-      for (i = 0; i < 200 && sqlite3_step(want_stmt) == SQLITE_ROW; i++) {
-        want[i] = sqlite3_column_int64(want_stmt, 0);
-      }
-      sqlite3_finalize(want_stmt);
-      CHECK(i == 200, "reference query returned %zu rowids, want 200", i);
-
-      for (i = 0; i < 200; i++) {
-        CHECK(got[i] == want[i],
-              "cap row %zu: got id %lld, want %lld -- the 200 rows are not the "
-              "lowest-rowid matches, so the LIMIT is not inside the subquery",
-              i, (long long) got[i], (long long) want[i]);
-      }
-    } else {
-      CHECK(0, "failed to prepare the lowest-rowid reference query");
-    }
-  }
-
-  db_track_rows_free(rows, n);
-  free(match);
-} /* test_search_cap */
-
-/*
- * test_search_latency: assertion 3 (design.md 4.4/5.3, decide R7). Times
- * the pre-phase-6 statement shape against the current PREP(query_search,
- * ...) text, both against the same connection and the same
- * prefix-indexed schema, so the ratio isolates the statement shape
- * rather than the index. Best of five. Prints both figures and their
- * ratio for CHANGELOG.md. Gate >= 2.0 against a healthy measured ~4.0x
- * at this fixture size (decide R5/R7).
- */
-static void
-test_search_latency(void)
-{
-  sqlite3 *      conn = search_fixture_raw();
-  char *         match;
-  sqlite3_stmt * old_stmt = NULL;
-  sqlite3_stmt * new_stmt = NULL;
-  double         old_best = -1.0, new_best = -1.0;
-  double         ratio;
-  int            rep;
-
-  if (conn == NULL) {
-    CHECK(0, "search fixture unavailable for the latency test");
-    return;
-  }
-
-  match = query_build_match("a");
-  CHECK(match != NULL, "query_build_match(\"a\") returned NULL");
-  if (match == NULL) {
-    return;
-  }
-
-  CHECK(sqlite3_prepare_v2(conn,
-      "SELECT t.* FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
-      "WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT 200",
-      -1, &old_stmt, NULL) == SQLITE_OK, "failed to prepare the old-shape statement");
-  CHECK(sqlite3_prepare_v2(conn,
-      "SELECT t.* FROM tracks t "
-      "JOIN (SELECT rowid AS rid, rank AS r FROM tracks_fts "
-      "       WHERE tracks_fts MATCH ?1 LIMIT 200) x ON t.id = x.rid "
-      "ORDER BY x.r, x.rid",
-      -1, &new_stmt, NULL) == SQLITE_OK, "failed to prepare the new-shape statement");
-
-  if (old_stmt == NULL || new_stmt == NULL) {
-    if (old_stmt != NULL) {
-      sqlite3_finalize(old_stmt);
-    }
-    if (new_stmt != NULL) {
-      sqlite3_finalize(new_stmt);
-    }
-    free(match);
-    return;
-  }
-
-  for (rep = 0; rep < 5; rep++) {
-    struct timespec t0, t1;
-    double          elapsed;
-
-    sqlite3_reset(old_stmt);
-    sqlite3_clear_bindings(old_stmt);
-    sqlite3_bind_text(old_stmt, 1, match, -1, SQLITE_TRANSIENT);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    while (sqlite3_step(old_stmt) == SQLITE_ROW) { }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    elapsed = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
-    if (old_best < 0.0 || elapsed < old_best) {
-      old_best = elapsed;
-    }
-
-    sqlite3_reset(new_stmt);
-    sqlite3_clear_bindings(new_stmt);
-    sqlite3_bind_text(new_stmt, 1, match, -1, SQLITE_TRANSIENT);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    while (sqlite3_step(new_stmt) == SQLITE_ROW) { }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    elapsed = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
-    if (new_best < 0.0 || elapsed < new_best) {
-      new_best = elapsed;
-    }
-  }
-  sqlite3_finalize(old_stmt);
-  sqlite3_finalize(new_stmt);
-  free(match);
-
-  ratio = (new_best > 0.0) ? old_best / new_best : 0.0;
-  printf("fts_query_test: search latency old=%.3fms new=%.3fms ratio=%.2fx\n",
-         old_best * 1000.0, new_best * 1000.0, ratio);
-
-  /* If this fails on CI with no db.c change, demote to a printed figure
-     -- do not re-tune the gate upward (decide R7). */
-  CHECK(ratio >= 2.0, "search latency ratio %.2fx, want >= 2.0x (old=%.3fms new=%.3fms)",
-        ratio, old_best * 1000.0, new_best * 1000.0);
-} /* test_search_latency */
 
 /*
  * test_fts_prefix_index: assertion 4 (decide R7). A fresh database's
@@ -2580,9 +2302,6 @@ int main(int argc, char ** argv)
     test_against_fts5();
     test_prefix_range_precondition();
     test_upsert_preserves_id();
-    test_search_order_preserved();
-    test_search_cap();
-    test_search_latency();
     test_list_order();
     test_list_artist();
     test_list_compose();

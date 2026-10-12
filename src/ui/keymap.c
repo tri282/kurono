@@ -143,6 +143,11 @@ static const Binding g_bindings_browse[] = {
   { 0, 'a',  0, ACT_ENQUEUE,          0 },
 };
 
+/* KEYCTX_LIBRARY: Library-only keys (design IX.1). */
+static const Binding g_bindings_library[] = {
+  { 0, 'f',  0, ACT_FACET_TOGGLE,     0 },
+};
+
 /*
  * KEYCTX_TRACKLIST: edit the queue under the Playlists cursor. `d` and
  * `C` live only here (decide D7): the entry they act on is visible only
@@ -203,10 +208,9 @@ static const Binding g_bindings_menu[] = {
  * KEYCTX_FILTER binds the keys below and nothing else, and the omission
  * is the design (amendment 04 decision 4): every other event resolves
  * ACT_NONE, and tui.c reads ACT_NONE with a non-zero ev->ch as "insert
- * this codepoint into the query". That is what keeps text entry inside
+ * this codepoint into the filter". That is what keeps text entry inside
  * the binding table instead of bypassing it. Esc cancels rather than
- * pops. MODE_SEARCH resolves against this table until phase 5 (decide
- * D22).
+ * pops; tui.c consumes ACT_QUIT here (decide D16).
  */
 static const Binding g_bindings_filter[] = {
   { TB_KEY_ESC,        0, 0, ACT_SEARCH_CANCEL, 0 },
@@ -234,8 +238,7 @@ static const struct {
   [KEYCTX_GLOBAL]    = { g_bindings_global,    TABLE_ROWS(g_bindings_global)    },
   [KEYCTX_LIST]      = { g_bindings_list,      TABLE_ROWS(g_bindings_list)      },
   [KEYCTX_BROWSE]    = { g_bindings_browse,    TABLE_ROWS(g_bindings_browse)    },
-  /* filled in phase 5 (design IX.1) */
-  [KEYCTX_LIBRARY]   = { NULL, 0 },
+  [KEYCTX_LIBRARY]   = { g_bindings_library,   TABLE_ROWS(g_bindings_library)   },
   [KEYCTX_TRACKLIST] = { g_bindings_tracklist, TABLE_ROWS(g_bindings_tracklist) },
   [KEYCTX_FILTER]    = { g_bindings_filter,    TABLE_ROWS(g_bindings_filter)    },
   [KEYCTX_HELP]      = { g_bindings_help,      TABLE_ROWS(g_bindings_help)      },
@@ -299,6 +302,7 @@ static const char * const g_action_name[] = {
   [ACT_MENU_TOGGLE]      = "menu_toggle",
   [ACT_CONFIRM]          = "confirm",
   [ACT_QUEUE_TOGGLE]     = "queue_toggle",
+  [ACT_FACET_TOGGLE]     = "facet_toggle",
 };
 
 _Static_assert(sizeof(g_action_name) / sizeof(g_action_name[0]) == ACT_COUNT,
@@ -338,8 +342,7 @@ keymap_chain(UiMode mode, int editing, UiView view, KeyCtx out[KEYCTX_CHAIN_MAX]
   size_t n = 0;
   if (mode == MODE_HELP) { out[n++] = KEYCTX_HELP; return n; }
   if (mode == MODE_MENU) { out[n++] = KEYCTX_MENU; return n; }
-  /* MODE_SEARCH resolves against FILTER until phase 5 (decide D22). */
-  if (editing || mode == MODE_SEARCH) { out[n++] = KEYCTX_FILTER; return n; }
+  if (editing) { out[n++] = KEYCTX_FILTER; return n; }
   switch (view) {
     case VIEW_LIBRARY:     out[n++] = KEYCTX_LIBRARY;   out[n++] = KEYCTX_BROWSE; out[n++] = KEYCTX_LIST; break;
     case VIEW_DIRECTORIES: out[n++] = KEYCTX_BROWSE;    out[n++] = KEYCTX_LIST;   break;
@@ -472,6 +475,13 @@ key_name(const Binding * b)
   snprintf(buf, sizeof buf, "%sU+%04X", pre, (unsigned) b->ch);
   return buf;
 } /* key_name */
+
+/* keymap_filter_consumes: see include/ui/keymap.h. */
+int
+keymap_filter_consumes(Action a)
+{
+  return a != ACT_CURSOR_UP && a != ACT_CURSOR_DOWN;
+} /* keymap_filter_consumes */
 
 /*
  * Takes an Action, returns its stable config-file name, or "invalid" for

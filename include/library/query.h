@@ -9,7 +9,7 @@
  * The two transforms the query layer owns, and the whole of it.
  *
  * library/db.c already exposes every named query the views need
- * (db_query_dirs, db_query_artists, ... db_query_search), each backed
+ * (db_query_dirs, db_query_artists, ... db_query_tracks_list), each backed
  * by a statement prepared once at db_open. ui/ calls those directly;
  * this file deliberately holds no pass-through wrapper over them
  * (plans/kurono/02-decide/amendment-08-query-layer-scope.md).
@@ -96,12 +96,12 @@ int query_name_cmp(const char * a, const char * b);
  * Verified against SQLite 3.51.2: unquoted, each of those last three
  * inputs is a query error ("unterminated string", "syntax error",
  * "unknown special query"); quoted, all of them parse and return zero
- * or more rows. The result is bound as a parameter by db_query_search
- * and is never concatenated into SQL.
+ * or more rows. The result is bound as a parameter by
+ * db_query_tracks_list and is never concatenated into SQL.
  *
  * Input with no tokens at all (empty or whitespace-only) returns an
- * owned empty string, and the caller must treat that as "no search" and
- * not call db_query_search with it -- FTS5 has no spelling of the empty
+ * owned empty string, which db_query_tracks_list treats as "no filter"
+ * rather than handing it to MATCH -- FTS5 has no spelling of the empty
  * query, so there is nothing honest to build. Returns NULL only on
  * allocation failure. Caller frees with free().
  */
