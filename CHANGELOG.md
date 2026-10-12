@@ -4,10 +4,15 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] — 2026-10-12
 
 ### Added
 
+- Library view, the default: an artist column narrows an album-grouped
+  track list, with the selected track's details beside it. `←`/`→` move
+  between the artist column and the track list; `f` hides or shows the
+  artist column. `enter` or `a` on an album heading plays or queues the
+  tracks listed under it.
 - Playlists view: the queue in its own column, with the details of the
   entry under the cursor beside it. `enter` plays the entry, `d` removes
   it, `C` clears the queue, `K`/`J` move it.
@@ -15,11 +20,6 @@ Notable changes to `kurono`. Format based on
 - Settings view: the effective configuration, read-only.
 - `?` opens help, like `h`. Page keys (`pgup`, `pgdn`, `home`, `end`) work
   in every list.
-- Library view, the default: an artist column narrows an album-grouped
-  track list, with the selected track's details beside it. `←`/`→` move
-  between the artist column and the track list; `f` hides or shows the
-  artist column. `enter` or `a` on an album heading plays or queues the
-  tracks listed under it.
 
 ### Changed
 
@@ -224,11 +224,16 @@ through those.
   order, marked `200+`; the last album under the cap may be partial.
 - In the Library's All listing a compilation lists as one group per
   performer, because grouping is by track artist.
-- The decode buffer is sized by a guess (about 2.7 s at 48 kHz). The exit
-  summary now reports the measured steady-state headroom; the figure and any
-  resulting change will be recorded once enough listening time exists.
+- Filtering with an artist selected takes about 14 ms per keystroke at
+  100,000 tracks with an artist of about 2,800 tracks (release build). It is
+  unnoticeable at typical library sizes.
+- The decode buffer is sized by a guess (about 2.7 s at 48 kHz). Measured
+  over 6.4 h in 2 sessions, there were no steady-state underruns and the
+  lowest headroom was 2.69 s of 2.73 s. The verdict waits on more listening
+  (10 h over 3 sessions), so the size is unchanged for now.
 
-[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v1.3.1...main
+[Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v2.0.0...main
+[2.0.0]: https://gitlab.com/tri282/kurono/-/compare/v1.3.1...v2.0.0
 [1.3.1]: https://gitlab.com/tri282/kurono/-/compare/v1.3.0...v1.3.1
 [1.3.0]: https://gitlab.com/tri282/kurono/-/compare/v1.2.0...v1.3.0
 [1.2.0]: https://gitlab.com/tri282/kurono/-/compare/v1.1.0...v1.2.0

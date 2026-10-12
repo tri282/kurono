@@ -2,7 +2,7 @@
 
 A simple, local terminal music player in C.
 
-`kurono` is standalone. It decodes and plays audio itself, no daemon, no MPD protocol, no client/server split, no other player wrapped underneath. One process, one binary, keyboard driven throughout. It indexes your music tree into SQLite and gives you a three-column [ranger](https://github.com/ranger/ranger)-style browser over it, with gapless playback and full-text search.
+`kurono` is standalone. It decodes and plays audio itself, no daemon, no MPD protocol, no client/server split, no other player wrapped underneath. One process, one binary, keyboard driven throughout. It indexes your music tree into SQLite and gives you a [ranger](https://github.com/ranger/ranger)-style browser over it, with gapless playback and a live filter.
 
 Linux only, deliberately.
 
@@ -12,10 +12,10 @@ Linux only, deliberately.
 
 ## Features
 
-* **Three-column browsing.** Artists, albums, tracks, or directories, if you'd rather see the tree as it is on disk. Same widget, different query.
+* **Five views.** Library (artists and an album-grouped track list), Directories (the tree as it is on disk), Playlists (the queue), Now playing and Settings. Library and Directories are the same widget with a different query.
 * **Gapless playback.** The next track is opened and decoding before the current one ends. No silence at album boundaries, no click.
-* **Full-text search** over your whole library through SQLite's FTS5, ranked, updating as you type.
-* **A real queue** you can reorder and edit while it plays, in a pane that keeps the transport keys live.
+* **A live filter** over the Library through SQLite's FTS5, narrowing the focused column as you type.
+* **A real queue** you can reorder and edit while it plays, in the Playlists view, with the transport keys live.
 * **Instant rescans.** The first scan reads tags from every file; after that `kurono` compares size and mtime and skips everything unchanged.
 * **Multiple music roots**, so an archive disk and a home directory can be one library.
 * **Shuffle and repeat** off, all, one.
@@ -23,6 +23,7 @@ Linux only, deliberately.
 * **Fast and small.** No runtime, no garbage collector, no config parsing on the hot path. Playback runs lock-free.
 
 ![Full-text search: the query and its ranked results, updating as you type.](./assets/search.png)
+<!-- assets/search.png shows the v1 search overlay; recapture with the Library filter or remove. -->
 
 ---
 
@@ -150,7 +151,7 @@ export KURONO_MUSIC_DIR="$HOME/Music"
 export KURONO_MUSIC_DIR="$HOME/Music:/mnt/archive/flac"
 ```
 
-Roots are scanned in order, and that's the order they appear in the Directory view. A root that doesn't exist is reported rather than quietly skipped, so an unmounted disk looks like an unmounted disk instead of an empty library. A directory whose name contains `:` can't be used, the same limitation `PATH` has.
+Roots are scanned in order, and that's the order they appear in the Directories view. A root that doesn't exist is reported rather than quietly skipped, so an unmounted disk looks like an unmounted disk instead of an empty library. A directory whose name contains `:` can't be used, the same limitation `PATH` has.
 
 Symlinking a second location into your music directory does **not** work: the scanner skips symlinked directories deliberately, so it can't escape the tree it was pointed at. Use multiple roots instead.
 
@@ -177,20 +178,24 @@ Run `kurono`. On first launch it scans your music tree and builds the index, pri
 ```txt
 +--------------------------------------------------------------+
 | header: now playing / mode indicators                        |
-+---------------+----------------+-----------------------------+
-| column 1      | column 2       | column 3                    |
-| artists       | albums         | tracks                      |
-| (or dirs)     | (or entries)   | (or preview)                |
-+---------------+----------------+-----------------------------+
++---------------+----------------------------+-----------------+
+| facet         | tracks, grouped by album   | info            |
+| (artists)     |                            | (selected track)|
++---------------+----------------------------+-----------------+
 | -- NORMAL -- | progress, time, volume, shuffle, repeat       |
 +--------------------------------------------------------------+
 ```
 
-The leftmost field of the status bar is the current input mode, `vim`-style. It reads `-- NORMAL --` while browsing, and changes to `-- SEARCH --`, `-- HELP --` or `-- MENU --` while one of those is open.
+That is the Library view, the default. While a filter is open its line sits on top of the two lists.
 
-Directory, Artists and Album Artists are the same browser fed by different queries, not separate screens, which is why they behave identically.
+The leftmost field of the status bar is the current input mode, `vim`-style. It reads `-- NORMAL --` while browsing, and changes to `-- FILTER --` while you type a filter, or `-- HELP --` or `-- MENU --` while one of those is open.
+
+There are five views, on `1` to `5`: Library, Directories, Playlists, Now playing and Settings. Library and Directories are the same browser fed by different queries, not separate screens, which is why they behave identically. Now playing and Settings are not browsers: Now playing shows the playing track, and Settings shows the effective configuration, read-only.
 
 ![The queue pane open over the browser, editable while playback continues.](./assets/queue.png)
+<!-- assets/queue.png shows the v1 queue pane; recapture it for the Playlists view or remove it. -->
+
+The Playlists view is the queue: the entries in one column, the details of the entry under the cursor beside it, editable while playback continues.
 
 ### Keybindings
 
@@ -198,15 +203,16 @@ Arrows navigate, letters act. Every key resolves through a table to a named acti
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Move up / down within a column |
-| `←` / `→` | Move between columns |
+| `↑` / `↓` | Move up / down within a list |
+| `←` / `→` | Library: move between the artist column and the track list. Directories: up a folder / into a folder |
+| `pgup` `pgdn` `home` `end` | Page / jump in any list |
 | `space` | Play / pause |
-| `enter` | Play the selection now |
-| `a` | Add the selection to the queue |
-| `d` | Remove from the queue |
-| `C` | Clear the queue |
-| `v` | Open / close the queue pane |
-| `K` / `J` | Move an entry up / down (queue pane) |
+| `enter` | Play the selection now (in Playlists, play the entry) |
+| `a` | Add the selection to the queue (on an album heading, the tracks listed under it) |
+| `f` | Show / hide the artist column (Library) |
+| `d` / `C` | Remove from the queue / clear the queue (Playlists) |
+| `K` / `J` | Move an entry up / down (Playlists) |
+| `v` | Go to Playlists and back |
 | `o` | Jump to the playing track |
 | `n` / `p` | Next / previous track |
 | `x` | Stop |
@@ -216,19 +222,19 @@ Arrows navigate, letters act. Every key resolves through a table to a named acti
 | `H` / `L` | Seek 30 s back / forward (fallback) |
 | `+` / `-` | Volume up / down |
 | `M` | Mute / unmute |
-| `/` | Search |
+| `/` | Filter the focused Library column as you type; `enter` keeps it, `esc` clears it |
 | `s` | Toggle shuffle |
 | `r` | Cycle repeat, off, all, one |
-| `tab` | Cycle view |
-| `1` / `2` / `3` | Directories / Artists / Album Artists |
+| `tab` | Cycle views |
+| `1` / `2` / `3` / `4` / `5` | Library / Directories / Playlists / Now playing / Settings |
 | `ctrl+r` | Rescan the library |
 | `R` | Retry the audio device after a loss |
-| `h` | Help, the key list, generated from the bindings themselves |
+| `h` / `?` | Help, the key list of the current view, generated from the bindings themselves |
 | `m` | Settings menu |
-| `esc` | Close the open overlay or cancel a search |
-| `q` / `ctrl+c` | Close the open overlay, or quit when none is open |
+| `esc` | Close the open overlay, or clear the filter while typing it |
+| `q` / `ctrl+c` | Close the open overlay, or quit when none is open. While typing a filter, `ctrl+c` clears it and `q` is text |
 
-*The queue pane is a mode of its own. While it's open the arrows move its cursor rather than the browser's, `enter` plays the entry under it, and `d` `C` `K` `J` edit it. Transport, play/pause, seek, volume, mute, next/previous, shuffle, repeat, there too, as does rescan (`ctrl-r`). View switching (`tab`, `1`/`2`/`3`) doesn't; close the pane with `esc` or `v` first.*
+`d` `C` `K` `J` act only in the Playlists view, where the entry they act on is visible.
 
 `h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help, a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
 
@@ -337,7 +343,7 @@ kurono/
 │   ├── queue.c             playback queue: order, shuffle, repeat
 │   ├── audio/              engine, ring buffer, decoder, sink, test sources
 │   ├── library/            sqlite index, filesystem scan, queries
-│   └── ui/                 tui, theme, keymap, browser, queue view, status bar
+│   └── ui/                 tui, theme, keymap, layout, browser, queue view
 ├── include/                mirrors src/, one header per source file
 ├── tools/                  standalone test binaries and harnesses
 ├── vendor/                 single-header third-party, never edited
@@ -388,4 +394,4 @@ build.
 
 ## Status
 
-v1 is complete and what's described above works. **v2 is underway**, cover art, a spectrum visualiser, playlists, a config file, an EQ, and moving the scan to the background.
+v2.0.0 reorganises the screen into the five views above. **v2 continues** with cover art, a spectrum visualiser, saved playlists, a config file, an EQ, and moving the scan to the background.
