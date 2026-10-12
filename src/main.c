@@ -2687,21 +2687,12 @@ player_queue_confirm(Player * p)
 } /* player_queue_confirm */
 
 /*
- * player_locate: move the browser to the library track with this id, in
- * whichever view is showing. Takes the Player, the id and a name for the
- * message, returns nothing.
+ * player_locate: move the Directories browser to the library track with
+ * this id. Takes the Player, the id and a name for the message, returns
+ * nothing. Library has its own arm, library_jump.
  *
- * One caller since search became a filter: ACT_JUMP_TO_PLAYING. Kept a
- * function because the part worth getting right -- "where does this
- * track sit in this view" -- belongs to browser.c either way. In Library
- * it reports "cannot reach" until phase 6 (plan G4).
- *
- * The keys come from browser.c and not from here. Until now this
- * function took strrchr of the path and passed the halves to
- * browser_goto, which was right when a key was a path and silently wrong
- * the moment it stopped being one: a library key is a kind byte and a
- * payload, so every comparison missed by one byte and the jump reported
- * "cannot reach" for a track that was on screen.
+ * The keys come from browser.c and not from here: a library key is a
+ * kind byte and a payload, not a path.
  */
 static void
 player_locate(Player * p, int64_t track_id, const char * label)
@@ -2731,9 +2722,7 @@ player_locate(Player * p, int64_t track_id, const char * label)
   db_track_row_free_fields(&t);
 
   if (rc != 0) {
-    /* The track exists but has no row in this view -- no artist tag in
-       the Artists view, say. Saying which view is what makes the next
-       keystroke obvious: the same track is reachable one view over. */
+    /* Malformed row only: a directory-source track always has a parent. */
     player_report(p, "%s is not in this view", label);
     return;
   }
@@ -2748,6 +2737,45 @@ player_locate(Player * p, int64_t track_id, const char * label)
   }
   tui_mark_dirty();
 } /* player_locate */
+
+/*
+ * library_jump: ACT_JUMP_TO_PLAYING in Library (design VIII, #11). Takes
+ * the Player, returns nothing. Moves focus to the track list and the
+ * cursor to the playing track within the current listing, using the row
+ * key only; when the facet or filter excludes it, reports and moves
+ * nothing, never rerooting to All.
+ */
+static void
+library_jump(Player * p)
+{
+  DbTrackRow t;
+  memset(&t, 0, sizeof t);
+  if (p->lib_main == NULL || p->db == NULL || p->now_id <= 0
+      || db_query_track_by_id(p->db, p->now_id, &t) != 1) {
+    player_report(p, "no library entry for %s", p->now_name);
+    return;
+  }
+
+  char * parent = NULL;
+  char * row    = NULL;
+  int    rc     = browser_library_locate(&p->brsrc[BROWSER_SRC_LIBRARY], &t,
+                                         &parent, &row);
+  db_track_row_free_fields(&t);
+  if (rc != 0) {
+    player_report(p, "no library entry for %s", p->now_name);
+    return;
+  }
+  free(parent);
+
+  rc = browser_goto(p->lib_main, browser_cwd(p->lib_main), row);
+  free(row);
+  if (rc != 0) {
+    player_report(p, "not in the current listing: %s", p->now_name);
+    return;
+  }
+  ui_focus_set(ROLE_MAIN);
+  tui_mark_dirty();
+} /* library_jump */
 
 /*
  * player_jump_to_playing: ACT_JUMP_TO_PLAYING -- move the current view's
@@ -2785,6 +2813,10 @@ player_jump_to_playing(Player * p)
     return;
   }
 
+  if (ui_view() == VIEW_LIBRARY) {
+    library_jump(p);
+    return;
+  }
   player_locate(p, p->now_id, p->now_name);
 } /* player_jump_to_playing */
 

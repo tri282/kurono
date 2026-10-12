@@ -163,9 +163,10 @@ char * browser_library_list_key(const char * facet_row_key, const char * query);
  * would put the encoding under two owners, which is the same leak
  * BrowserSource.parent_key exists to prevent.
  *
- * Returns -1 for a track with no position in this view -- an untagged
- * track in the Artists view has none, and that is an answer rather than
- * an error. The caller reports it and does not move.
+ * The library source always answers with the unfiltered All listing; the
+ * directory source with the track's directory. -1 means a malformed row.
+ * A caller that wants the current listing uses the row key only (design
+ * VIII).
  */
 int browser_library_locate(const BrowserSource * src, const DbTrackRow * track,
                            char ** out_parent, char ** out_row);

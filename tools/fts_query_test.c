@@ -2268,6 +2268,108 @@ test_list_grouping(void)
 } /* test_list_grouping */
 
 /*
+ * locate_check: F9 for one track. Takes the database, a source, the
+ * track's path and a label. Locates the track and asserts the locate
+ * succeeds and that loading the returned parent lists the returned row
+ * key. Returns an owned copy of the parent key (or NULL) so the
+ * directory case can compare it.
+ */
+static char *
+locate_check(Db * db, const BrowserSource * src, const char * path, const char * label)
+{
+  DbTrackRow t;
+  BrowserRow * rows = NULL;
+  size_t       n = 0;
+  char *       parent = NULL;
+  char *       row = NULL;
+  int64_t      id = 0;
+  int          found = 0;
+
+  memset(&t, 0, sizeof t);
+  {
+    DbTrackRow * in = NULL;
+    size_t       ni = 0;
+    char         dir[256];
+    const char * slash = strrchr(path, '/');
+
+    snprintf(dir, sizeof dir, "%.*s", (int) (slash - path), path);
+    if (db_query_tracks_in_dir(db, dir, &in, &ni) == 0) {
+      for (size_t i = 0; i < ni; i++) {
+        if (in[i].path != NULL && strcmp(in[i].path, path) == 0) {
+          id = in[i].id;
+        }
+      }
+    }
+    db_track_rows_free(in, ni);
+  }
+  CHECK(id > 0, "F9 %s: no track at %s", label, path);
+  CHECK(id > 0 && db_query_track_by_id(db, id, &t) == 1, "F9 %s: row not found", label);
+  CHECK(browser_library_locate(src, &t, &parent, &row) == 0, "F9 %s: locate returned -1", label);
+  db_track_row_free_fields(&t);
+  if (parent == NULL || row == NULL) {
+    free(parent);
+    free(row);
+    return NULL;
+  }
+  CHECK(src->load(src->self, BROWSER_COL_MAIN, parent, &rows, &n) == 0, "F9 %s: parent load failed", label);
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(rows[i].key, row) == 0) {
+      found = 1;
+    }
+  }
+  CHECK(found, "F9 %s: row key not in the returned parent's listing", label);
+  src->free_rows(src->self, rows, n);
+  free(row);
+  return parent;
+} /* locate_check */
+
+/*
+ * test_locate_untagged: F9 (#11). The untagged row and a tagged row both
+ * locate in the library source (into the unfiltered All listing), and in
+ * the directory source the parent is the key the root listing gives the
+ * track's directory.
+ */
+static void
+test_locate_untagged(void)
+{
+  Db *          gdb = group_fixture_db();
+  const char *  roots[] = { "/music" };
+  BrowserSource lsrc;
+  BrowserSource dsrc;
+  char *        parent;
+
+  if (gdb == NULL) {
+    CHECK(0, "group fixture unavailable for F9");
+    return;
+  }
+  browser_library_source(&lsrc, BROWSER_SRC_LIBRARY, gdb, roots, 1);
+  browser_library_source(&dsrc, BROWSER_SRC_DIRECTORY, gdb, roots, 1);
+
+  free(locate_check(gdb, &lsrc, "/music/untagged/x.flac", "library untagged"));
+  free(locate_check(gdb, &lsrc, "/music/beta/s1.flac", "library tagged"));
+
+  parent = locate_check(gdb, &dsrc, "/music/untagged/x.flac", "directory untagged");
+  if (parent != NULL) {
+    char *       rk = browser_library_root(BROWSER_SRC_DIRECTORY, roots, 1);
+    BrowserRow * rows = NULL;
+    size_t       n = 0;
+    int          found = 0;
+
+    CHECK(rk != NULL && dsrc.load(dsrc.self, BROWSER_COL_MAIN, rk, &rows, &n) == 0,
+          "F9: directory root load failed");
+    for (size_t i = 0; i < n; i++) {
+      if (strcmp(rows[i].key, parent) == 0) {
+        found = 1;
+      }
+    }
+    CHECK(found, "F9: the directory parent is not a row of the root listing");
+    dsrc.free_rows(dsrc.self, rows, n);
+    free(rk);
+    free(parent);
+  }
+} /* test_locate_untagged */
+
+/*
  * group_fixture_cleanup: release the group fixture. Called once from main.
  */
 static void
@@ -2311,6 +2413,7 @@ int main(int argc, char ** argv)
     test_list_path_tiebreak();
     test_list_index();
     test_list_grouping();
+    test_locate_untagged();
     test_fts_prefix_index();
     test_schema_migrate();
     search_fixture_cleanup();

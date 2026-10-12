@@ -1026,14 +1026,9 @@ lib_parent_key(void * self, const char * key)
  * applied in the other direction.
  *
  * The row key is the same in both views: a track is addressed by
- * id. The parent differs -- the same track is inside a directory and
- * inside its artist's album, two different rows in two different
- * listings.
- *
- * A track whose tags do not place it in the current view -- no artist in
- * the Artists view, no album anywhere -- returns -1. That is "this track
- * has no position here", not a failure: the caller reports it and stays
- * where it is.
+ * id. The parent differs: the track's directory for the directory
+ * source, the unfiltered All listing for the library source, where every
+ * track has a row, tagged or not (design VIII, #11).
  */
 int
 browser_library_locate(const BrowserSource * src, const DbTrackRow * t,
@@ -1063,10 +1058,7 @@ browser_library_locate(const BrowserSource * src, const DbTrackRow * t,
       break;
 
     case BROWSER_SRC_LIBRARY:
-      if (t->artist == NULL || t->album == NULL) {
-        return -1;
-      }
-      parent = lib_key(LIB_KEY_ALBUM, t->artist, t->album);
+      parent = browser_library_list_key(NULL, "");
       break;
 
     default:
