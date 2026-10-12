@@ -777,7 +777,7 @@ draw_statusbar(const TuiModel * m)
                 style_fg(&g_theme, slot), style_bg(&g_theme, slot));
   }
 
-  char pos[16], dur[16];
+  char pos[24], dur[24];   /* fmt_clock's h:mm:ss of an int64 ms needs up to 20 bytes */
   fmt_clock(m->playing || m->pos_ms > 0 ? m->pos_ms : -1, pos, sizeof pos);
   fmt_clock(m->dur_ms > 0 ? m->dur_ms : -1, dur, sizeof dur);
 

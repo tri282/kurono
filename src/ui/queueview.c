@@ -68,7 +68,7 @@ row_text(size_t pos, const QueueEntry * e, Db * db)
     DbTrackRow t;
     memset(&t, 0, sizeof t);
     if (db_query_track_by_id(db, e->track_id, &t) == 1) {
-      char dur[16];
+      char dur[24];   /* fmt_ms's m:ss of an int64 ms needs up to 20 bytes */
       fmt_ms(t.has_duration_ms ? t.duration_ms : 0, dur, sizeof dur);
       /* A missing title falls back to the path's basename rather than to
          "(unknown)": an untagged file is still identifiable by its
