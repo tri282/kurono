@@ -3539,8 +3539,8 @@ player_view_settings_build(Player * p)
   }
 
   for (size_t i = 0; i < p->cfg.nroots; i++) {
-    snprintf(buf, sizeof buf, "%-13s %s%s", "music dir", p->cfg.roots[i].path,
-             p->cfg.roots[i].ok ? "" : " (missing)");
+    snprintf(buf, sizeof buf, "%-13s %s%s", "music dir",
+             p->cfg.roots[i].ok ? "" : "(missing) ", p->cfg.roots[i].path);
     rows[n++].name = strdup(buf);
   }
 
