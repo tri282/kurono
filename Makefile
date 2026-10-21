@@ -88,9 +88,11 @@ LDLIBS = $(PKG_LIBS) -lpthread -lm -ldl
 # with no caller in the linked binary yet, the same way queue.c and
 # theme.c were before theirs existed -- so it is not silently unanalysed
 # by `make analyze` and so the sanitiser builds compile it.
+# src/playlist.c: the m3u8 format and playlist directory I/O (v2.1.0 design
+# P2); in SRCS before its first caller, like queue.c.
 SRCS = src/main.c src/config.c src/event.c src/audio/ring.c src/audio/sink.c \
        src/audio/trace.c src/audio/decoder.c src/audio/engine.c \
-       src/audio/testsrc.c src/queue.c \
+       src/audio/testsrc.c src/queue.c src/playlist.c \
        src/ui/theme.c src/ui/keymap.c src/ui/tui.c src/ui/browser.c \
        src/ui/queueview.c \
        src/library/db.c src/library/scan.c src/library/query.c
@@ -108,7 +110,7 @@ OBJS_TSAN    = $(SRCS:src/%.c=build/tsan/%.o)
 
 .PHONY: all release debug asan tsan analyze check check-layering check-flush \
         check-theme check-deps ring-stress queue-test keymap-test \
-        testsrc-test fts-query-test nullsink-test gapless-test install uninstall clean
+        testsrc-test fts-query-test nullsink-test gapless-test playlist-test install uninstall clean
 
 all: kurono
 
@@ -301,6 +303,14 @@ build/default/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
+# Pure, libc only (design P2, VI.1): name validation, path resolution,
+# m3u8 parsing, dedupe and the atomic write, in a scratch directory under
+# build/ that the test removes itself.
+playlist-test: tools/playlist_test
+
+tools/playlist_test: build/default/tools/playlist_test.o build/default/playlist.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
 # Pure, dependency-free (DESIGN.md XII.2 testable tier): no PKGS, no
 # check-deps, no terminal. vendor/termbox2.h is included by ui/keymap.h
 # and ui/theme.h for its declarations only -- TB_IMPL is defined nowhere
@@ -371,7 +381,8 @@ uninstall:
 clean:
 	rm -rf build kurono kurono-asan kurono-tsan tools/ring_stress \
 	       tools/queue_test tools/keymap_test tools/testsrc_test \
-	       tools/fts_query_test tools/nullsink_test tools/gapless_test
+	       tools/fts_query_test tools/nullsink_test tools/gapless_test \
+	       tools/playlist_test
 
 # The .d files written by DEPFLAGS above. A wildcard rather than a list
 # derived from SRCS: the tools' objects live under build/<mode>/tools/
