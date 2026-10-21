@@ -141,6 +141,7 @@ static const Binding g_bindings_list[] = {
 static const Binding g_bindings_browse[] = {
   { TB_KEY_ENTER, 0,  0, ACT_PLAY_NOW,   0 },
   { 0, 'a',  0, ACT_ENQUEUE,          0 },
+  { 0, 't',  0, ACT_PLAYLIST_ADD,     0 },
 };
 
 /* KEYCTX_LIBRARY: Library-only keys (design IX.1). */
@@ -155,6 +156,10 @@ static const Binding g_bindings_library[] = {
  *
  * K and J rather than shift+arrow for the moves: termbox2 v2.5.0 sets
  * TB_MOD_SHIFT only on TB_KEY_ARROW_*, and those four are already seek.
+ *
+ * `a`, `w`, `t` act on the selection by focus; Enter and `d` mean
+ * load/delete on the sources column through keymap_sources_action
+ * (design P4, P26).
  */
 static const Binding g_bindings_tracklist[] = {
   { TB_KEY_ENTER,      0, 0, ACT_CONFIRM,          0 },
@@ -162,6 +167,9 @@ static const Binding g_bindings_tracklist[] = {
   { 0, 'C',  0, ACT_CLEAR_QUEUE,      0 },
   { 0, 'K',  0, ACT_MOVE_UP,          0 },
   { 0, 'J',  0, ACT_MOVE_DOWN,        0 },
+  { 0, 'a',  0, ACT_ENQUEUE,          0 },
+  { 0, 'w',  0, ACT_PLAYLIST_SAVE,    0 },
+  { 0, 't',  0, ACT_PLAYLIST_ADD,     0 },
 };
 
 /*
@@ -210,7 +218,8 @@ static const Binding g_bindings_menu[] = {
  * ACT_NONE, and tui.c reads ACT_NONE with a non-zero ev->ch as "insert
  * this codepoint into the filter". That is what keeps text entry inside
  * the binding table instead of bypassing it. Esc cancels rather than
- * pops; tui.c consumes ACT_QUIT here (decide D16).
+ * pops; tui.c consumes ACT_QUIT here (decide D16). Tab cycles names in a
+ * playlist prompt; the Library filter swallows it (design P28).
  */
 static const Binding g_bindings_filter[] = {
   { TB_KEY_ESC,        0, 0, ACT_SEARCH_CANCEL, 0 },
@@ -218,6 +227,7 @@ static const Binding g_bindings_filter[] = {
   { TB_KEY_BACKSPACE2, 0, 0, ACT_REMOVE,        0 },
   { TB_KEY_ARROW_UP,   0, 0, ACT_CURSOR_UP,     0 },
   { TB_KEY_ARROW_DOWN, 0, 0, ACT_CURSOR_DOWN,   0 },
+  { TB_KEY_TAB,        0, 0, ACT_PROMPT_CYCLE,  0 },
   /* Ctrl-C is bound here for the same reason it is bound in every other
      table: it is the one key that must never be swallowed as text. Every
      other unbound key in this context is literal input, and without this
@@ -303,6 +313,7 @@ static const char * const g_action_name[] = {
   [ACT_CONFIRM]          = "confirm",
   [ACT_QUEUE_TOGGLE]     = "queue_toggle",
   [ACT_FACET_TOGGLE]     = "facet_toggle",
+  [ACT_PROMPT_CYCLE]     = "prompt_cycle",
 };
 
 _Static_assert(sizeof(g_action_name) / sizeof(g_action_name[0]) == ACT_COUNT,
@@ -482,6 +493,27 @@ keymap_filter_consumes(Action a)
 {
   return a != ACT_CURSOR_UP && a != ACT_CURSOR_DOWN;
 } /* keymap_filter_consumes */
+
+/* keymap_sources_action: see include/ui/keymap.h. */
+Action
+keymap_sources_action(Action a)
+{
+  switch (a) {
+    case ACT_CONFIRM:   return ACT_PLAYLIST_LOAD;
+    case ACT_REMOVE:    return ACT_PLAYLIST_DELETE;
+    case ACT_MOVE_UP:
+    case ACT_MOVE_DOWN: return ACT_NONE;
+    default:            return a;   /* ENQUEUE and PLAYLIST_ADD pass through (decide V6) */
+  }
+} /* keymap_sources_action */
+
+/* keymap_confirm_accepts: see include/ui/keymap.h. */
+int
+keymap_confirm_accepts(Action a, const struct tb_event * ev)
+{
+  return a == ACT_NONE && ev != NULL && ev->type == TB_EVENT_KEY && ev->key == 0
+         && ev->mod == 0 && (ev->ch == 'y' || ev->ch == 'Y');   /* U10 */
+} /* keymap_confirm_accepts */
 
 /*
  * Takes an Action, returns its stable config-file name, or "invalid" for

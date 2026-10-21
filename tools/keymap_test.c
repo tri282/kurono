@@ -318,6 +318,21 @@ test_mode_tables(void)
     CHECK(resolve_ctx(closable[i], &ev, &arg) == ACT_QUIT,
           "context %d has no ctrl-c binding", (int) closable[i]);
   }
+
+  /* K-f: Tab cycles prompt names while editing and is still view_next
+     everywhere else; the filter hands nothing on for it (design P28). */
+  ev = synth_event(TB_KEY_TAB, 0, 0);
+  for (int v = 0; v < (int) VIEW_COUNT; v++) {
+    KeyCtx chain[KEYCTX_CHAIN_MAX];
+    size_t n = keymap_chain(MODE_NORMAL, 1, (UiView) v, chain);
+    CHECK(keymap_resolve(chain, n, &ev, &arg) == ACT_PROMPT_CYCLE,
+          "view %d: Tab while editing must be prompt_cycle", v);
+    n = keymap_chain(MODE_NORMAL, 0, (UiView) v, chain);
+    CHECK(keymap_resolve(chain, n, &ev, &arg) == ACT_VIEW_NEXT,
+          "view %d: Tab outside editing must stay view_next", v);
+  }
+  CHECK(keymap_filter_consumes(ACT_PROMPT_CYCLE) == 1,
+        "filter editing must consume prompt_cycle");
 } /* test_mode_tables */
 
 /*
@@ -383,23 +398,33 @@ test_action_names(void)
  * test_reserved_actions_present: the post-v1 block is load-bearing
  * plumbing (phase-10-theme-keymap.md II) and a future reader must not
  * delete it as dead code. Naming the members here makes the deletion a
- * build failure. Takes nothing, returns nothing.
+ * build failure. PLAYLIST_SAVE/ADD are bound since v2.1.0 and only
+ * range-checked; the rest must stay row-less. Takes nothing, returns
+ * nothing.
  */
 static void
 test_reserved_actions_present(void)
 {
   Action reserved[] = {
     ACT_TOGGLE_COVER, ACT_TOGGLE_VIZ, ACT_CYCLE_VIZ_MODE,
-    ACT_PLAYLIST_SAVE, ACT_PLAYLIST_ADD, ACT_PLAYLIST_LOAD,
-    ACT_PLAYLIST_DELETE, ACT_EQ_TOGGLE, ACT_EQ_SET_BAND, ACT_EQ_LOAD_PRESET,
+    ACT_PLAYLIST_LOAD, ACT_PLAYLIST_DELETE,
+    ACT_EQ_TOGGLE, ACT_EQ_SET_BAND, ACT_EQ_LOAD_PRESET,
   };
+  /* Bound since v2.1.0, so out of the unbound list but still in range. */
+  const Action bound[] = { ACT_PLAYLIST_SAVE, ACT_PLAYLIST_ADD };
+  for (size_t i = 0; i < sizeof bound / sizeof bound[0]; i++) {
+    CHECK(bound[i] > ACT_NONE && bound[i] < ACT_COUNT,
+          "bound action %zu is out of range", i);
+  }
   for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++) {
     CHECK(reserved[i] > ACT_NONE && reserved[i] < ACT_COUNT,
           "reserved action %zu is out of range", i);
   }
 
-  /* No reserved action may be bound in v1 -- binding one would dispatch
-     into a case nothing implements. */
+  /* The post-v1 block stays load-bearing. PLAYLIST_LOAD/DELETE are
+     implemented and deliberately row-less, reached through
+     keymap_sources_action (design P4); a row binding them is a
+     regression. */
   for (int c = 0; c < KEYCTX_COUNT; c++) {
     size_t n = 0;
     const Binding * tab = keymap_table((KeyCtx) c, &n);
@@ -1113,6 +1138,14 @@ test_view_coverage(void)
     { VIEW_PLAYLISTS,   0,                  'J', ACT_MOVE_DOWN },
     { VIEW_PLAYLISTS,   TB_KEY_ENTER,       0,   ACT_CONFIRM   },
     { VIEW_PLAYLISTS,   TB_KEY_ARROW_UP,    0,   ACT_CURSOR_UP },
+    /* v2.1.0 playlist rows (design II.1). */
+    { VIEW_PLAYLISTS,   0,                  'w', ACT_PLAYLIST_SAVE },
+    { VIEW_PLAYLISTS,   0,                  'a', ACT_ENQUEUE   },
+    { VIEW_PLAYLISTS,   0,                  't', ACT_PLAYLIST_ADD },
+    { VIEW_LIBRARY,     0,                  't', ACT_PLAYLIST_ADD },
+    { VIEW_DIRECTORIES, 0,                  't', ACT_PLAYLIST_ADD },
+    { VIEW_NOW_PLAYING, 0,                  't', ACT_NONE      },
+    { VIEW_SETTINGS,    0,                  't', ACT_NONE      },
   };
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
     struct tb_event ev  = synth_event(cases[i].key, cases[i].ch, 0);
@@ -1168,6 +1201,7 @@ test_filter_entry(void)
     { TB_KEY_BACKSPACE2, ACT_REMOVE        },
     { TB_KEY_ARROW_UP,   ACT_CURSOR_UP     },
     { TB_KEY_ARROW_DOWN, ACT_CURSOR_DOWN   },
+    { TB_KEY_TAB,        ACT_PROMPT_CYCLE  },
     { TB_KEY_CTRL_C,     ACT_QUIT          },
   };
   for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
@@ -1187,6 +1221,64 @@ test_filter_entry(void)
           (a == ACT_QUIT) ? ": ctrl-c would end the run (decide D16)" : "");
   }
 } /* test_filter_entry */
+
+/*
+ * test_sources_action: K-c. The SOURCES-focus translation maps Enter, d,
+ * K and J and passes every other action through, ENQUEUE and
+ * PLAYLIST_ADD included (decide V6). Takes nothing, returns nothing.
+ */
+static void
+test_sources_action(void)
+{
+  struct { Action in; Action want; } cases[] = {
+    { ACT_CONFIRM,       ACT_PLAYLIST_LOAD   },
+    { ACT_REMOVE,        ACT_PLAYLIST_DELETE },
+    { ACT_MOVE_UP,       ACT_NONE            },
+    { ACT_MOVE_DOWN,     ACT_NONE            },
+    { ACT_ENQUEUE,       ACT_ENQUEUE         },
+    { ACT_PLAYLIST_ADD,  ACT_PLAYLIST_ADD    },
+    { ACT_CURSOR_UP,     ACT_CURSOR_UP       },
+    { ACT_CLEAR_QUEUE,   ACT_CLEAR_QUEUE     },
+    { ACT_PLAYLIST_SAVE, ACT_PLAYLIST_SAVE   },
+    { ACT_COL_LEFT,      ACT_COL_LEFT        },
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    Action got = keymap_sources_action(cases[i].in);
+    CHECK(got == cases[i].want, "sources: %s gave %s, expected %s",
+          action_name(cases[i].in), action_name(got),
+          action_name(cases[i].want));
+  }
+} /* test_sources_action */
+
+/*
+ * test_confirm_accepts: K-d. Each event is resolved through the FILTER
+ * chain, as a y/N prompt sees it; only an unmodified y or Y answers yes
+ * [user 2026-10-21, U10]. Takes nothing, returns nothing.
+ */
+static void
+test_confirm_accepts(void)
+{
+  struct { uint16_t key; uint32_t ch; uint8_t mod; int want; const char * what; } cases[] = {
+    { 0,                'y', 0,           1, "y"         },
+    { 0,                'Y', 0,           1, "Y"         },
+    { 0,                'n', 0,           0, "n"         },
+    { 0,                'N', 0,           0, "N"         },
+    { 0,                'y', TB_MOD_ALT,  0, "alt-y"     },
+    { TB_KEY_ENTER,     0,   0,           0, "Enter"     },
+    { TB_KEY_ESC,       0,   0,           0, "Esc"       },
+    { TB_KEY_CTRL_C,    0,   0,           0, "ctrl-c"    },
+    { TB_KEY_BACKSPACE2, 0,  0,           0, "Backspace" },
+    { 0,                ' ', 0,           0, "space"     },
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    struct tb_event ev  = synth_event(cases[i].key, cases[i].ch, cases[i].mod);
+    int32_t         arg = -1;
+    Action          a   = resolve_ctx(KEYCTX_FILTER, &ev, &arg);
+    CHECK(keymap_confirm_accepts(a, &ev) == cases[i].want,
+          "confirm: %s must %s", cases[i].what,
+          cases[i].want ? "answer yes" : "cancel");
+  }
+} /* test_confirm_accepts */
 
 /*
  * main: runs every check, returns 0 when all passed and 1 otherwise.
@@ -1219,6 +1311,8 @@ main(void)
   test_global_reach();
   test_view_coverage();
   test_filter_entry();
+  test_sources_action();
+  test_confirm_accepts();
 
   size_t n = 0;
   (void) keymap_table(KEYCTX_GLOBAL, &n);

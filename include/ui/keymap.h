@@ -65,6 +65,9 @@ typedef enum {
   ACT_QUEUE_TOGGLE,
   /* v2.0.0: Library's `f`, shows or hides the artist column (design III.1). */
   ACT_FACET_TOGGLE,
+  /* v2.1.0: Tab in an open playlist-name prompt shows the next saved
+     name (design P28, P31). */
+  ACT_PROMPT_CYCLE,
   ACT_COUNT
 } Action;
 
@@ -148,10 +151,29 @@ const char * action_name(Action a);
  * Takes a resolved action; returns 0 for the two it hands on to
  * action_dispatch (cursor up/down move the edited region), 1 for every
  * other, ACT_QUIT included: with no mode to pop, a dispatched ACT_QUIT
- * would end the run on the first ctrl-c (decide D16). Pure, so
- * keymap_test asserts it.
+ * would end the run on the first ctrl-c (decide D16), and
+ * ACT_PROMPT_CYCLE included (design P28). Pure, so * keymap_test asserts it.
  */
 int keymap_filter_consumes(Action a);
+
+/*
+ * keymap_sources_action: what `a` means when the Playlists SOURCES
+ * column has focus. Takes a resolved action; returns ACT_PLAYLIST_LOAD
+ * for ACT_CONFIRM, ACT_PLAYLIST_DELETE for ACT_REMOVE, ACT_NONE for
+ * ACT_MOVE_UP/DOWN, and `a` for every other (ACT_ENQUEUE and
+ * ACT_PLAYLIST_ADD included: on a playlist row they act on the
+ * playlist's entries [decide V6]).
+ * Pure, so keymap_test asserts it.
+ */
+Action keymap_sources_action(Action a);
+
+/*
+ * keymap_confirm_accepts: whether a key answers a (y/N) prompt with yes.
+ * Takes the action the FILTER chain resolved and the event; returns 1
+ * only for an unbound, unmodified `y` or `Y` [user 2026-10-21, U10],
+ * 0 for everything else. Pure.
+ */
+int keymap_confirm_accepts(Action a, const struct tb_event * ev);
 
 /*
  * Renders one Binding's key as text for the help overlay -- `up` for an
