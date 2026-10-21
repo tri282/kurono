@@ -374,9 +374,30 @@ trim_cap_open(Decoder * d, const AVStream * st)
 } /* trim_cap_open */
 
 /*
+ * open_local: avformat_open_input restricted to the file protocol, which
+ * also binds every resource a probed demuxer (hls, dash) opens on its own,
+ * so a local file never reaches the network. ffmpeg's file protocol already
+ * defaults to "file,crypto,data"; stating it here keeps the guarantee from
+ * resting on that default (v2.1.0 phase 2). Takes the
+ * context out-pointer and the path; returns avformat_open_input's result.
+ */
+static int
+open_local(AVFormatContext ** ctx, const char * path)
+{
+  AVDictionary * opts = NULL;
+  int ret = av_dict_set(&opts, "protocol_whitelist", "file", 0);
+
+  if (ret >= 0) {
+    ret = avformat_open_input(ctx, path, NULL, &opts);
+  }
+  av_dict_free(&opts);
+  return ret;
+} /* open_local */
+
+/*
  * decoder_open_impl: AudioSource.open. Closes any previously open file
  * first (this Decoder is reused across every track, DESIGN.md V.1),
- * then avformat_open_input -> avformat_find_stream_info ->
+ * then open_local -> avformat_find_stream_info ->
  * av_find_best_stream -> avcodec_alloc_context3 ->
  * avcodec_parameters_to_context -> avcodec_open2, builds a SwrContext to
  * interleaved f32 stereo at the stored target rate
@@ -404,7 +425,7 @@ decoder_open_impl(void * self, const char * path, StreamInfo * out_info)
 
   decoder_close_file(d);
 
-  int ret = avformat_open_input(&d->fmt_ctx, path, NULL, NULL);
+  int ret = open_local(&d->fmt_ctx, path);
   if (ret < 0) {
     d->fmt_ctx = NULL; /* avformat_open_input frees and nulls *ps itself on failure,
                            but the assignment is kept explicit as the documented
@@ -702,7 +723,7 @@ decoder_probe(const char * path, StreamInfo * out_info)
   av_log_set_level(AV_LOG_QUIET);
 
   AVFormatContext * fmt_ctx = NULL;
-  int ret = avformat_open_input(&fmt_ctx, path, NULL, NULL);
+  int ret = open_local(&fmt_ctx, path);
   if (ret < 0) {
     return ret;
   }
