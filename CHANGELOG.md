@@ -20,6 +20,8 @@ Notable changes to `kurono`. Format based on
   to a playlist, from Library, Directories or Playlists: the prompt offers
   the last playlist used, `tab` cycles the existing names, and a new name
   creates one. `d` on a playlist deletes it after `(y/N)`.
+- The queue and its position are restored at startup, from
+  `$XDG_STATE_HOME/kurono/queue.m3u8`.
 
 ### Changed
 
@@ -263,6 +265,8 @@ through those.
 - Changing a playlist rewrites it in kurono's form: sorted, deduplicated,
   comments and `#EXTINF` lines from other programs dropped, entries relative.
   A playlist with lines kurono cannot read, or a symlinked one, is read-only.
+- The queue is saved on exit, so a crash loses that session's queue
+  changes; shuffle and repeat are not restored.
 
 [Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v2.0.0...main
 [2.0.0]: https://gitlab.com/tri282/kurono/-/compare/v1.3.1...v2.0.0

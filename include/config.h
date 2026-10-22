@@ -29,6 +29,7 @@ typedef struct {
                          /*   against the cwd, v2.1.0 P15), else          */
                          /*   roots[0]/playlists                          */
   char * cache_dir;      /* $XDG_CACHE_HOME/kurono, else ~/.cache/kurono  */
+  char * state_dir;      /* $XDG_STATE_HOME/kurono, else ~/.local/state/kurono */
   char * db_path;        /* cache_dir/library.db                          */
   char * config_path;    /* KURONO_CONFIG -- resolved, unused in v1       */
   int    no_scan;        /* KURONO_NO_SCAN set to anything                */
@@ -36,7 +37,8 @@ typedef struct {
 
 /*
  * config_init: resolve every runtime path from the environment into
- * *c and create the cache directory (mode 0700). Returns 0 on success,
+ * *c and create the cache directory (mode 0700), and best-effort the
+ * state directory (mode 0700). Returns 0 on success,
  * -1 on allocation failure -- on -1, *c has already been passed through
  * config_free internally and is safe to pass to config_free again (a
  * no-op) or to discard. Cache-directory creation failure is not

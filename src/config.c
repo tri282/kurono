@@ -327,6 +327,22 @@ resolve_cache_dir(Config * c)
 } /* resolve_cache_dir */
 
 /*
+ * resolve_state_dir: $XDG_STATE_HOME/kurono, else $HOME/.local/state/kurono.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int
+resolve_state_dir(Config * c)
+{
+  char * base = xdg_or_home("XDG_STATE_HOME", "/.local/state");
+  if (base == NULL) {
+    return -1;
+  }
+  c->state_dir = path_join(base, "/kurono");
+  free(base);
+  return c->state_dir != NULL ? 0 : -1;
+} /* resolve_state_dir */
+
+/*
  * resolve_db_path: <cache_dir>/library.db. Must run after
  * resolve_cache_dir. Returns 0 on success, -1 on allocation failure.
  */
@@ -370,7 +386,9 @@ resolve_config_path(Config * c)
  * populated Config or a zeroed one -- never a half-built struct. Cache
  * directory creation failure is unconditionally fatal and calls
  * kurono_die directly (DESIGN.md XI.4) -- there is no recoverable
- * degraded mode, so it is not folded into the -1 return.
+ * degraded mode, so it is not folded into the -1 return. The state
+ * directory is created best-effort (design P22, II.7): a failure is not
+ * reported here, the exit save reports it.
  */
 int
 config_init(Config * c)
@@ -389,6 +407,9 @@ config_init(Config * c)
   if (resolve_cache_dir(c) != 0) {
     goto fail;
   }
+  if (resolve_state_dir(c) != 0) {
+    goto fail;
+  }
   if (resolve_db_path(c) != 0) {
     goto fail;
   }
@@ -400,6 +421,9 @@ config_init(Config * c)
   if (mkdir_p(c->cache_dir, 0700) != 0) {
     kurono_die("failed to create cache directory %s: %s", c->cache_dir, strerror(errno));
   }
+
+  /* Best effort: the queue save reports its own failure (design II.7, V15). */
+  (void) mkdir_p(c->state_dir, 0700);
 
   return 0;
 
@@ -440,6 +464,8 @@ config_free(Config * c)
   c->playlist_dir = NULL;
   free(c->cache_dir);
   c->cache_dir = NULL;
+  free(c->state_dir);
+  c->state_dir = NULL;
   free(c->db_path);
   c->db_path = NULL;
   free(c->config_path);

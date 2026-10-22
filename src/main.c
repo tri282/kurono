@@ -620,6 +620,10 @@ typedef struct {
   struct timespec msg_at;
   int  ui;                   /* 1 when this run drives the TUI (phase 11) */
 
+  /* Set by player_queue_restore when the saved queue exists but could not
+     be read; the exit save then leaves that file alone (design P22, V4). */
+  int  queue_restore_failed;
+
   /* The library index. Opened at startup step 3 and closed at teardown
      step 7, so it outlives every other subsystem that might query it. */
   Db * db;
@@ -5224,6 +5228,107 @@ player_repaint(Player * p)
 } /* player_repaint */
 
 /*
+ * player_queue_restore: load $state_dir/queue.m3u8 into the fresh queue
+ * (design P22, II.7): every entry appended with the id its path has in
+ * the freshly scanned index (missing files included), the cursor
+ * clamped and applied to the queue and the pane, stopped. Takes the
+ * Player and a buffer for the one status-bar line to show once the TUI
+ * is up ("" when nothing went wrong); returns nothing. Any failure other
+ * than ENOENT sets queue_restore_failed so the exit save cannot replace
+ * a queue it never read.
+ */
+static void
+player_queue_restore(Player * p, char * msg, size_t msgsz)
+{
+  msg[0] = '\0';
+  if (p->q == NULL) {
+    return;
+  }
+
+  int dfd = playlist_dir_open(p->cfg.state_dir, 0);
+  if (dfd < 0) {
+    if (dfd != -ENOENT) {
+      p->queue_restore_failed = 1;
+      snprintf(msg, msgsz, "could not read the saved queue: %s", strerror(-dfd));
+    }
+    return;
+  }
+
+  Playlist pl;
+  int      rc = playlist_read(dfd, p->cfg.state_dir, "queue", &pl);
+  close(dfd);
+  if (rc < 0) {
+    if (rc != -ENOENT) {
+      p->queue_restore_failed = 1;
+      snprintf(msg, msgsz, "could not read the saved queue: %s", strerror(-rc));
+    }
+    return;
+  }
+
+  /* No player_queue_changed: the player is stopped and nothing is
+     prefetched (decide V18). */
+  for (size_t i = 0; i < pl.n; i++) {
+    (void) queue_append(p->q, db_track_id_by_path(p->db, pl.paths[i]), pl.paths[i]);
+  }
+  size_t count = queue_count(p->q);
+  if (pl.cursor >= 0 && count > 0) {
+    size_t cur = ((size_t) pl.cursor < count) ? (size_t) pl.cursor : count - 1;
+    (void) queue_set_cursor(p->q, cur);
+  }
+  if (pl.bad > 0) {
+    snprintf(msg, msgsz, "queue restore: %zu lines skipped", pl.bad);
+  }
+  playlist_free(&pl);
+} /* player_queue_restore */
+
+/*
+ * player_queue_persist: write the queue to $state_dir/queue.m3u8 in play
+ * order with its cursor, absolute paths, mode 0600 (design P22, decide
+ * V4). Teardown step 9 only, after tb_shutdown, so a failure is one
+ * stderr line. Skipped for a non-TUI run, a missing queue, and when the
+ * startup read failed (do-not-clobber). Takes the Player, returns
+ * nothing.
+ */
+static void
+player_queue_persist(Player * p)
+{
+  if (!p->ui || p->q == NULL) {
+    return;
+  }
+  if (p->queue_restore_failed) {
+    fprintf(stderr, "kurono: queue not saved: %s/queue.m3u8 could not be read at startup\n",
+            p->cfg.state_dir);
+    return;
+  }
+
+  size_t        n     = queue_count(p->q);
+  const char ** paths = malloc((n > 0 ? n : 1) * sizeof *paths);
+  if (paths == NULL) {
+    fprintf(stderr, "kurono: could not save the queue to %s/queue.m3u8: %s\n",
+            p->cfg.state_dir, strerror(ENOMEM));
+    return;
+  }
+  for (size_t i = 0; i < n; i++) {
+    paths[i] = queue_at(p->q, i)->path;
+  }
+
+  /* create = 1: config_init's mkdir_p of the state directory is best-effort (V15). */
+  int    rc      = playlist_dir_open(p->cfg.state_dir, 1);
+  size_t skipped = 0;
+  if (rc >= 0) {
+    int dfd = rc;
+    rc = playlist_write(dfd, p->cfg.state_dir, "queue", paths, n, 0,
+                        n > 0 ? (long) queue_cursor(p->q) : -1, 0600, &skipped);
+    close(dfd);
+  }
+  if (rc < 0) {
+    fprintf(stderr, "kurono: could not save the queue to %s/queue.m3u8: %s\n",
+            p->cfg.state_dir, strerror(-rc));
+  }
+  free(paths);
+} /* player_queue_persist */
+
+/*
  * shutdown_all: DESIGN.md IV.9.b, the normative teardown table, in
  * order, with no merges. ACT_QUIT and SIGINT/SIGTERM/SIGHUP both
  * converge here; there is no other exit path from a running state.
@@ -5353,6 +5458,10 @@ shutdown_all(Player * p)
         the fs source borrows Config's ignore list, and freeing the list
         under a live source is the kind of ordering error this table
         exists to make unwriteable. */
+  /* Design P22: after tb_shutdown (step 8), so stderr is legal, and before
+     queue_destroy and config_free, which it reads. */
+  player_queue_persist(p);
+
   /* Before the browsers only for tidiness: the queue view's rows and the
      view caches borrow nothing from them. */
   queueview_free();
@@ -5928,6 +6037,12 @@ run_tui(void)
     fprintf(stderr, "kurono: could not create the queue -- playback disabled\n");
   }
 
+  /* Design P22: after the scan (so ids resolve) and before the first
+     paint; the anomaly line waits for tui_init (rule: no printf under
+     the TUI). */
+  char restore_msg[96];
+  player_queue_restore(&p, restore_msg, sizeof restore_msg);
+
   /* The views' own state (design V.2, V.4; decide D21, D26). The queue
      view is valid before the first mutation; queueview_rebuild takes a
      NULL queue (decide D27). */
@@ -5935,6 +6050,9 @@ run_tui(void)
   p.info_id   = -1;
   p.np_id     = -1;
   queueview_rebuild(p.q, p.db);
+  if (p.q != NULL && queue_count(p.q) > 0) {
+    queueview_cursor_set(queue_cursor(p.q));
+  }
   player_view_settings_build(&p);
   (void) player_sources_rows_build(&p);   /* Queue row only until the first refresh */
 
@@ -5973,6 +6091,10 @@ run_tui(void)
      browser needs a viewport before the first paint, not only on the
      first resize: without it the widget keeps its minimum of one row. */
   player_view_switch(&p, VIEW_LIBRARY);
+
+  if (restore_msg[0] != '\0') {
+    player_report(&p, "%s", restore_msg);
+  }
 
   /* First paint before the first wait, or the screen stays blank until
      something happens to be dirty. */
