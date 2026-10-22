@@ -184,11 +184,8 @@ tui_compute_layout(void)
       && layout_find(&g_layout, ROLE_SOURCES) == NULL) {
     g_pl_focus = ROLE_QUEUE;
   }
-  /* Input state never outlives the surface it draws on (D17). Cancel
-     dispatches nothing (design II.2). */
-  if (g_layout.too_small) {
-    g_prompt = PROMPT_NONE;
-  }
+  /* An open prompt survives a too-small spell and redraws, text intact,
+     when the window grows back (user ruling 2026-10-22, replacing U6). */
 } /* tui_compute_layout */
 
 /*
@@ -1116,7 +1113,11 @@ dispatch_event(const struct tb_event * ev)
       Action  a    = keymap_resolve(chain, nc, ev, &arg);
 
       if (g_prompt != PROMPT_NONE) {   /* exclusive with g_editing (design II.2) */
-        prompt_key(ev, a);
+        /* Hidden while too small: only a cancel gets through, so nothing
+           is typed or confirmed blind. */
+        if (!g_layout.too_small || a == ACT_QUIT || a == ACT_SEARCH_CANCEL) {
+          prompt_key(ev, a);
+        }
         g_dirty = 1;
         break;
       }
