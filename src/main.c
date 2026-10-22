@@ -11,14 +11,18 @@
 #include "../include/library/db.h"
 #include "../include/library/query.h"
 #include "../include/library/scan.h"
+#include "../include/playlist.h"
 #include "../include/queue.h"
 #include "../include/ui/browser.h"
 #include "../include/ui/keymap.h"
+#include "../include/ui/listgeom.h"
 #include "../include/ui/queueview.h"
 #include "../include/ui/tui.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -27,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -54,6 +59,19 @@ kurono_die(const char * fmt, ...)
 } /* kurono_die */
 
 /*
+ * dir_exists: whether `path` names a directory. Takes the path, returns
+ * 1 or 0. Serves the `(missing)` marker in --paths and Settings (v2.1.0
+ * P15).
+ */
+static int
+dir_exists(const char * path)
+{
+  struct stat st;
+
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+} /* dir_exists */
+
+/*
  * print_paths: implements --paths (plan.md VI.8, phase-3-config.md
  * I.6). Prints every resolved Config field with the environment
  * variable that overrides it, and whether each music root currently
@@ -73,7 +91,8 @@ print_paths(const Config * c)
   }
   printf("  (KURONO_IGNORE_DIRS)\n");
 
-  printf("playlist_dir  %s  (KURONO_PLAYLIST_DIR)\n", c->playlist_dir);
+  printf("playlist_dir  %s%s  (KURONO_PLAYLIST_DIR)\n",
+         dir_exists(c->playlist_dir) ? "" : "(missing) ", c->playlist_dir);
   printf("cache_dir     %s  (XDG_CACHE_HOME)     ok\n", c->cache_dir);
   printf("db_path       %s\n", c->db_path);
   printf("config_path   %s  (unused in v1)\n", c->config_path);
@@ -449,6 +468,18 @@ typedef struct {
   /* The Settings view's rows, built once at startup (design V.4). */
   BrowserRow *    settings_rows;
   size_t          settings_n;
+
+  /* Playlists sources (design II.8, II.9). */
+  char **      pl_names;           /* sorted stems, owned */
+  size_t       pl_n;
+  size_t       src_cursor;         /* 0 = Queue, i + 1 = pl_names[i] */
+  BrowserRow * src_rows;           /* pl_n + 1 rows, names borrowed */
+  char         src_queue_label[32];
+  Queue *      pl_view;            /* the selected saved playlist, NULL on Queue */
+  int          pl_view_ro;         /* unusable lines or a symlink: edits refused */
+  size_t       pl_view_bad;        /* the unusable-line count, for the message */
+  size_t       queue_pane_cursor;  /* the Queue source's pane cursor while away */
+
   Queue *         q;                 /* NULL on every headless run */
 
   /* The playing track, for the status bar. A copy of the basename
@@ -599,6 +630,10 @@ static void player_drain_cancel(Player * p);
 static void player_ladder_begin(Player * p, const char * detector);
 static void player_ladder_attempt(Player * p);
 static void player_on_notify(void * user, int notification_type);
+static void player_source_select(Player * p, size_t idx);
+static void player_sources_refresh(Player * p);
+static void player_view_settings_build(Player * p);
+static void player_view_rows_free(BrowserRow * rows, size_t n);
 
 /* Every action that moves the player through a state -- transport, the
    queue, device recovery -- is defined below beside the state it moves
@@ -607,6 +642,7 @@ static void player_on_notify(void * user, int notification_type);
    but browser.c. */
 static void player_action(Player * p, Action a, int32_t arg);
 static int  library_action(Player * p, Action a);
+static int  playlists_action(Player * p, Action a);
 
 /*
  * player_role_browser: the browser behind region `r` of the current view.
@@ -695,6 +731,21 @@ static void
 player_view_switch(Player * p, UiView v)
 {
   ui_view_set(v);
+  if (v == VIEW_PLAYLISTS) {
+    /* Re-read the list and the selected playlist, so an external edit
+       shows (design II.9). */
+    player_sources_refresh(p);
+    if (p->src_cursor > 0) {
+      size_t keep = queueview_cursor();
+
+      /* The re-read must not move the track cursor; it clamps if the
+         file got shorter. */
+      player_source_select(p, p->src_cursor);
+      if (p->src_cursor > 0) {
+        queueview_cursor_set(keep);
+      }
+    }
+  }
   player_view_viewports(p);
   tui_mark_dirty();
 } /* player_view_switch */
@@ -869,7 +920,8 @@ action_dispatch(Action a, int32_t arg)
 
   if (a == ACT_CONFIRM) {
     if (ui_view() == VIEW_PLAYLISTS) {
-      player_queue_confirm(p);
+      (void) playlists_action(p, a);
+      tui_mark_dirty();
       return;
     }
     player_report(p, "confirm: nothing to confirm yet");
@@ -918,14 +970,9 @@ action_dispatch(Action a, int32_t arg)
     return;
   }
 
-  if (ui_view() == VIEW_PLAYLISTS) {
-    if (queue_cursor_action(a, page)) {
-      tui_mark_dirty();
-      return;
-    }
-    if (a == ACT_COL_LEFT || a == ACT_COL_RIGHT) {
-      return;   /* SOURCES is not focusable (decide D13) */
-    }
+  if (ui_view() == VIEW_PLAYLISTS && playlists_action(p, a)) {
+    tui_mark_dirty();
+    return;
   }
 
   /* Navigation. Every one of these is a pure cursor move inside
@@ -2026,6 +2073,37 @@ player_play_entry(Player * p, const QueueEntry * ent)
 } /* player_play_entry */
 
 /*
+ * player_pl_name: the stem of the selected saved playlist. Takes the
+ * Player; returns a borrowed name, or NULL on the Queue row.
+ */
+static const char *
+player_pl_name(const Player * p)
+{
+  return (p->src_cursor > 0 && p->src_cursor <= p->pl_n)
+             ? p->pl_names[p->src_cursor - 1] : NULL;
+} /* player_pl_name */
+
+/*
+ * player_shown_queue: the Queue the Playlists pane shows (design II.8).
+ * Takes the Player; returns the viewed saved playlist, else the queue.
+ */
+static const Queue *
+player_shown_queue(const Player * p)
+{
+  return (p->pl_view != NULL) ? p->pl_view : p->q;
+} /* player_shown_queue */
+
+/*
+ * player_pane_rebuild: rebuild the Playlists pane from whichever Queue
+ * the selection names (design II.8). Takes the Player, returns nothing.
+ */
+static void
+player_pane_rebuild(Player * p)
+{
+  queueview_rebuild(player_shown_queue(p), p->db);
+} /* player_pane_rebuild */
+
+/*
  * player_queue_changed: everything that has to happen after the queue is
  * mutated. Takes the Player, returns nothing.
  *
@@ -2040,7 +2118,9 @@ player_play_entry(Player * p, const QueueEntry * ent)
 static void
 player_queue_changed(Player * p)
 {
-  queueview_rebuild(p->q, p->db);
+  if (p->src_cursor == 0) {      /* a saved playlist's pane is unchanged */
+    player_pane_rebuild(p);
+  }
   player_prefetch_next(p);
 } /* player_queue_changed */
 
@@ -2156,7 +2236,9 @@ player_on_boundary(Player * p, const BoundaryEntry * b)
                       : -1;
   p->fail_count = 0; /* a track that reached its boundary played */
 
-  queueview_rebuild(p->q, p->db);
+  if (p->src_cursor == 0) {
+    player_pane_rebuild(p);
+  }
   player_prefetch_next(p);
   tui_mark_dirty();
 } /* player_on_boundary */
@@ -2687,6 +2769,627 @@ player_queue_confirm(Player * p)
 } /* player_queue_confirm */
 
 /*
+ * entry_base: the last path component of `path`. Takes the path, returns
+ * a borrowed pointer into it.
+ */
+static const char *
+entry_base(const char * path)
+{
+  const char * slash = strrchr(path, '/');
+
+  return (slash != NULL) ? slash + 1 : path;
+} /* entry_base */
+
+/*
+ * player_playable: whether a playlist entry may reach the decoder (v2.1.0
+ * P18). Takes a path; returns 1 for a regular file with a library audio
+ * extension, else 0.
+ */
+static int
+player_playable(const char * path)
+{
+  struct stat st;
+
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode) && scan_has_audio_ext(path);
+} /* player_playable */
+
+/*
+ * player_report_ro: the read-only refusal for the viewed playlist (design
+ * II.8). Takes the Player, returns nothing. Edits are refused when the
+ * parse counted unusable lines or the file is a symlink; with no
+ * unusable line the cause is the link.
+ */
+static void
+player_report_ro(Player * p)
+{
+  const char * name = player_pl_name(p);
+
+  if (p->pl_view_bad == 0) {
+    player_report(p, "read-only playlist (symlink): %s", name);
+  } else {
+    player_report(p, "read-only playlist (%zu unreadable lines): %s",
+                  p->pl_view_bad, name);
+  }
+} /* player_report_ro */
+
+/*
+ * player_playlist_store: write `paths` as the saved playlist `name`
+ * (design II.5, P27). Takes the Player, the stem, the path array and its
+ * count, and an out-param for the number of lines written. CONSUMES
+ * `paths` and every string in it. Normalises, dedupes, orders through the
+ * library (an ordering failure writes unsorted, R12) and writes
+ * dir-relative with mode 0644. Returns 0, PLAYLIST_UNSYNCED or -errno;
+ * when the write
+ * created the playlist directory, the Settings rows are rebuilt.
+ */
+static int
+player_playlist_store(Player * p, const char * name, char ** paths, size_t n,
+                      size_t * out_written)
+{
+  int    dir_existed = dir_exists(p->cfg.playlist_dir);
+  size_t skipped     = 0;
+  int    rc;
+  int    dfd;
+
+  *out_written = 0;
+  for (size_t i = 0; i < n; i++) {
+    char * norm = playlist_path_normalize(paths[i]);
+
+    if (norm != NULL) {
+      free(paths[i]);
+      paths[i] = norm;
+    }
+  }
+  n = playlist_dedupe(paths, n);
+  (void) db_order_paths(p->db, paths, n);
+
+  dfd = playlist_dir_open(p->cfg.playlist_dir, 1);
+  if (dfd < 0) {
+    rc = dfd;
+  } else {
+    rc = playlist_write(dfd, p->cfg.playlist_dir, name,
+                        (const char * const *) paths, n, 1, -1, 0644, &skipped);
+    close(dfd);
+  }
+  for (size_t i = 0; i < n; i++) {
+    free(paths[i]);
+  }
+  free(paths);
+
+  if (rc >= 0) {
+    *out_written = n - skipped;
+    if (!dir_existed) {
+      player_view_rows_free(p->settings_rows, p->settings_n);
+      p->settings_rows = NULL;
+      p->settings_n    = 0;
+      player_view_settings_build(p);
+    }
+  }
+  return rc;
+} /* player_playlist_store */
+
+/*
+ * player_sources_rows_build: rebuild the SOURCES rows from pl_names
+ * (design II.9). Takes the Player; returns 0, or -1 with no rows on
+ * allocation failure (the fill then draws an empty column). Names are
+ * borrowed, so freeing the rows is free(src_rows) alone.
+ */
+static int
+player_sources_rows_build(Player * p)
+{
+  BrowserRow * rows = realloc(p->src_rows, (p->pl_n + 1) * sizeof *rows);
+
+  if (rows == NULL) {
+    free(p->src_rows);
+    p->src_rows = NULL;
+    return -1;
+  }
+  rows[0].name   = p->src_queue_label;
+  rows[0].key    = NULL;
+  rows[0].is_dir = 0;
+  for (size_t i = 0; i < p->pl_n; i++) {
+    rows[i + 1].name   = p->pl_names[i];
+    rows[i + 1].key    = NULL;
+    rows[i + 1].is_dir = 0;
+  }
+  p->src_rows = rows;
+  return 0;
+} /* player_sources_rows_build */
+
+/*
+ * source_name_cmp: qsort adapter over query_name_cmp for the stem array.
+ * Takes two char ** elements; returns the comparison.
+ */
+static int
+source_name_cmp(const void * a, const void * b)
+{
+  return query_name_cmp(*(char * const *) a, *(char * const *) b);
+} /* source_name_cmp */
+
+/*
+ * player_sources_refresh: re-list the playlist directory (design II.9).
+ * Takes the Player, returns nothing. A missing or unreadable directory
+ * lists nothing and reports nothing (the first-run state). The selection
+ * is kept by name; one that vanished falls back to the Queue row.
+ */
+static void
+player_sources_refresh(Player * p)
+{
+  const char * sel   = player_pl_name(p);
+  char *       keep  = (sel != NULL) ? strdup(sel) : NULL;
+  char **      names = NULL;
+  size_t       n     = 0;
+  int          dfd   = playlist_dir_open(p->cfg.playlist_dir, 0);
+
+  if (dfd >= 0) {
+    if (playlist_list(dfd, &names, &n) != 0) {
+      names = NULL;
+      n     = 0;
+    }
+    close(dfd);
+  }
+  if (n > 1) {
+    qsort(names, n, sizeof *names, source_name_cmp);
+  }
+  playlist_names_free(p->pl_names, p->pl_n);
+  p->pl_names = names;
+  p->pl_n     = n;
+  (void) player_sources_rows_build(p);
+
+  if (keep != NULL) {
+    size_t i = 0;
+
+    while (i < n && strcmp(names[i], keep) != 0) {
+      i++;
+    }
+    if (i < n) {
+      p->src_cursor = i + 1;
+    } else {
+      player_source_select(p, 0);
+    }
+    free(keep);
+  } else if (p->src_cursor > n) {
+    p->src_cursor = 0;
+  }
+  tui_mark_dirty();
+} /* player_sources_refresh */
+
+/*
+ * player_source_select: make source `idx` (0 = Queue, i + 1 = pl_names[i])
+ * the one the pane shows (design II.8, P20). Takes the Player and the
+ * index, returns nothing. Leaving the Queue row stores its pane cursor and
+ * returning restores it. A saved playlist is read whole into pl_view with
+ * every entry kept, missing ones included; a read failure is reported and
+ * falls back to the Queue row.
+ */
+static void
+player_source_select(Player * p, size_t idx)
+{
+  int      was_queue = (p->src_cursor == 0);
+  char     name[PLAYLIST_NAME_BUF];
+  Playlist pl;
+  int      dfd;
+  int      rc;
+
+  if (was_queue && idx != 0) {
+    p->queue_pane_cursor = queueview_cursor();
+  }
+  queue_destroy(p->pl_view);
+  p->pl_view     = NULL;
+  p->pl_view_ro  = 0;
+  p->pl_view_bad = 0;
+  p->info_id     = -1;   /* INFO follows the new pane */
+
+  if (idx == 0 || idx > p->pl_n) {
+    p->src_cursor = 0;
+    player_pane_rebuild(p);
+    if (!was_queue) {
+      queueview_cursor_set(p->queue_pane_cursor);
+    }
+    tui_mark_dirty();
+    return;
+  }
+
+  snprintf(name, sizeof name, "%s", p->pl_names[idx - 1]);
+  dfd = playlist_dir_open(p->cfg.playlist_dir, 0);
+  rc  = dfd;
+  if (dfd >= 0) {
+    rc = playlist_read(dfd, p->cfg.playlist_dir, name, &pl);
+    close(dfd);
+  }
+  if (rc == 0) {
+    p->pl_view = queue_create(0);
+    if (p->pl_view == NULL) {
+      playlist_free(&pl);
+      rc = -ENOMEM;
+    }
+  }
+  if (rc != 0) {
+    player_report(p, "could not read playlist %s: %s", name, strerror(-rc));
+    player_sources_refresh(p);
+    player_source_select(p, 0);
+    return;
+  }
+
+  for (size_t i = 0; i < pl.n; i++) {
+    (void) queue_append(p->pl_view, db_track_id_by_path(p->db, pl.paths[i]),
+                        pl.paths[i]);
+  }
+  p->pl_view_bad = pl.bad;
+  p->pl_view_ro  = (pl.bad > 0 || pl.is_link);
+  playlist_free(&pl);
+  p->src_cursor = idx;
+  player_pane_rebuild(p);
+  queueview_cursor_set(0);
+  tui_mark_dirty();
+} /* player_source_select */
+
+/*
+ * player_sources_cursor: move the sources cursor for one navigation
+ * action and load the selection as it moves (design II.1, R10). Takes the
+ * Player, the action and the page size; returns 1 for the six cursor
+ * actions and 0 for anything else.
+ */
+static int
+player_sources_cursor(Player * p, Action a, int page)
+{
+  size_t n  = p->pl_n + 1;
+  size_t at = p->src_cursor;
+
+  switch (a) {
+    case ACT_CURSOR_UP:        at = list_cursor_move(at, n, -1);   break;
+    case ACT_CURSOR_DOWN:      at = list_cursor_move(at, n, 1);    break;
+    case ACT_CURSOR_PAGE_UP:   at = list_cursor_move(at, n, -page); break;
+    case ACT_CURSOR_PAGE_DOWN: at = list_cursor_move(at, n, page);  break;
+    case ACT_CURSOR_HOME:      at = 0;                              break;
+    case ACT_CURSOR_END:       at = n - 1;                          break;
+    default:                   return 0;
+  }
+  if (at != p->src_cursor) {
+    player_source_select(p, at);
+  }
+  return 1;
+} /* player_sources_cursor */
+
+/*
+ * player_playlist_replace: Enter on a saved playlist (design IV
+ * "Load-replace", P5, P6). Takes the Player and the pane index to start
+ * at, or SIZE_MAX for the whole row (first playable entry). Only playable
+ * entries (P18) enter the queue; the kept list is built before the queue
+ * is touched. Zero kept, or a selected entry that is unplayable, leaves
+ * the queue as it was. Returns nothing.
+ */
+static void
+player_playlist_replace(Player * p, size_t sel)
+{
+  const char *  name  = player_pl_name(p);
+  size_t        total = (p->pl_view != NULL) ? queue_count(p->pl_view) : 0;
+  const char ** kp    = NULL;
+  int64_t *     ki    = NULL;
+  size_t        kept  = 0;
+  size_t        start = 0;
+  int           found = (sel == SIZE_MAX);
+
+  if (p->q == NULL) {
+    player_report(p, "no queue");
+    return;
+  }
+  /* Replacing the queue is only worth it if the result can play. */
+  if (p->dev != DEV_READY) {
+    player_report(p, "no audio device -- playlist not loaded");
+    return;
+  }
+  if (total > 0) {
+    kp = malloc(total * sizeof *kp);
+    ki = malloc(total * sizeof *ki);
+    if (kp == NULL || ki == NULL) {
+      free(kp);
+      free(ki);
+      player_report(p, "out of memory, playlist not loaded");
+      return;
+    }
+  }
+  for (size_t i = 0; i < total; i++) {
+    const QueueEntry * e = queue_at(p->pl_view, i);
+
+    if (e == NULL || !player_playable(e->path)) {
+      continue;
+    }
+    if (i == sel) {
+      start = kept;
+      found = 1;
+    }
+    kp[kept] = e->path;
+    ki[kept] = e->track_id;
+    kept++;
+  }
+
+  if (sel != SIZE_MAX && sel < total && !found) {
+    player_report(p, "missing or unplayable: %s",
+                  entry_base(queue_at(p->pl_view, sel)->path));
+  } else if (kept == 0 || !found) {
+    player_report(p, "no playable tracks in playlist: %s", name);
+  } else {
+    int    sh       = queue_shuffle(p->q);
+    size_t added    = 0;
+    size_t at       = 0;
+    int    start_ok = 0;
+
+    queue_set_shuffle(p->q, 0);
+    queue_clear(p->q);
+    /* Position the start by what was actually appended, so a failed
+       append cannot shift playback onto another track. */
+    for (size_t i = 0; i < kept; i++) {
+      if (queue_append(p->q, ki[i], kp[i]) == 0) {
+        if (i == start) {
+          at       = added;
+          start_ok = 1;
+        }
+        added++;
+      }
+    }
+    if (!start_ok || queue_set_cursor(p->q, at) != 0) {
+      player_queue_changed(p);
+      player_report(p, "could not load playlist: %s", name);
+    } else {
+      if (sh) {
+        queue_set_shuffle(p->q, 1);
+      }
+      p->fail_count = 0;
+      player_queue_changed(p);
+      if (added == total) {
+        player_report(p, "playing %zu tracks from playlist: %s", added, name);
+      } else {
+        player_report(p, "playing %zu of %zu tracks from playlist: %s", added, total, name);
+      }
+      (void) player_play_entry(p, queue_at(p->q, queue_cursor(p->q)));
+    }
+  }
+  free(kp);
+  free(ki);
+} /* player_playlist_replace */
+
+/*
+ * player_playlist_append: `a` on a saved playlist (design IV "Append",
+ * P7). Takes the Player and the pane index of one track, or SIZE_MAX for
+ * the whole row (every playable entry). No stop and no CMD_PLAY. Returns
+ * nothing.
+ */
+static void
+player_playlist_append(Player * p, size_t sel)
+{
+  const char * name  = player_pl_name(p);
+  size_t       total = (p->pl_view != NULL) ? queue_count(p->pl_view) : 0;
+
+  if (p->q == NULL) {
+    player_report(p, "no queue");
+    return;
+  }
+
+  if (sel == SIZE_MAX) {
+    DbTrackRow * rows = (total > 0) ? calloc(total, sizeof *rows) : NULL;
+    size_t       ok   = 0;
+
+    if (total > 0 && rows == NULL) {
+      player_report(p, "out of memory, %s not queued", name);
+      return;
+    }
+    for (size_t i = 0; i < total; i++) {
+      const QueueEntry * e = queue_at(p->pl_view, i);
+
+      rows[i].id = e->track_id;
+      if (player_playable(e->path)) {
+        rows[i].path = e->path;   /* borrowed: free(rows) alone */
+        ok++;
+      }
+    }
+    if (ok == 0) {
+      player_report(p, "no playable tracks in playlist: %s", name);
+    } else {
+      player_append_rows(p, rows, total, name);
+    }
+    free(rows);
+    return;
+  }
+
+  if (sel >= total) {
+    player_report(p, "no playable tracks in playlist: %s", name);
+    return;
+  }
+  const QueueEntry * e = queue_at(p->pl_view, sel);
+
+  if (!player_playable(e->path)) {
+    player_report(p, "missing or unplayable: %s", entry_base(e->path));
+    return;
+  }
+  if (queue_append(p->q, e->track_id, e->path) != 0) {
+    player_report(p, "could not queue %s", entry_base(e->path));
+    return;
+  }
+  player_queue_changed(p);
+  player_report(p, "queued: %s (%zu in queue)", entry_base(e->path), queue_count(p->q));
+  tui_mark_dirty();
+} /* player_playlist_append */
+
+/*
+ * player_playlist_remove_entry: `d` on a track of a saved playlist
+ * (design IV "Edit a saved playlist", P21). Takes the Player, returns
+ * nothing. Writes through (dedupe, order, atomic write), then reloads the
+ * playlist from disk so the pane never shows a state that is not on disk.
+ * Missing entries are in pl_view and so survive the write. Refused on a
+ * read-only playlist.
+ */
+static void
+player_playlist_remove_entry(Player * p)
+{
+  char    name[PLAYLIST_NAME_BUF];
+  char ** paths;
+  size_t  n;
+  size_t  at;
+  size_t  written = 0;
+  int     rc      = 0;
+
+  if (p->pl_view_ro) {
+    player_report_ro(p);
+    return;
+  }
+  if (p->pl_view == NULL || queue_count(p->pl_view) == 0) {
+    return;
+  }
+  snprintf(name, sizeof name, "%s", player_pl_name(p));
+  at = queueview_cursor();
+  if (at >= queue_count(p->pl_view)) {
+    at = queue_count(p->pl_view) - 1;
+  }
+  if (queue_remove(p->pl_view, at) != 0) {
+    player_report(p, "could not remove entry %zu", at + 1);
+    return;
+  }
+
+  n     = queue_count(p->pl_view);
+  paths = calloc((n > 0) ? n : 1, sizeof *paths);
+  if (paths == NULL) {
+    rc = -ENOMEM;
+  } else {
+    for (size_t i = 0; i < n && rc == 0; i++) {
+      paths[i] = strdup(queue_at(p->pl_view, i)->path);
+      if (paths[i] == NULL) {
+        rc = -ENOMEM;
+      }
+    }
+    if (rc == 0) {
+      rc = player_playlist_store(p, name, paths, n, &written);
+    } else {
+      for (size_t i = 0; i < n; i++) {
+        free(paths[i]);
+      }
+      free(paths);
+    }
+  }
+  if (rc < 0) {
+    player_report(p, "could not save playlist %s: %s", name, strerror(-rc));
+  } else if (rc == PLAYLIST_UNSYNCED) {
+    player_report(p, "removed from %s, but not confirmed on disk", name);
+  } else {
+    player_report(p, "removed from %s", name);   /* G6 */
+  }
+  player_source_select(p, p->src_cursor);
+  queueview_cursor_set(at);
+  tui_mark_dirty();
+} /* player_playlist_remove_entry */
+
+/*
+ * playlists_action: the Playlists arms of design II.1. With SOURCES
+ * focused the action is translated by keymap_sources_action first, then
+ * cursor moves go to the sources cursor; with QUEUE focused they go to
+ * queue_cursor_action, whichever source the pane shows (decide V7).
+ * Takes the Player and the action; returns 1 when handled, 0 to carry on
+ * with player_action.
+ */
+static int
+playlists_action(Player * p, Action a)
+{
+  int on_src = (ui_focus() == ROLE_SOURCES);
+  int saved  = (p->src_cursor > 0);
+  int page   = player_view_rows() - 1;
+
+  if (page < 1) {
+    page = 1;
+  }
+  if (on_src) {
+    a = keymap_sources_action(a);
+    if (player_sources_cursor(p, a, page)) {
+      return 1;
+    }
+  } else if (queue_cursor_action(a, page)) {
+    return 1;   /* INFO follows at repaint: player_view_details compares ids */
+  }
+
+  switch (a) {
+    case ACT_NONE:
+      return 1;   /* K/J on SOURCES (design II.1) */
+
+    case ACT_COL_LEFT:
+      if (!on_src) {
+        ui_focus_set(ROLE_SOURCES);
+      }
+      return 1;
+
+    case ACT_COL_RIGHT:
+      if (on_src) {
+        ui_focus_set(ROLE_QUEUE);
+      }
+      return 1;
+
+    case ACT_PLAYLIST_LOAD:   /* the Queue row: silent */
+      if (saved) {
+        player_playlist_replace(p, SIZE_MAX);
+      }
+      return 1;
+
+    case ACT_PLAYLIST_DELETE:
+      if (!saved) {
+        player_report(p, "the queue cannot be deleted; C clears it");
+      } else {
+        /* P7 adds the flow; the translated action must reach player_action
+           itself, since the raw `d` would remove a queue entry. */
+        player_action(p, ACT_PLAYLIST_DELETE, 0);
+      }
+      return 1;
+
+    case ACT_CONFIRM:
+      if (!saved) {
+        player_queue_confirm(p);
+      } else {
+        player_playlist_replace(p, queueview_cursor());
+      }
+      return 1;
+
+    case ACT_ENQUEUE:
+      if (!saved) {
+        player_report(p, "already in the queue");
+      } else {
+        player_playlist_append(p, on_src ? SIZE_MAX : queueview_cursor());
+      }
+      return 1;
+
+    case ACT_REMOVE:
+      if (saved) {
+        player_playlist_remove_entry(p);
+        return 1;
+      }
+      return 0;   /* Queue: player_action's existing arm */
+
+    case ACT_MOVE_UP:
+    case ACT_MOVE_DOWN:
+      if (saved) {
+        player_report(p, "playlists are kept sorted");
+        return 1;
+      }
+      return 0;
+
+    case ACT_CLEAR_QUEUE:
+      if (saved) {
+        player_report(p, "C clears the queue only");
+        return 1;
+      }
+      return 0;
+
+    case ACT_JUMP_TO_PLAYING:
+      /* G7: from either source and focus, land on the Queue source with
+         QUEUE focused; player_jump_to_playing moves the cursor. */
+      if (saved) {
+        player_source_select(p, 0);
+      }
+      ui_focus_set(ROLE_QUEUE);
+      return 0;
+
+    default:
+      return 0;
+  }
+} /* playlists_action */
+
+/*
  * player_locate: move the Directories browser to the library track with
  * this id. Takes the Player, the id and a name for the message, returns
  * nothing. Library has its own arm, library_jump.
@@ -3191,7 +3894,7 @@ player_rescan(Player * p)
     (void) browser_reload(p->lib_main);
   }
   p->library_empty = (db_count_tracks(p->db) == 0);
-  queueview_rebuild(p->q, p->db);
+  player_pane_rebuild(p);
   /* Tags may have changed behind the same ids (decide D21). */
   p->info_id = -1;
   p->np_id   = -1;
@@ -3551,7 +4254,8 @@ player_view_settings_build(Player * p)
   }
   rows[n++].name = strdup(buf);
 
-  snprintf(buf, sizeof buf, "%-13s %s", "playlists", p->cfg.playlist_dir);
+  snprintf(buf, sizeof buf, "%-13s %s%s", "playlists",
+           dir_exists(p->cfg.playlist_dir) ? "" : "(missing) ", p->cfg.playlist_dir);
   rows[n++].name = strdup(buf);
   snprintf(buf, sizeof buf, "%-13s %s", "database", p->cfg.db_path);
   rows[n++].name = strdup(buf);
@@ -3609,8 +4313,8 @@ player_view_details(Player * p)
 {
   if (ui_view() == VIEW_PLAYLISTS) {
     int64_t id = 0;
-    if (p->q != NULL && queueview_count() > 0) {
-      const QueueEntry * e = queue_at(p->q, queueview_cursor());
+    if (player_shown_queue(p) != NULL && queueview_count() > 0) {
+      const QueueEntry * e = queue_at(player_shown_queue(p), queueview_cursor());
       id = (e != NULL) ? e->track_id : 0;
     }
     player_view_detail(p, id, &p->info_id, &p->info_rows, &p->info_n);
@@ -3770,6 +4474,16 @@ player_fill_lists(Player * p, TuiModel * m)
     }
 
     case VIEW_PLAYLISTS: {
+      /* Counted from the queue, not the pane, which may show a playlist. */
+      snprintf(p->src_queue_label, sizeof p->src_queue_label, "Queue (%zu)",
+               (p->q != NULL) ? queue_count(p->q) : (size_t) 0);
+
+      TuiList * sl = &m->list[ROLE_SOURCES];
+      sl->rows    = p->src_rows;
+      sl->n       = (p->src_rows != NULL) ? p->pl_n + 1 : 0;
+      sl->cursor  = p->src_cursor;
+      sl->playing = -1;
+
       TuiList * ql = &m->list[ROLE_QUEUE];
       ql->rows    = queueview_rows();
       ql->n       = queueview_count();
@@ -3777,15 +4491,15 @@ player_fill_lists(Player * p, TuiModel * m)
       if (ql->n > 0 && ql->cursor >= ql->n) {
         ql->cursor = ql->n - 1;
       }
-      ql->playing = player_queue_playing_index(p);
-      ql->empty   = "(queue empty)";
+      ql->playing = (p->src_cursor == 0) ? player_queue_playing_index(p) : -1;
+      ql->empty   = (p->src_cursor == 0) ? "(queue empty)" : "(empty)";   /* G8 */
 
       TuiList * il = &m->list[ROLE_INFO];
       il->rows   = p->info_rows;
       il->n      = p->info_n;
       il->cursor = il->n;
       il->empty  = (ql->n > 0) ? "(no library entry)" : NULL;
-      m->crumb   = "Queue";
+      m->crumb   = (p->src_cursor == 0) ? "Queue" : player_pl_name(p);
       break;
     }
 
@@ -4033,6 +4747,11 @@ shutdown_all(Player * p)
   player_view_rows_free(p->settings_rows, p->settings_n);
   p->settings_rows = NULL;
   p->settings_n    = 0;
+  playlist_names_free(p->pl_names, p->pl_n);
+  p->pl_names = NULL;
+  p->pl_n     = 0;
+  free(p->src_rows);
+  p->src_rows = NULL;
 
   for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
     browser_destroy(p->brv[v]);
@@ -4052,6 +4771,8 @@ shutdown_all(Player * p)
      window in which T2 could be handed an entry that was just freed. */
   queue_destroy(p->q);
   p->q = NULL;
+  queue_destroy(p->pl_view);
+  p->pl_view = NULL;
 
   config_free(&p->cfg);
   event_destroy(p->el);
@@ -4600,6 +5321,7 @@ run_tui(void)
   p.np_id     = -1;
   queueview_rebuild(p.q, p.db);
   player_view_settings_build(&p);
+  (void) player_sources_rows_build(&p);   /* Queue row only until the first refresh */
 
   /* Step 9: tb_init, then the remaining epoll registrations. Its
      position is unaffected by amendment 05 -- what used to precede it

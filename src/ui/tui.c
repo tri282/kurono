@@ -466,7 +466,7 @@ static const struct {
   [ROLE_INFO]    = { CUR_NONE,  STYLE_COL_INACTIVE, 0 },
   [ROLE_QUEUE]   = { CUR_FOCUS, STYLE_COUNT,        1 },
   [ROLE_COVER]   = { CUR_NONE,  STYLE_COUNT,        0 },
-  [ROLE_SOURCES] = { CUR_MARK,  STYLE_NORMAL,       1 },
+  [ROLE_SOURCES] = { CUR_FOCUS, STYLE_NORMAL,       1 },
 };
 
 /*
@@ -567,24 +567,6 @@ draw_body(const TuiModel * m)
       case ROLE_COVER:
       case ROLE_COUNT:
         break;   /* never allocated in v2.0.0 (design II.5) */
-
-      case ROLE_SOURCES: {
-        /* One fixed row until v2.1.0 (design V.2). */
-        char       name[32];
-        BrowserRow row;
-        TuiList    src;
-
-        snprintf(name, sizeof name, "Queue (%zu)", m->list[ROLE_QUEUE].n);
-        memset(&src, 0, sizeof src);
-        row.name   = name;
-        row.key    = NULL;
-        row.is_dir = 0;
-        src.rows    = &row;
-        src.n       = 1;
-        src.playing = -1;
-        draw_region(r, &src);
-        break;
-      }
 
       case ROLE_MAIN: {
         const TuiList * l = &m->list[ROLE_MAIN];

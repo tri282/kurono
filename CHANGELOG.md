@@ -4,6 +4,24 @@ Notable changes to `kurono`. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Saved playlists in the Playlists view: the sources column lists `Queue`
+  first, then every `.m3u8` file in `KURONO_PLAYLIST_DIR`, and selecting
+  one shows its tracks. `enter` on a playlist replaces the queue and plays
+  it; `enter` on one of its tracks starts there. `a` appends a playlist, or
+  one of its tracks, to the queue. `d` removes a track from a saved
+  playlist. Playlists are kept in Library order without duplicates.
+
+### Changed
+
+- The Playlists sources column takes focus: `←`/`→` move between it and
+  the track list.
+- A relative `KURONO_PLAYLIST_DIR` resolves against the working directory.
+- Settings and `--paths` mark a missing playlist directory `(missing)`.
+
 ## [2.0.0] — 2026-10-12
 
 ### Added
@@ -231,6 +249,11 @@ through those.
   over 6.4 h in 2 sessions, there were no steady-state underruns and the
   lowest headroom was 2.69 s of 2.73 s. The verdict waits on more listening
   (10 h over 3 sessions), so the size is unchanged for now.
+- Playlists are `m3u8` only; `.m3u`, `.xspf` and `.pls` files are not read.
+- A saved playlist has no custom order: `K`/`J` reorder only the queue.
+- Changing a playlist rewrites it in kurono's form: sorted, deduplicated,
+  comments and `#EXTINF` lines from other programs dropped, entries relative.
+  A playlist with lines kurono cannot read, or a symlinked one, is read-only.
 
 [Unreleased]: https://gitlab.com/tri282/kurono/-/compare/v2.0.0...main
 [2.0.0]: https://gitlab.com/tri282/kurono/-/compare/v1.3.1...v2.0.0

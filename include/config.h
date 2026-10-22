@@ -25,7 +25,9 @@ typedef struct {
   size_t      nroots;    /*   XDG/~ fallback -- nroots >= 1 always        */
   char **     ignore;    /* KURONO_IGNORE_DIRS (','-separated basenames)  */
   size_t      nignore;
-  char * playlist_dir;   /* KURONO_PLAYLIST_DIR, else roots[0]/playlists  */
+  char * playlist_dir;   /* KURONO_PLAYLIST_DIR (relative: made absolute  */
+                         /*   against the cwd, v2.1.0 P15), else          */
+                         /*   roots[0]/playlists                          */
   char * cache_dir;      /* $XDG_CACHE_HOME/kurono, else ~/.cache/kurono  */
   char * db_path;        /* cache_dir/library.db                          */
   char * config_path;    /* KURONO_CONFIG -- resolved, unused in v1       */

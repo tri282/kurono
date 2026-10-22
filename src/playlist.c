@@ -563,7 +563,13 @@ playlist_names_free(char ** names, size_t n)
 int
 playlist_dir_open(const char * dir, int create)
 {
-  int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int fd;
+
+  /* Entries resolve against dir, so it must be absolute (v2.1.0 phase 6). */
+  if (dir == NULL || dir[0] != '/') {
+    return -EINVAL;
+  }
+  fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
   if (fd < 0 && errno == ENOENT && create) {
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
@@ -868,9 +874,11 @@ playlist_write(int dfd, const char * dir, const char * name,
     err = errno;
     goto fail;
   }
-  if (fsync(dfd) < 0 && errno != EINVAL) {      /* vfat/exfat [decide V21] */
-    err = errno;
-    goto fail;
+  /* The rename is done, so a directory fsync failure is not a failed save.
+     EINVAL is vfat/exfat, which cannot sync a directory [decide V21]; any
+     other errno leaves the rename unconfirmed on disk. */
+  if (fsync(dfd) < 0 && errno != EINVAL) {
+    return PLAYLIST_UNSYNCED;
   }
   return 0;
 ioerr:

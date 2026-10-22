@@ -4,10 +4,12 @@
 #include "../include/main.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /*
  * split_owned: split `s` on single-character `delim` into an array of
@@ -279,15 +281,29 @@ resolve_ignore(Config * c)
 
 /*
  * resolve_playlist_dir: KURONO_PLAYLIST_DIR if set and non-empty, else
- * <roots[0].path>/playlists. Must run after resolve_roots. Returns 0 on
- * success, -1 on allocation failure.
+ * <roots[0].path>/playlists. A relative value is made absolute against
+ * the working directory, not normalised (v2.1.0 P15); if getcwd fails it
+ * is kept as given, and playlist_dir_open refuses it. Must run after
+ * resolve_roots. Returns 0 on success,
+ * -1 on allocation failure.
  */
 static int
 resolve_playlist_dir(Config * c)
 {
   const char * env = getenv("KURONO_PLAYLIST_DIR");
   if (env != NULL && env[0] != '\0') {
-    c->playlist_dir = strdup(env);
+    char cwd[PATH_MAX];
+
+    if (env[0] != '/' && getcwd(cwd, sizeof cwd) != NULL) {
+      size_t len = strlen(cwd) + strlen(env) + 2;
+
+      c->playlist_dir = malloc(len);
+      if (c->playlist_dir != NULL) {
+        snprintf(c->playlist_dir, len, "%s/%s", cwd, env);
+      }
+    } else {
+      c->playlist_dir = strdup(env);
+    }
   } else {
     c->playlist_dir = path_join(c->roots[0].path, "/playlists");
   }

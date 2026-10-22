@@ -5,6 +5,8 @@
    a mkdtemp directory under build/ that it removes itself; alarm(10)
    turns a blocking open into a failure instead of a hang. */
 
+#define _GNU_SOURCE   /* O_PATH, for the directory-fsync check in T9 */
+
 #include "../include/playlist.h"
 
 #include <dirent.h>
@@ -550,6 +552,22 @@ test_t9(void)
   CHECK(playlist_write(dfd, "/m/pl", "m", v1, 1, 0, -1, 0600, &skipped) == 0, "write 0600");
   CHECK(mode_of(dfd, "m.m3u8") == 0600, "mode %o want 600", mode_of(dfd, "m.m3u8"));
   umask(um);
+
+  /* fsync(dfd) failing after the rename is not a failed save but an
+     unconfirmed one: an O_PATH directory fd is valid for openat/renameat
+     but fsync gives EBADF. */
+  {
+    int pfd = openat(dfd, ".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+
+    CHECK(pfd >= 0, "open O_PATH directory fd");
+    if (pfd >= 0) {
+      CHECK(write_simple(pfd, "fs", v1, 1, 0, -1, &skipped) == PLAYLIST_UNSYNCED,
+            "directory fsync failure not reported as unsynced");
+      CHECK(mode_of(dfd, "fs.m3u8") >= 0, "file missing after directory fsync failure");
+      CHECK(count_prefixed(dfd, ".kurono-") == 0, "temp left after directory fsync failure");
+      close(pfd);
+    }
+  }
   rm_children(dfd);
   close(dfd);
 } /* test_t9 */
@@ -654,6 +672,13 @@ test_t13(void)
   close(dfd);
 } /* test_t13 */
 
+/* T15: a relative playlist directory is refused, never opened. */
+static void
+test_t15(void)
+{
+  CHECK(playlist_dir_open("build", 0) == -EINVAL, "relative playlist directory opened");
+} /* test_t15 */
+
 /* dedupe_case: dedupes the words in `in` and compares with `want` (space separated). */
 static void
 dedupe_case(const char * const * in, size_t n, const char * const * want, size_t wn)
@@ -688,7 +713,7 @@ test_t14(void)
   dedupe_case(one, 0, one, 0);
 } /* test_t14 */
 
-/* main: runs T1-T14 in a scratch directory under build/ and removes it. */
+/* main: runs T1-T15 in a scratch directory under build/ and removes it. */
 int
 main(void)
 {
@@ -720,6 +745,7 @@ main(void)
   test_t12();
   test_t13();
   test_t14();
+  test_t15();
 
   rm_children(g_root_fd);
   close(g_root_fd);

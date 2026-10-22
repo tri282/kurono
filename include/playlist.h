@@ -10,6 +10,9 @@
    of up to 4 bytes [user 2026-10-21]. */
 #define PLAYLIST_NAME_BUF 257
 
+/* playlist_write: saved, but the directory fsync after the rename failed. */
+#define PLAYLIST_UNSYNCED 1
+
 /*
  * One parsed playlist. paths[] are absolute and lexically normalised,
  * owned. bad counts lines that were not usable entries; cursor is the
@@ -76,7 +79,7 @@ size_t playlist_dedupe(char ** paths, size_t n);
 
 /*
  * playlist_dir_open: a directory fd (O_CLOEXEC) or -errno; create makes
- * one missing level.
+ * one missing level. A relative dir is -EINVAL.
  */
 int playlist_dir_open(const char * dir, int create);
 
@@ -101,10 +104,13 @@ int playlist_read(int dfd, const char * dir, const char * name, Playlist * out);
 
 /*
  * playlist_write: atomically replaces <name>.m3u8 in dfd (temp file,
- * fsync, renameat, directory fsync); 0 or -errno, *out_skipped set either
+ * fsync, renameat, directory fsync); 0, PLAYLIST_UNSYNCED, or -errno,
+ * *out_skipped set either
  * way. relative selects the dir-relative form, cursor < 0 omits the
  * cursor line, mode is the openat mode (umask applies). Sweeps dead-pid
- * temp files first [decide V3, V4]. A failure leaves the previous file.
+ * temp files first [decide V3, V4]. A failure leaves the previous file. A
+ * directory fsync failure after the rename, other than EINVAL, returns
+ * PLAYLIST_UNSYNCED: the new file is in place but not confirmed on disk.
  */
 int playlist_write(int dfd, const char * dir, const char * name,
                    const char * const * paths, size_t n, int relative,
