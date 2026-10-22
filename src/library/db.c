@@ -20,9 +20,11 @@
 #define DB_STR_(x) #x
 #define DB_STR(x)  DB_STR_(x)
 
-/* Order key <K> of the four list statements (design IV.2, D2). */
-#define LIST_ORDER " ORDER BY artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, " \
-                   "album, disc_no, track_no, tracks.path"
+/* Order terms <K> of the four list statements and db_order_paths (design
+   IV.2, D2; v2.1.0 P27). */
+#define LIST_ORDER_TERMS "artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, " \
+                         "album, disc_no, track_no, tracks.path"
+#define LIST_ORDER       " ORDER BY " LIST_ORDER_TERMS
 
 /* Columns of the four list statements, in list_row_from_stmt's order (Q3).
    path is selected only for untitled rows (the label falls back to its
@@ -33,7 +35,7 @@
 /* Index serving LIST_ORDER for the All listing (Q3 rung 3). Created on
    every open rather than by a migrate case, so schema_version stays 2
    and a 1.x build still opens the file. Its columns must match
-   LIST_ORDER term for term. */
+   LIST_ORDER_TERMS term for term. */
 #define SQL_LIST_INDEX \
   "CREATE INDEX IF NOT EXISTS idx_tracks_list ON tracks(" \
   "artist COLLATE NOCASE, artist, year, album COLLATE NOCASE, album, disc_no, track_no, path);"
@@ -133,6 +135,10 @@ sqlite3_stmt * query_tracks_for_artist_album;
   sqlite3_stmt * query_list_all_fts;
   sqlite3_stmt * query_list_artist_fts;
   sqlite3_stmt * count_tracks;
+  sqlite3_stmt * track_id_by_path;
+  sqlite3_stmt * sort_clear;
+  sqlite3_stmt * sort_insert;
+  sqlite3_stmt * sort_select;
   int            corrupt;
   int            truncated;
 };
@@ -634,6 +640,15 @@ prepare_all_statements(Db * db)
        "(SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?1)"
        LIST_ORDER " LIMIT " DB_STR(DB_MATCH_CAP));
   PREP(count_tracks, "SELECT count(*) FROM tracks");
+  /* v2.1.0 P19: path is the only persisted key; the id is re-derived. */
+  PREP(track_id_by_path, "SELECT id FROM tracks WHERE path = ?1");
+  /* v2.1.0 P27, decide V2: a path set in Library order, outside tracks
+     last by path (their tracks.* columns are all NULL). */
+  PREP(sort_clear, "DELETE FROM sort_in");
+  PREP(sort_insert, "INSERT INTO sort_in(path) VALUES(?1)");
+  PREP(sort_select,
+       "SELECT sort_in.path FROM sort_in LEFT JOIN tracks ON tracks.path = sort_in.path "
+       "ORDER BY tracks.id IS NULL, " LIST_ORDER_TERMS ", sort_in.path");
 
 #undef PREP
 } /* prepare_all_statements */
@@ -692,6 +707,14 @@ db_open(const char * db_path, const char * const * roots, size_t nroots, int * o
       fprintf(stderr, "kurono: cannot create the list index in %s: %s\n", db_path, sqlite3_errmsg(db->conn));
     }
 
+    /* db_order_paths' scratch set (v2.1.0 P27, decide V2). TEMP: it lives
+       in the connection's temp database, never in this file, and must
+       exist before prepare_all_statements prepares its statements. */
+    if (sqlite3_exec(db->conn, "CREATE TEMP TABLE IF NOT EXISTS sort_in(path TEXT PRIMARY KEY);",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+      kurono_die("cannot create the sort table in %s: %s", db_path, sqlite3_errmsg(db->conn));
+    }
+
     prepare_all_statements(db);
     return db;
   }
@@ -728,6 +751,10 @@ db_close(Db * db)
   sqlite3_finalize(db->query_list_all_fts);
   sqlite3_finalize(db->query_list_artist_fts);
   sqlite3_finalize(db->count_tracks);
+  sqlite3_finalize(db->track_id_by_path);
+  sqlite3_finalize(db->sort_clear);
+  sqlite3_finalize(db->sort_insert);
+  sqlite3_finalize(db->sort_select);
 
   /* Refresh sqlite_stat1 for the query planner before close. */
   sqlite3_exec(db->conn, "PRAGMA optimize;", NULL, NULL, NULL);
@@ -1213,6 +1240,106 @@ db_count_tracks(Db * db)
   db_reset(db, stmt);
   return n;
 } /* db_count_tracks */
+
+/*
+ * db_track_id_by_path: see include/library/db.h.
+ */
+int64_t
+db_track_id_by_path(Db * db, const char * path)
+{
+  if (db == NULL || path == NULL) {
+    return 0;
+  }
+
+  sqlite3_stmt * stmt = db->track_id_by_path;
+  int64_t        id = 0;
+
+  db_reset(db, stmt);
+  sqlite3_clear_bindings(stmt);
+  sqlite3_bind_text(stmt, 1, path, -1, SQLITE_STATIC);
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    id = sqlite3_column_int64(stmt, 0);
+  }
+  db_reset(db, stmt);
+  return id;
+} /* db_track_id_by_path */
+
+/*
+ * db_order_paths: see include/library/db.h. All or nothing: the sorted
+ * copies are collected into a fresh array first, and paths[] is touched
+ * only after the transaction committed with exactly n rows (v2.1.0 P27, V2).
+ */
+int
+db_order_paths(Db * db, char ** paths, size_t n)
+{
+  if (db == NULL || (paths == NULL && n > 0)) {
+    return -1;
+  }
+  if (n < 2) {
+    return 0;
+  }
+
+  char ** out = calloc(n, sizeof(*out));
+  if (out == NULL) {
+    return -1;
+  }
+  if (db_begin(db) != 0) {
+    free(out);
+    return -1;
+  }
+
+  size_t k = 0;
+  int    ok = 1;
+
+  db_reset(db, db->sort_clear);
+  if (sqlite3_step(db->sort_clear) != SQLITE_DONE) {
+    ok = 0;
+  }
+  db_reset(db, db->sort_clear);
+
+  for (size_t i = 0; ok && i < n; i++) {
+    db_reset(db, db->sort_insert);
+    sqlite3_clear_bindings(db->sort_insert);
+    sqlite3_bind_text(db->sort_insert, 1, paths[i], -1, SQLITE_STATIC);
+    if (sqlite3_step(db->sort_insert) != SQLITE_DONE) {
+      ok = 0; /* a PRIMARY KEY conflict: the caller passed a duplicate */
+    }
+    db_reset(db, db->sort_insert);
+  }
+
+  if (ok) {
+    db_reset(db, db->sort_select);
+    int rc;
+    while ((rc = sqlite3_step(db->sort_select)) == SQLITE_ROW) {
+      const char * text = (const char *)sqlite3_column_text(db->sort_select, 0);
+      if (k >= n || text == NULL || (out[k] = strdup(text)) == NULL) {
+        ok = 0;
+        break;
+      }
+      k++;
+    }
+    if (rc != SQLITE_DONE) {
+      ok = 0;
+    }
+    db_reset(db, db->sort_select);
+  }
+
+  if (!ok || k != n || db_commit(db) != 0) {
+    db_rollback(db);
+    for (size_t i = 0; i < k; i++) {
+      free(out[i]);
+    }
+    free(out);
+    return -1;
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    free(paths[i]);
+  }
+  memcpy(paths, out, n * sizeof(*paths));
+  free(out);
+  return 0;
+} /* db_order_paths */
 
 /*
  * db_names_free: see include/library/db.h.

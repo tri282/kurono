@@ -318,6 +318,19 @@ int     db_query_tracks_list(Db * db, const char * artist, const char * match,
  */
 int64_t db_count_tracks(Db * db);
 
+/*
+ * db_track_id_by_path: the id of the track stored under exactly `path`,
+ * or 0 when there is none or on error. Byte-exact; the caller normalises.
+ */
+int64_t db_track_id_by_path(Db * db, const char * path);
+
+/*
+ * db_order_paths: reorder paths[0..n) in place into the Library list's
+ * order (LIST_ORDER_TERMS), paths with no track row last, by path.
+ * Paths must be distinct. Returns 0, or -1 with paths unchanged.
+ */
+int db_order_paths(Db * db, char ** paths, size_t n);
+
 /* db_names_free: free an array returned by db_query_dirs/artists/albums_for. */
 void db_names_free(char ** names, size_t n);
 

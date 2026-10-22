@@ -88,4 +88,13 @@ typedef struct {
  */
 int scan_run(Db * db, const ScanOpts * opts);
 
+/*
+ * scan_has_audio_ext: case-insensitive compare of the extension against
+ * the scanner's table. Takes a basename or a full path; only the text
+ * after the last `.` is compared, so a dot in a directory name never
+ * matches an audio extension. Returns 1 on a match, 0 otherwise (no
+ * extension included).
+ */
+int scan_has_audio_ext(const char * name);
+
 #endif // KURONO_LIBRARY_SCAN_H

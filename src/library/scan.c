@@ -49,13 +49,9 @@ typedef struct {
   int              skipped;
 } ScanCtx;
 
-/*
- * has_audio_ext: case-insensitive compare of name's extension against
- * SCAN_EXT_TABLE. Takes a basename, returns 1 if it matches, 0 otherwise
- * (no extension included).
- */
-static int
-has_audio_ext(const char * name)
+/* scan_has_audio_ext: see include/library/scan.h. */
+int
+scan_has_audio_ext(const char * name)
 {
   const char * dot = strrchr(name, '.');
   if (dot == NULL) {
@@ -67,7 +63,7 @@ has_audio_ext(const char * name)
     }
   }
   return 0;
-} /* has_audio_ext */
+} /* scan_has_audio_ext */
 
 /*
  * dir_is_ignored: exact, case-sensitive basename compare against
@@ -173,7 +169,7 @@ walk_dir(const char * dir, ScanCtx * ctx, int depth)
     if (de->d_name[0] == '.') {
       continue;
     }
-    if (has_audio_ext(de->d_name)) {
+    if (scan_has_audio_ext(de->d_name)) {
       ctx->total++;
     }
   }
@@ -202,7 +198,7 @@ walk_dir(const char * dir, ScanCtx * ctx, int depth)
       if (S_ISDIR(rst.st_mode)) {
         continue; /* never follow a symlinked directory out of the tree */
       }
-      if (S_ISREG(rst.st_mode) && has_audio_ext(de->d_name)) {
+      if (S_ISREG(rst.st_mode) && scan_has_audio_ext(de->d_name)) {
         process_leaf(path, &rst, ctx);
       }
       continue;
@@ -216,7 +212,7 @@ walk_dir(const char * dir, ScanCtx * ctx, int depth)
       continue;
     }
 
-    if (S_ISREG(lst.st_mode) && has_audio_ext(de->d_name)) {
+    if (S_ISREG(lst.st_mode) && scan_has_audio_ext(de->d_name)) {
       process_leaf(path, &lst, ctx);
     }
   }

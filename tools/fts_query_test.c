@@ -1506,6 +1506,101 @@ test_list_order(void)
 } /* test_list_order */
 
 /*
+ * test_order_paths: F-o. db_order_paths over the group fixture's paths
+ * plus two outside the library, shuffled with a fixed seed, returns the
+ * All listing's order followed by the outside paths in byte order;
+ * n < 2 is a no-op; db_track_id_by_path agrees with the listing's ids.
+ */
+static void
+test_order_paths(void)
+{
+  Db *         gdb = group_fixture_db();
+  DbTrackRow * rows = NULL;
+  size_t       n = 0;
+
+  if (gdb == NULL || db_query_tracks_list(gdb, NULL, NULL, &rows, &n) != 0 || n == 0) {
+    CHECK(0, "group fixture unavailable for F-o");
+    return;
+  }
+
+  size_t  total = n + 2;
+  char ** want = calloc(total, sizeof(*want));
+  char ** in = calloc(total, sizeof(*in));
+  int     ok = (want != NULL && in != NULL);
+
+  for (size_t i = 0; ok && i < n; i++) {
+    DbTrackRow full;
+    memset(&full, 0, sizeof(full));
+    if (!db_query_track_by_id(gdb, rows[i].id, &full)) {
+      ok = 0;
+      break;
+    }
+    want[i] = strdup(full.path);
+    ok = (want[i] != NULL);
+    CHECK(db_track_id_by_path(gdb, full.path) == rows[i].id,
+          "F-o db_track_id_by_path(%s) != %" PRId64, full.path, rows[i].id);
+    db_track_row_free_fields(&full);
+  }
+  CHECK(ok, "F-o expected order could not be built");
+  CHECK(db_track_id_by_path(gdb, "/aa/outside-a.flac") == 0, "F-o outside path has an id");
+  CHECK(db_track_id_by_path(gdb, NULL) == 0, "F-o NULL path has an id");
+
+  if (ok) {
+    want[n] = strdup("/aa/outside-a.flac");
+    want[n + 1] = strdup("/zz/outside-b.flac");
+    for (size_t i = 0; i < total; i++) {
+      in[i] = strdup(want[i]);
+    }
+
+    unsigned int seed = 27;
+    for (size_t i = total - 1; i > 0; i--) {
+      size_t j = (size_t)rand_r(&seed) % (i + 1);
+      char * t = in[i];
+      in[i] = in[j];
+      in[j] = t;
+    }
+
+    /* the trailing sort_in.path term is only exercised when b precedes a */
+    size_t ia = 0, ib = 0;
+    for (size_t i = 0; i < total; i++) {
+      if (strcmp(in[i], "/aa/outside-a.flac") == 0) {
+        ia = i;
+      }
+      if (strcmp(in[i], "/zz/outside-b.flac") == 0) {
+        ib = i;
+      }
+    }
+    if (ia < ib) {
+      char * t = in[ia];
+      in[ia] = in[ib];
+      in[ib] = t;
+    }
+
+    CHECK(db_order_paths(gdb, in, total) == 0, "F-o db_order_paths failed");
+    for (size_t i = 0; i < total; i++) {
+      CHECK(in[i] != NULL && strcmp(in[i], want[i]) == 0, "F-o position %zu is %s, want %s", i,
+            in[i] != NULL ? in[i] : "(null)", want[i]);
+    }
+
+    char * one[1] = { in[0] };
+    CHECK(db_order_paths(gdb, one, 1) == 0 && one[0] == in[0], "F-o n=1 changed the array");
+    CHECK(db_order_paths(gdb, one, 0) == 0 && one[0] == in[0], "F-o n=0 changed the array");
+  }
+
+  for (size_t i = 0; i < total; i++) {
+    if (want != NULL) {
+      free(want[i]);
+    }
+    if (in != NULL) {
+      free(in[i]);
+    }
+  }
+  free(want);
+  free(in);
+  db_track_rows_free(rows, n);
+} /* test_order_paths */
+
+/*
  * count_artist_in_all: rows of `db`'s All listing whose artist equals
  * `artist` byte for byte; the independent oracle for the group fixture.
  */
@@ -2405,6 +2500,7 @@ int main(int argc, char ** argv)
     test_prefix_range_precondition();
     test_upsert_preserves_id();
     test_list_order();
+    test_order_paths();
     test_list_artist();
     test_list_compose();
     test_list_cap();
