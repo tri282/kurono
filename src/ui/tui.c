@@ -126,6 +126,22 @@ static int        g_editing  = 0;
 static char       g_filter_facet[FILTER_MAX];
 static char       g_filter_main[FILTER_MAX];
 
+/* Playlists focus (design P3): SOURCES or QUEUE. */
+static RegionRole g_pl_focus = ROLE_QUEUE;
+
+/*
+ * The playlist prompt (design P9): one slot, TEXT or CONFIRM, resolved
+ * through KEYCTX_FILTER like filter editing and never at the same time
+ * as it. The question is copied at open; main.c reads the buffer through
+ * ui_prompt_text and keeps the intent itself.
+ */
+#define PROMPT_Q_MAX         320   /* fixed question text plus a 250-byte name */
+#define PROMPT_TEXT_LABEL    "-- NAME --"
+#define PROMPT_CONFIRM_LABEL "-- Y/N --"
+static PromptKind g_prompt = PROMPT_NONE;
+static char       g_prompt_q[PROMPT_Q_MAX];
+static char       g_prompt_buf[FILTER_MAX];
+
 /* The `200+` marker on MAIN's filter line (design IV.5). */
 #define FILTER_CAP_MARK "200+"
 
@@ -161,6 +177,17 @@ tui_compute_layout(void)
       && layout_find(&g_layout, ROLE_FACET) == NULL) {
     g_focus   = ROLE_MAIN;
     g_editing = 0;
+  }
+  /* Same rule in Playlists (design III.4, decide V5: unreachable with
+     today's variants, kept as an invariant). */
+  if (g_view == VIEW_PLAYLISTS && g_pl_focus == ROLE_SOURCES
+      && layout_find(&g_layout, ROLE_SOURCES) == NULL) {
+    g_pl_focus = ROLE_QUEUE;
+  }
+  /* Input state never outlives the surface it draws on (D17). Cancel
+     dispatches nothing (design II.2). */
+  if (g_layout.too_small) {
+    g_prompt = PROMPT_NONE;
   }
 } /* tui_compute_layout */
 
@@ -622,6 +649,10 @@ static const char * const g_mode_label[MODE_COUNT] = {
 /* Filter editing is a context, not a mode (design II.8). */
 #define FILTER_LABEL "-- FILTER --"
 
+_Static_assert(sizeof PROMPT_TEXT_LABEL - 1 <= MODE_FIELD_W
+               && sizeof PROMPT_CONFIRM_LABEL - 1 <= MODE_FIELD_W,
+               "prompt labels fit the mode field");
+
 _Static_assert(sizeof(g_mode_label) / sizeof(g_mode_label[0]) == MODE_COUNT,
                "every UiMode needs a label in g_mode_label");
 
@@ -742,6 +773,71 @@ draw_overlay(void)
 } /* draw_overlay */
 
 /*
+ * tail_fitting: byte offset of the shortest suffix of `s` that is at most
+ * `cols` columns wide, cut on a codepoint boundary, by the same wcwidth
+ * rule as text_width. Takes the string and the column budget (>= 0);
+ * returns the offset.
+ */
+static size_t
+tail_fitting(const char * s, int cols)
+{
+  int    total = text_width(s);
+  size_t off   = 0;
+
+  while (total > cols && s[off] != '\0') {
+    uint32_t uni = 0;
+    int      len = tb_utf8_char_to_unicode(&uni, s + off);
+    if (len <= 0) {
+      break;
+    }
+    off += (size_t) len;
+
+    int cw = wcwidth((wchar_t) uni);
+    if (cw > 0) {
+      total -= cw;
+    }
+  }
+  return off;
+} /* tail_fitting */
+
+/*
+ * draw_prompt: the open prompt in the status bar's right part (design
+ * II.2, U4). CONFIRM draws its question, whose name comes last so the end
+ * ellipsis cuts only the name. TEXT draws the question, then the buffer
+ * cut at its start with a leading U+2026 when it overflows, then a block
+ * cursor. Takes the origin column, the row and the width; returns nothing.
+ */
+static void
+draw_prompt(int x, int y, int w)
+{
+  if (g_prompt == PROMPT_CONFIRM) {
+    draw_text(x, y, w, STYLE_STATUSBAR, g_prompt_q);
+    return;
+  }
+
+  int qw = text_width(g_prompt_q);
+  draw_text(x, y, w, STYLE_STATUSBAR, g_prompt_q);
+
+  int avail = w - qw - 1;   /* one column for the cursor */
+  int cx    = x + qw;
+  if (avail >= 2) {
+    if (text_width(g_prompt_buf) <= avail) {
+      draw_text(cx, y, avail, STYLE_SEARCH_MATCH, g_prompt_buf);
+      cx += text_width(g_prompt_buf);
+    } else {
+      const char * tail = g_prompt_buf
+                          + tail_fitting(g_prompt_buf, avail - 1);
+      draw_text(cx, y, 1, STYLE_SEARCH_MATCH, "\xe2\x80\xa6");
+      draw_text(cx + 1, y, avail - 1, STYLE_SEARCH_MATCH, tail);
+      cx += 1 + text_width(tail);
+    }
+  }
+  if (cx < x + w) {
+    draw_text(cx, y, 1, STYLE_CURSOR, " ");
+  }
+} /* draw_prompt */
+
+/*
  * draw_statusbar: the last row -- progress bar, clock, volume, shuffle
  * and repeat indicators, and the current message. Takes the model,
  * returns nothing.
@@ -759,8 +855,18 @@ draw_statusbar(const TuiModel * m)
   int bar_x = 1;
   if (g_layout.w >= MODE_FIELD_W + PROGRESS_W + 4) {
     draw_text(1, y, MODE_FIELD_W, STYLE_MODE,
-              g_editing ? FILTER_LABEL : mode_label(ui_mode()));
+              (g_prompt == PROMPT_TEXT)    ? PROMPT_TEXT_LABEL
+              : (g_prompt == PROMPT_CONFIRM) ? PROMPT_CONFIRM_LABEL
+              : g_editing                    ? FILTER_LABEL
+                                             : mode_label(ui_mode()));
     bar_x = MODE_FIELD_W + 1;
+  }
+
+  /* An open prompt owns everything right of the mode field; the pending
+     message keeps its timer in main.c and shows again after (U12). */
+  if (g_prompt != PROMPT_NONE) {
+    draw_prompt(bar_x, y, g_layout.w - bar_x);
+    return;
   }
 
   /* Progress bar. An unknown duration leaves it empty rather than full:
@@ -881,6 +987,49 @@ overlay_scroll_action(Action a)
 } /* overlay_scroll_action */
 
 /*
+ * text_edit: one editing key against a NUL-terminated UTF-8 buffer of
+ * `cap` bytes (design II.2). ACT_REMOVE deletes one codepoint; ACT_NONE
+ * with a non-zero ev->ch inserts it if it fits whole; everything else,
+ * and ch == 0, changes nothing. Takes the buffer, its capacity, the
+ * event and the resolved action; returns nothing.
+ */
+static void
+text_edit(char * buf, size_t cap, const struct tb_event * ev, Action a)
+{
+  size_t len = strlen(buf);
+
+  switch (a) {
+    case ACT_REMOVE:
+      /* One codepoint, not one byte: a truncated sequence would reach the
+         FTS query. */
+      while (len > 0) {
+        len--;
+        if (((unsigned char) buf[len] & 0xc0) != 0x80) {
+          break;
+        }
+      }
+      buf[len] = '\0';
+      return;
+
+    case ACT_NONE: {
+      if (ev->ch == 0) {
+        return;  /* an unbound non-character key: swallowed, not text */
+      }
+      char enc[8];
+      int  n = tb_utf8_unicode_to_char(enc, ev->ch);
+      if (n > 0 && len + (size_t) n < cap) {
+        memcpy(buf + len, enc, (size_t) n);
+        buf[len + (size_t) n] = '\0';
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+} /* text_edit */
+
+/*
  * filter_key: handle one key event while a Library filter is being edited
  * (KEYCTX_FILTER, design III.5). Takes the event and the action it
  * resolved to; returns 0 for the actions keymap_filter_consumes hands on
@@ -901,7 +1050,6 @@ filter_key(const struct tb_event * ev, Action a)
     return 1;
   }
 
-  size_t len = strlen(buf);
   switch (a) {
     case ACT_SEARCH_CANCEL:
     case ACT_QUIT:
@@ -916,34 +1064,55 @@ filter_key(const struct tb_event * ev, Action a)
       return 1;
 
     case ACT_REMOVE:
-      /* One codepoint, not one byte: a truncated sequence would reach the
-         FTS query. */
-      while (len > 0) {
-        len--;
-        if (((unsigned char) buf[len] & 0xc0) != 0x80) {
-          break;
-        }
-      }
-      buf[len] = '\0';
+    case ACT_NONE:
+      text_edit(buf, FILTER_MAX, ev, a);
       return 1;
-
-    case ACT_NONE: {
-      if (ev->ch == 0) {
-        return 1;  /* an unbound non-character key: swallowed, not text */
-      }
-      char enc[8];
-      int  n = tb_utf8_unicode_to_char(enc, ev->ch);
-      if (n > 0 && len + (size_t) n < FILTER_MAX) {
-        memcpy(buf + len, enc, (size_t) n);
-        buf[len + (size_t) n] = '\0';
-      }
-      return 1;
-    }
 
     default:
       return 1;  /* exclusive context: nothing else gets through */
   }
 } /* filter_key */
+
+/*
+ * prompt_key: one key while a prompt is open (design II.2). Always
+ * consumes. CONFIRM closes on any key and dispatches the accept only for
+ * keymap_confirm_accepts (P10). TEXT: Esc and ctrl-c cancel (D16 extended:
+ * a dispatched ACT_QUIT would end the run), Enter closes and dispatches
+ * the accept, Tab dispatches ACT_PROMPT_CYCLE with the prompt left open,
+ * Backspace and text go to text_edit, anything else is swallowed. The
+ * prompt is closed before any dispatch, so main.c may open the next one
+ * from inside it. Takes the event and the resolved action.
+ */
+static void
+prompt_key(const struct tb_event * ev, Action a)
+{
+  if (g_prompt == PROMPT_CONFIRM) {
+    g_prompt = PROMPT_NONE;
+    if (keymap_confirm_accepts(a, ev)) {
+      action_dispatch(ACT_CONFIRM, UI_PROMPT_ACCEPTED);
+    }
+    return;
+  }
+  switch (a) {
+    case ACT_SEARCH_CANCEL:
+    case ACT_QUIT:
+      g_prompt = PROMPT_NONE;
+      return;
+    case ACT_CONFIRM:
+      g_prompt = PROMPT_NONE;
+      action_dispatch(ACT_CONFIRM, UI_PROMPT_ACCEPTED);
+      return;
+    case ACT_PROMPT_CYCLE:
+      action_dispatch(ACT_PROMPT_CYCLE, 0);
+      return;
+    case ACT_REMOVE:
+    case ACT_NONE:
+      text_edit(g_prompt_buf, sizeof g_prompt_buf, ev, a);
+      return;
+    default:
+      return;   /* up/down included: swallowed in a prompt (design II.1) */
+  }
+} /* prompt_key */
 
 /*
  * dispatch_event: route one termbox event by its type. Key events resolve
@@ -960,8 +1129,15 @@ dispatch_event(const struct tb_event * ev)
       int32_t arg  = 0;
       UiMode  mode = ui_mode();
       KeyCtx  chain[KEYCTX_CHAIN_MAX];
-      size_t  nc   = keymap_chain(mode, g_editing, g_view, chain);
+      size_t  nc   = keymap_chain(mode, g_editing || g_prompt != PROMPT_NONE,
+                                 g_view, chain);
       Action  a    = keymap_resolve(chain, nc, ev, &arg);
+
+      if (g_prompt != PROMPT_NONE) {   /* exclusive with g_editing (design II.2) */
+        prompt_key(ev, a);
+        g_dirty = 1;
+        break;
+      }
 
       /* Filter text is terminal state and lives in this file; main.c
          reads the buffers at repaint (design II.7). */
@@ -1165,7 +1341,7 @@ ui_focus(void)
   switch (g_view) {
     case VIEW_LIBRARY:     return g_focus;
     case VIEW_DIRECTORIES: return ROLE_MAIN;
-    case VIEW_PLAYLISTS:   return ROLE_QUEUE;
+    case VIEW_PLAYLISTS:   return g_pl_focus;
     default:               return ROLE_COUNT;
   }
 } /* ui_focus */
@@ -1174,11 +1350,17 @@ ui_focus(void)
 void
 ui_focus_set(RegionRole r)
 {
-  if (g_view != VIEW_LIBRARY || (r != ROLE_FACET && r != ROLE_MAIN)
-      || layout_find(&g_layout, r) == NULL) {
+  int lib = (g_view == VIEW_LIBRARY && (r == ROLE_FACET || r == ROLE_MAIN));
+  int pl  = (g_view == VIEW_PLAYLISTS && (r == ROLE_SOURCES || r == ROLE_QUEUE));
+
+  if ((!lib && !pl) || layout_find(&g_layout, r) == NULL) {
     return;
   }
-  g_focus = r;
+  if (lib) {
+    g_focus = r;
+  } else {
+    g_pl_focus = r;
+  }
   g_dirty = 1;
 } /* ui_focus_set */
 
@@ -1214,6 +1396,62 @@ ui_filter_editing(void)
 {
   return g_editing;
 } /* ui_filter_editing */
+
+/*
+ * prompt_fill: copy `text` (NULL is empty) into g_prompt_buf, cut on a
+ * codepoint boundary like text_edit's insert. Takes the text; returns
+ * nothing.
+ */
+static void
+prompt_fill(const char * text)
+{
+  size_t n = (text != NULL) ? strlen(text) : 0;
+
+  if (n > sizeof g_prompt_buf - 1) {
+    n = sizeof g_prompt_buf - 1;
+    while (n > 0 && ((unsigned char) text[n] & 0xc0) == 0x80) {
+      n--;
+    }
+  }
+  if (n > 0) {
+    memcpy(g_prompt_buf, text, n);
+  }
+  g_prompt_buf[n] = '\0';
+} /* prompt_fill */
+
+/* ui_prompt_open: see include/ui/tui.h. */
+int
+ui_prompt_open(PromptKind k, const char * question, const char * initial)
+{
+  if (g_layout.too_small || g_prompt != PROMPT_NONE || g_editing
+      || ui_mode() != MODE_NORMAL
+      || (k != PROMPT_TEXT && k != PROMPT_CONFIRM)) {
+    return -1;
+  }
+  snprintf(g_prompt_q, sizeof g_prompt_q, "%s", question);
+  prompt_fill((k == PROMPT_TEXT) ? initial : NULL);
+  g_prompt = k;
+  g_dirty  = 1;
+  return 0;
+} /* ui_prompt_open */
+
+/* ui_prompt_set_text: see include/ui/tui.h. */
+void
+ui_prompt_set_text(const char * text)
+{
+  if (g_prompt != PROMPT_TEXT) {
+    return;
+  }
+  prompt_fill(text);
+  g_dirty = 1;
+} /* ui_prompt_set_text */
+
+/* ui_prompt_text: see include/ui/tui.h. */
+const char *
+ui_prompt_text(void)
+{
+  return g_prompt_buf;
+} /* ui_prompt_text */
 
 /*
  * tui_active: whether the terminal is currently claimed. Takes nothing,

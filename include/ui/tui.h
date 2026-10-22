@@ -111,17 +111,17 @@ void   ui_mode_pop(void);
  * ui_view returns the current view. ui_view_set stores `v`, recomputes
  * the layout and marks the screen dirty; the caller validates the range.
  * ui_focus returns the role that owns the cursor: ROLE_FACET or
- * ROLE_MAIN in Library, ROLE_MAIN in Directories, ROLE_QUEUE in
- * Playlists, ROLE_COUNT (none) in Now playing and Settings.
+ * ROLE_MAIN in Library, ROLE_MAIN in Directories, ROLE_QUEUE or
+ * ROLE_SOURCES in Playlists (initially ROLE_QUEUE), ROLE_COUNT (none) in Now playing and Settings.
  */
 UiView     ui_view(void);
 void       ui_view_set(UiView v);
 RegionRole ui_focus(void);
 
 /*
- * ui_focus_set: move Library focus to `r` (ROLE_FACET or ROLE_MAIN).
- * Ignored outside Library and for a role the layout did not allocate.
- * Takes the role, returns nothing.
+ * ui_focus_set: move focus to `r`: ROLE_FACET or ROLE_MAIN in Library,
+ * ROLE_SOURCES or ROLE_QUEUE in Playlists; ignored in other views and for
+ * a role the layout did not allocate. Takes the role, returns nothing.
  */
 void       ui_focus_set(RegionRole r);
 
@@ -142,6 +142,30 @@ const char * ui_filter(RegionRole r);
 
 /* ui_filter_editing: 1 while KEYCTX_FILTER is the chain (design II.7). */
 int        ui_filter_editing(void);
+
+/* Playlists prompt kinds (design P9). */
+typedef enum { PROMPT_NONE = 0, PROMPT_TEXT, PROMPT_CONFIRM } PromptKind;
+
+/* The arg of the ACT_CONFIRM tui.c dispatches when a prompt is answered;
+   table rows bind ACT_CONFIRM with 0. */
+#define UI_PROMPT_ACCEPTED 1
+
+/*
+ * ui_prompt_open: open a bottom-bar prompt with `question`, copied.
+ * Returns 0, or -1 when the terminal is too small, a prompt is open, a
+ * filter is being edited, or the mode stack is not at MODE_NORMAL (an
+ * overlay's chain would hide the prompt from input). A TEXT prompt starts
+ * with `initial` (NULL is empty), cursor at its end; CONFIRM ignores it.
+ */
+int ui_prompt_open(PromptKind k, const char * question, const char * initial);
+
+/* ui_prompt_set_text: replace an open TEXT prompt's buffer (Tab cycling);
+   ignored when no TEXT prompt is open. Truncates to the buffer. */
+void ui_prompt_set_text(const char * text);
+
+/* ui_prompt_text: the last TEXT prompt's buffer, never NULL; valid until
+   the next ui_prompt_open. */
+const char * ui_prompt_text(void);
 
 void tui_get_fds(int * ttyfd, int * resizefd);
 
