@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -385,6 +386,15 @@ static const int g_ladder_backoff_ms[] = { 250, 500, 1000, 2000, 4000 };
 #define CB_STALL_TICKS    5
 #define LADDER_GIVE_UP_MS 60000
 
+/* Why a prompt is open, read only when it is accepted (design II.2). */
+#define PROMPT_FOR_SAVE       1
+#define PROMPT_FOR_OVERWRITE  2
+#define PROMPT_FOR_DELETE     3
+#define PROMPT_FOR_ADD_TO     4
+
+/* Appended to a save report when the directory fsync was unconfirmed. */
+#define UNSYNCED_NOTE ", but not confirmed on disk"
+
 /*
  * DeviceState: T1's own view of the device, distinct from EngineState.
  * DESIGN.md IV.8 names a DEVICE_LOST engine state, but T1 storing it
@@ -479,6 +489,13 @@ typedef struct {
   int          pl_view_ro;         /* unusable lines or a symlink: edits refused */
   size_t       pl_view_bad;        /* the unusable-line count, for the message */
   size_t       queue_pane_cursor;  /* the Queue source's pane cursor while away */
+
+  /* Playlist prompts (design II.2, II.8). */
+  int          prompt_for;         /* PROMPT_FOR_*, read only on accept */
+  char         prompt_name[PLAYLIST_NAME_BUF];
+  char         last_added[PLAYLIST_NAME_BUF];   /* `t` pre-fill, session only (P28) */
+  char **      add_paths;          /* `t`'s targets while its prompt is open */
+  size_t       add_n;
 
   Queue *         q;                 /* NULL on every headless run */
 
@@ -632,6 +649,9 @@ static void player_ladder_attempt(Player * p);
 static void player_on_notify(void * user, int notification_type);
 static void player_source_select(Player * p, size_t idx);
 static void player_sources_refresh(Player * p);
+static void player_playlist_add_begin(Player * p);
+static void player_prompt_cycle(Player * p);
+static void player_prompt_accepted(Player * p);
 static void player_view_settings_build(Player * p);
 static void player_view_rows_free(BrowserRow * rows, size_t n);
 
@@ -890,6 +910,12 @@ action_dispatch(Action a, int32_t arg)
     return;
   }
 
+  if (a == ACT_CONFIRM && arg == UI_PROMPT_ACCEPTED) {
+    player_prompt_accepted(p);
+    tui_mark_dirty();
+    return;
+  }
+
   if (a == ACT_HELP_TOGGLE) {
     if (ui_mode_toggle(MODE_HELP) < 0) {
       player_report(p, "terminal too small for the help overlay");
@@ -956,6 +982,18 @@ action_dispatch(Action a, int32_t arg)
     }
     default:
       break;
+  }
+
+  /* Every view where `a` enqueues, plus the prompt's Tab (design III.5). */
+  if (a == ACT_PLAYLIST_ADD) {
+    player_playlist_add_begin(p);
+    tui_mark_dirty();
+    return;
+  }
+  if (a == ACT_PROMPT_CYCLE) {
+    player_prompt_cycle(p);
+    tui_mark_dirty();
+    return;
   }
 
   /* A page is one screenful minus a row of overlap, so the line the user
@@ -1153,58 +1191,6 @@ player_append_rows(Player * p, const DbTrackRow * rows, size_t n, const char * n
 } /* player_append_rows */
 
 /*
- * player_enqueue_row: ACT_ENQUEUE's whole body, for one browser row of
- * any kind. Takes the Player and the selected row, returns nothing --
- * every outcome is a status-bar line.
- *
- * A container row is expanded by the source (browser_library_expand),
- * never by parsing its key here: phase 16's ruling that the encoding has
- * exactly one owner. A row that expands to nothing and is not a track is
- * reported as empty rather than queued silently.
- */
-static void
-player_enqueue_row(Player * p, const BrowserRow * sel)
-{
-  DbTrackRow * rows = NULL;
-  size_t       n = 0;
-
-  if (browser_library_expand(player_view_src(p), sel->key, &rows, &n) == 0 && n > 0) {
-    player_append_rows(p, rows, n, sel->name);
-    db_track_rows_free(rows, n);
-    return;
-  }
-  db_track_rows_free(rows, n);
-
-  if (sel->is_dir) {
-    /* A container the source could not expand, or one holding nothing:
-       the synthetic root is the first, an empty directory the second.
-       Neither is an error and neither queues anything. */
-    player_report(p, "%s holds no tracks", sel->name);
-    return;
-  }
-
-  /* A track. The id is 0 only for a source with no library row behind
-     it; the display-metadata branch keys on track_id > 0, which is why
-     the value is carried through the queue rather than recovered
-     later. */
-  char *  qpath = NULL;
-  int64_t qid   = 0;
-  if (player_row_target(p, sel, &qpath, &qid) != 0) {
-    player_report(p, "could not queue %s", sel->name);
-    return;
-  }
-  if (queue_append(p->q, qid, qpath) != 0) {
-    free(qpath);
-    player_report(p, "could not queue %s", sel->name);
-    return;
-  }
-  free(qpath);
-  player_queue_changed(p);
-  player_report(p, "queued: %s (%zu in queue)", sel->name, queue_count(p->q));
-  tui_mark_dirty();
-} /* player_enqueue_row */
-
-/*
  * player_play_rows: insert `rows` after the queue cursor and play the
  * first of them. Takes the Player, the rows (still the caller's), their
  * count and a name for the messages; returns nothing.
@@ -1308,6 +1294,130 @@ library_header_tracks(Player * p, DbTrackRow ** out, size_t * n)
 } /* library_header_tracks */
 
 /*
+ * player_selection_tracks: the tracks `a` would queue for the current
+ * selection in Library or Directories (design P30): a Library header's
+ * listed tracks, a container's expansion, or the one track. Takes the
+ * Player and out-params for rows the caller frees with db_track_rows_free
+ * (id and path set; an unresolved row keeps a NULL path), the selection's
+ * display name (borrowed until the next browser call) and whether the
+ * selection was a container (NULL allowed); returns 0, or -1 having
+ * reported exactly what `a` reports for the same selection (nothing
+ * selected, All, holds no tracks, could not queue).
+ *
+ * A container is expanded by the source (browser_library_expand), never
+ * by parsing its key here: the encoding has exactly one owner.
+ */
+static int
+player_selection_tracks(Player * p, DbTrackRow ** out, size_t * n,
+                        const char ** label, int * container)
+{
+  Browser *          b    = player_focus_browser(p);
+  const BrowserRow * sel  = NULL;
+  DbTrackRow *       rows = NULL;
+  size_t             cnt  = 0;
+  int                lib  = (ui_view() == VIEW_LIBRARY);
+
+  if (b == NULL || p->q == NULL) {
+    player_report(p, "nothing to queue");
+    return -1;
+  }
+  sel = browser_selection(b);
+  if (sel == NULL) {
+    player_report(p, "nothing selected");
+    return -1;
+  }
+  if (lib && ui_focus() == ROLE_FACET && browser_cursor(b) == 0) {
+    /* All is not a container (design III.6). */
+    player_report(p, "nothing to queue in %s", sel->name);
+    return -1;
+  }
+
+  if (lib && ui_focus() == ROLE_MAIN && sel->is_dir) {
+    if (library_header_tracks(p, &rows, &cnt) != 0) {
+      player_report(p, "out of memory, %s not queued", sel->name);
+      return -1;
+    }
+    if (cnt == 0) {
+      db_track_rows_free(rows, cnt);
+      player_report(p, "%s holds no tracks", sel->name);
+      return -1;
+    }
+  } else if (browser_library_expand(player_view_src(p), sel->key, &rows, &cnt) == 0
+             && cnt > 0) {
+    /* rows and cnt are the expansion */
+  } else {
+    db_track_rows_free(rows, cnt);
+    rows = NULL;
+    cnt  = 0;
+    if (sel->is_dir) {
+      /* A container the source could not expand, or one holding nothing:
+         the synthetic root is the first, an empty directory the second. */
+      player_report(p, "%s holds no tracks", sel->name);
+      return -1;
+    }
+
+    /* A track. The id is 0 only for a source with no library row behind
+       it; the display-metadata branch keys on track_id > 0, which is why
+       the value is carried through the queue rather than recovered
+       later. */
+    char *  path = NULL;
+    int64_t id   = 0;
+    rows = calloc(1, sizeof *rows);
+    if (rows == NULL || player_row_target(p, sel, &path, &id) != 0) {
+      free(rows);
+      player_report(p, "could not queue %s", sel->name);
+      return -1;
+    }
+    rows[0].path = path;
+    rows[0].id   = id;
+    cnt = 1;
+    if (container != NULL) {
+      *container = 0;
+    }
+    *out   = rows;
+    *n     = cnt;
+    *label = sel->name;
+    return 0;
+  }
+
+  if (container != NULL) {
+    *container = 1;
+  }
+  *out   = rows;
+  *n     = cnt;
+  *label = sel->name;
+  return 0;
+} /* player_selection_tracks */
+
+/*
+ * player_enqueue_selection: ACT_ENQUEUE's whole body for Library and
+ * Directories. Takes the Player, returns nothing -- every outcome is a
+ * status-bar line.
+ */
+static void
+player_enqueue_selection(Player * p)
+{
+  DbTrackRow * rows      = NULL;
+  size_t       n         = 0;
+  const char * label     = NULL;
+  int          container = 0;
+
+  if (player_selection_tracks(p, &rows, &n, &label, &container) != 0) {
+    return;
+  }
+  if (container) {
+    player_append_rows(p, rows, n, label);
+  } else if (queue_append(p->q, rows[0].id, rows[0].path) != 0) {
+    player_report(p, "could not queue %s", label);
+  } else {
+    player_queue_changed(p);
+    player_report(p, "queued: %s (%zu in queue)", label, queue_count(p->q));
+    tui_mark_dirty();
+  }
+  db_track_rows_free(rows, n);
+} /* player_enqueue_selection */
+
+/*
  * library_action: the Library arms of design III.4 and III.6 -- focus
  * moves, the facet toggle, the All row's report and header-row play and
  * enqueue. Takes the Player and the action; returns 1 when handled, 0 to
@@ -1339,8 +1449,11 @@ library_action(Player * p, Action a)
       ui_focus_set(ROLE_MAIN);
       return 0;
 
-    case ACT_PLAY_NOW:
-    case ACT_ENQUEUE: {
+    case ACT_ENQUEUE:
+      player_enqueue_selection(p);
+      return 1;
+
+    case ACT_PLAY_NOW: {
       Browser *          b   = player_focus_browser(p);
       const BrowserRow * sel = (b != NULL) ? browser_selection(b) : NULL;
       if (sel == NULL || p->q == NULL) {
@@ -1363,8 +1476,6 @@ library_action(Player * p, Action a)
       }
       if (n == 0) {
         player_report(p, "%s holds no tracks", sel->name);
-      } else if (a == ACT_ENQUEUE) {
-        player_append_rows(p, rows, n, sel->name);
       } else {
         player_play_rows(p, rows, n, sel->name);
       }
@@ -2794,23 +2905,33 @@ player_playable(const char * path)
 } /* player_playable */
 
 /*
- * player_report_ro: the read-only refusal for the viewed playlist (design
- * II.8). Takes the Player, returns nothing. Edits are refused when the
- * parse counted unusable lines or the file is a symlink; with no
- * unusable line the cause is the link.
+ * player_report_ro: the read-only refusal (design II.8). Takes the
+ * Player, the playlist's stem and its unusable-line count, returns
+ * nothing. Edits are refused when the parse counted unusable lines or the
+ * file is a symlink; with no unusable line the cause is the link.
  */
 static void
-player_report_ro(Player * p)
+player_report_ro(Player * p, const char * name, size_t bad)
 {
-  const char * name = player_pl_name(p);
-
-  if (p->pl_view_bad == 0) {
+  if (bad == 0) {
     player_report(p, "read-only playlist (symlink): %s", name);
   } else {
-    player_report(p, "read-only playlist (%zu unreadable lines): %s",
-                  p->pl_view_bad, name);
+    player_report(p, "read-only playlist (%zu unreadable lines): %s", bad, name);
   }
 } /* player_report_ro */
+
+/*
+ * player_settings_rebuild: rebuild the Settings rows, after the playlist
+ * directory was created (its `(missing)` marker). Takes the Player.
+ */
+static void
+player_settings_rebuild(Player * p)
+{
+  player_view_rows_free(p->settings_rows, p->settings_n);
+  p->settings_rows = NULL;
+  p->settings_n    = 0;
+  player_view_settings_build(p);
+} /* player_settings_rebuild */
 
 /*
  * player_playlist_store: write `paths` as the saved playlist `name`
@@ -2859,10 +2980,7 @@ player_playlist_store(Player * p, const char * name, char ** paths, size_t n,
   if (rc >= 0) {
     *out_written = n - skipped;
     if (!dir_existed) {
-      player_view_rows_free(p->settings_rows, p->settings_n);
-      p->settings_rows = NULL;
-      p->settings_n    = 0;
-      player_view_settings_build(p);
+      player_settings_rebuild(p);
     }
   }
   return rc;
@@ -3230,7 +3348,7 @@ player_playlist_remove_entry(Player * p)
   int     rc      = 0;
 
   if (p->pl_view_ro) {
-    player_report_ro(p);
+    player_report_ro(p, player_pl_name(p), p->pl_view_bad);
     return;
   }
   if (p->pl_view == NULL || queue_count(p->pl_view) == 0) {
@@ -3277,6 +3395,511 @@ player_playlist_remove_entry(Player * p)
   queueview_cursor_set(at);
   tui_mark_dirty();
 } /* player_playlist_remove_entry */
+
+/*
+ * player_add_paths_free: free `t`'s collected targets. Takes the Player,
+ * returns nothing. Called at every `t` open, after an accept and at
+ * teardown; a cancel dispatches nothing, so its paths wait for the next
+ * open (design IV "Add to playlist").
+ */
+static void
+player_add_paths_free(Player * p)
+{
+  for (size_t i = 0; i < p->add_n; i++) {
+    free(p->add_paths[i]);
+  }
+  free(p->add_paths);
+  p->add_paths = NULL;
+  p->add_n     = 0;
+} /* player_add_paths_free */
+
+/*
+ * player_prompt_name: the typed name for an accept (design II.3). Takes
+ * a PLAYLIST_NAME_BUF buffer; returns NULL with the name in `out`, or
+ * the reason to report verbatim. One trailing `.m3u8` is stripped from
+ * the typed text (U8); a Tab-cycled stem has none.
+ */
+static const char *
+player_prompt_name(char * out)
+{
+  const char * text = ui_prompt_text();
+  size_t       len  = strlen(text);
+
+  if (len >= PLAYLIST_NAME_BUF) {
+    return "name is too long";
+  }
+  memcpy(out, text, len + 1);
+  if (len > 5 && strcasecmp(out + len - 5, ".m3u8") == 0) {
+    out[len - 5] = '\0';
+  }
+  return playlist_name_safe(out);
+} /* player_prompt_name */
+
+/*
+ * player_prompt_target: the shared front of the `w` and `t` accepts
+ * (design II.3 order): safety check, directory open, exists, then the
+ * portability check for a name that does not exist (never for one that
+ * does, kurono's or foreign). The directory is not created here: a
+ * missing one holds no playlist, and only the write in
+ * player_playlist_store creates it, so a refused name leaves nothing
+ * behind. Takes the Player, a PLAYLIST_NAME_BUF buffer for the name, and
+ * out-params for whether the playlist exists and for the directory fd
+ * (-1 when the directory is missing; the caller closes it otherwise).
+ * Returns 0, or -1 having reported the reason.
+ */
+static int
+player_prompt_target(Player * p, char * name, int * exists, int * out_dfd)
+{
+  const char * why = player_prompt_name(name);
+  int          dfd;
+
+  *exists  = 0;
+  *out_dfd = -1;
+  if (why != NULL) {
+    player_report(p, "%s", why);
+    return -1;
+  }
+  dfd = playlist_dir_open(p->cfg.playlist_dir, 0);
+  if (dfd < 0 && dfd != -ENOENT) {
+    player_report(p, "could not open playlist directory: %s", strerror(-dfd));
+    return -1;
+  }
+  if (dfd >= 0) {
+    *exists = playlist_exists(dfd, name);
+  }
+  if (!*exists) {
+    why = playlist_name_check(name);
+    if (why != NULL) {
+      if (dfd >= 0) {
+        close(dfd);
+      }
+      player_report(p, "%s", why);
+      return -1;
+    }
+  }
+  *out_dfd = dfd;
+  return 0;
+} /* player_prompt_target */
+
+/*
+ * player_playlist_reload: after a write to `name`. Takes the Player and
+ * the stem; re-lists the directory (the selection is kept by name) and,
+ * when `name` is the selected source, re-reads it with the pane cursor
+ * kept. Returns nothing.
+ */
+static void
+player_playlist_reload(Player * p, const char * name)
+{
+  const char * sel;
+
+  player_sources_refresh(p);
+  sel = player_pl_name(p);
+  if (sel != NULL && strcmp(sel, name) == 0) {
+    size_t keep = queueview_cursor();
+
+    player_source_select(p, p->src_cursor);
+    if (p->src_cursor > 0) {
+      queueview_cursor_set(keep);
+    }
+  }
+} /* player_playlist_reload */
+
+/*
+ * player_playlist_save: write the queue as `name` (design IV "Save").
+ * Takes the Player and a validated stem; returns nothing. The queue's
+ * paths are stored in play order and come back sorted and deduplicated.
+ */
+static void
+player_playlist_save(Player * p, const char * name)
+{
+  size_t  m = (p->q != NULL) ? queue_count(p->q) : 0;
+  char ** paths;
+  size_t  written = 0;
+  int     rc      = 0;
+
+  if (m == 0) {
+    player_report(p, "queue is empty, nothing to save");
+    return;
+  }
+  paths = calloc(m, sizeof *paths);
+  if (paths == NULL) {
+    rc = -ENOMEM;
+  } else {
+    for (size_t i = 0; i < m && rc == 0; i++) {
+      paths[i] = strdup(queue_at(p->q, i)->path);
+      if (paths[i] == NULL) {
+        rc = -ENOMEM;
+      }
+    }
+    if (rc == 0) {
+      rc = player_playlist_store(p, name, paths, m, &written);
+    } else {
+      for (size_t i = 0; i < m; i++) {
+        free(paths[i]);
+      }
+      free(paths);
+    }
+  }
+  if (rc < 0) {
+    player_report(p, "could not save playlist %s: %s", name, strerror(-rc));
+    return;
+  }
+  if (written == m) {
+    player_report(p, "saved %zu tracks to playlist: %s%s", written, name,
+                  (rc == PLAYLIST_UNSYNCED) ? UNSYNCED_NOTE : "");
+  } else {
+    player_report(p, "saved %zu of %zu tracks to playlist: %s%s", written, m, name,
+                  (rc == PLAYLIST_UNSYNCED) ? UNSYNCED_NOTE : "");
+  }
+  player_playlist_reload(p, name);
+} /* player_playlist_save */
+
+/*
+ * player_playlist_save_begin: `w` (design IV "Save"). Takes the Player,
+ * returns nothing. An empty queue is refused before any prompt opens.
+ */
+static void
+player_playlist_save_begin(Player * p)
+{
+  if (p->q == NULL || queue_count(p->q) == 0) {
+    player_report(p, "queue is empty, nothing to save");
+    return;
+  }
+  player_sources_refresh(p);   /* Tab needs current names */
+  p->prompt_for = PROMPT_FOR_SAVE;
+  if (ui_prompt_open(PROMPT_TEXT, "Save queue as: ", NULL) != 0) {
+    player_report(p, "terminal too small for a prompt");
+  }
+} /* player_playlist_save_begin */
+
+/*
+ * player_save_accepted: Enter at the `w` prompt. Takes the Player,
+ * returns nothing. A new name is created; an existing one asks first.
+ */
+static void
+player_save_accepted(Player * p)
+{
+  char name[PLAYLIST_NAME_BUF];
+  int  exists = 0;
+  int  dfd;
+
+  if (player_prompt_target(p, name, &exists, &dfd) != 0) {
+    return;
+  }
+  if (dfd >= 0) {
+    close(dfd);
+  }
+  if (exists) {
+    char q[PLAYLIST_NAME_BUF + 48];
+
+    /* prompt_key closed the TEXT prompt before dispatching, so this opens. */
+    snprintf(p->prompt_name, sizeof p->prompt_name, "%s", name);
+    p->prompt_for = PROMPT_FOR_OVERWRITE;
+    snprintf(q, sizeof q, "already exists, overwrite? (y/N) %s", name);
+    if (ui_prompt_open(PROMPT_CONFIRM, q, NULL) != 0) {
+      player_report(p, "terminal too small for a prompt");
+    }
+    return;
+  }
+  player_playlist_save(p, name);
+} /* player_save_accepted */
+
+/*
+ * player_playlist_add_begin: `t` (design IV "Add to playlist", P26, V6).
+ * Takes the Player, returns nothing. Collects the targets by view and
+ * focus into add_paths, then opens the prompt pre-filled with the last
+ * playlist added to. Anything that yields no target has reported why.
+ */
+static void
+player_playlist_add_begin(Player * p)
+{
+  player_add_paths_free(p);
+
+  if (ui_view() == VIEW_LIBRARY || ui_view() == VIEW_DIRECTORIES) {
+    DbTrackRow * rows      = NULL;
+    size_t       n         = 0;
+    const char * label     = NULL;
+
+    if (player_selection_tracks(p, &rows, &n, &label, NULL) != 0) {
+      return;
+    }
+    p->add_paths = calloc(n, sizeof *p->add_paths);
+    for (size_t i = 0; p->add_paths != NULL && i < n; i++) {
+      if (rows[i].path != NULL
+          && (p->add_paths[p->add_n] = strdup(rows[i].path)) != NULL) {
+        p->add_n++;
+      }
+    }
+    db_track_rows_free(rows, n);
+    if (p->add_n == 0) {
+      player_report(p, "could not queue %s", label);
+      player_add_paths_free(p);
+      return;
+    }
+  } else if (ui_view() == VIEW_PLAYLISTS && ui_focus() == ROLE_QUEUE) {
+    const Queue *      shown = player_shown_queue(p);
+    const QueueEntry * e     = (shown != NULL) ? queue_at(shown, queueview_cursor()) : NULL;
+
+    if (e == NULL) {
+      if (p->src_cursor == 0) {
+        player_report(p, "queue is empty");   /* as `d` on an empty queue */
+      }
+      return;   /* an empty saved playlist: no wording (G8) */
+    }
+    p->add_paths = calloc(1, sizeof *p->add_paths);
+    if (p->add_paths == NULL || (p->add_paths[0] = strdup(e->path)) == NULL) {
+      player_add_paths_free(p);
+      player_report(p, "out of memory");
+      return;
+    }
+    p->add_n = 1;
+  } else if (ui_view() == VIEW_PLAYLISTS && ui_focus() == ROLE_SOURCES) {
+    size_t total = (p->pl_view != NULL) ? queue_count(p->pl_view) : 0;
+
+    if (p->src_cursor == 0) {
+      player_report(p, "use w to save the queue");
+      return;
+    }
+    p->add_paths = calloc((total > 0) ? total : 1, sizeof *p->add_paths);
+    for (size_t i = 0; p->add_paths != NULL && i < total; i++) {
+      const QueueEntry * e = queue_at(p->pl_view, i);
+
+      if (player_playable(e->path) && (p->add_paths[p->add_n] = strdup(e->path)) != NULL) {
+        p->add_n++;
+      }
+    }
+    if (p->add_n == 0) {
+      player_report(p, "no playable tracks in playlist: %s", player_pl_name(p));
+      player_add_paths_free(p);
+      return;
+    }
+  } else {
+    return;
+  }
+
+  player_sources_refresh(p);
+  p->prompt_for = PROMPT_FOR_ADD_TO;
+  if (ui_prompt_open(PROMPT_TEXT, "Add to playlist: ",
+                     (p->last_added[0] != '\0') ? p->last_added : NULL) != 0) {
+    player_report(p, "terminal too small for a prompt");
+    player_add_paths_free(p);
+  }
+} /* player_playlist_add_begin */
+
+/*
+ * player_playlist_add_to: Enter at the `t` prompt (design IV "Add to
+ * playlist"). Takes the Player, returns nothing; add_paths is freed by
+ * the caller. Appends to an existing playlist (read-only ones refused,
+ * file unchanged) or creates a new one; entries already present are
+ * counted, not rewritten.
+ */
+static void
+player_playlist_add_to(Player * p)
+{
+  char     name[PLAYLIST_NAME_BUF];
+  Playlist pl;
+  char **  merged;
+  size_t   add_n   = p->add_n;
+  size_t   already = 0;
+  size_t   total;
+  size_t   kept;
+  size_t   written = 0;
+  size_t   lost;
+  int      exists  = 0;
+  int      rc;
+  int      dfd;
+
+  memset(&pl, 0, sizeof pl);
+  if (add_n == 0) {
+    return;
+  }
+  if (player_prompt_target(p, name, &exists, &dfd) != 0) {
+    return;
+  }
+  if (exists) {   /* exists implies the directory opened */
+    rc = playlist_read(dfd, p->cfg.playlist_dir, name, &pl);
+    if (rc != 0) {
+      close(dfd);
+      player_report(p, "could not read playlist %s: %s", name, strerror(-rc));
+      return;
+    }
+    if (pl.bad > 0 || pl.is_link) {
+      close(dfd);
+      player_report_ro(p, name, pl.bad);   /* M15: the file is left as it is */
+      playlist_free(&pl);
+      return;
+    }
+  }
+  if (dfd >= 0) {
+    close(dfd);
+  }
+
+  for (size_t i = 0; i < add_n; i++) {
+    char * norm = playlist_path_normalize(p->add_paths[i]);
+
+    if (norm != NULL) {
+      free(p->add_paths[i]);
+      p->add_paths[i] = norm;
+    }
+    for (size_t j = 0; j < pl.n; j++) {
+      if (strcmp(p->add_paths[i], pl.paths[j]) == 0) {
+        already++;
+        break;
+      }
+    }
+  }
+  if (exists && already == add_n) {
+    playlist_free(&pl);
+    snprintf(p->last_added, sizeof p->last_added, "%s", name);   /* P28: still the target */
+    player_report(p, "already in playlist: %s", name);
+    return;
+  }
+
+  total  = pl.n + add_n;
+  merged = malloc(total * sizeof *merged);
+  if (merged == NULL) {
+    playlist_free(&pl);
+    player_report(p, "could not save playlist %s: %s", name, strerror(ENOMEM));
+    return;
+  }
+  /* Ownership of every string moves into merged, and from there into
+     the store. */
+  for (size_t i = 0; i < pl.n; i++) {
+    merged[i] = pl.paths[i];
+  }
+  for (size_t i = 0; i < add_n; i++) {
+    merged[pl.n + i] = p->add_paths[i];
+  }
+  free(pl.paths);
+  free(p->add_paths);
+  p->add_paths = NULL;
+  p->add_n     = 0;
+
+  kept = playlist_dedupe(merged, total);
+  rc   = player_playlist_store(p, name, merged, kept, &written);
+  if (rc < 0) {
+    player_report(p, "could not save playlist %s: %s", name, strerror(-rc));
+    return;
+  }
+
+  lost = kept - written;   /* lines the writer could not represent */
+  snprintf(p->last_added, sizeof p->last_added, "%s", name);
+  if (!exists) {
+    player_report(p, "created playlist: %s (%zu tracks)%s", name, written,
+                  (rc == PLAYLIST_UNSYNCED) ? UNSYNCED_NOTE : "");
+  } else if (add_n == 1 && lost == 0) {
+    player_report(p, "added to playlist: %s%s", name,
+                  (rc == PLAYLIST_UNSYNCED) ? UNSYNCED_NOTE : "");
+  } else {
+    size_t added = (add_n - already > lost) ? add_n - already - lost : 0;
+
+    player_report(p, "added %zu of %zu tracks to playlist: %s%s", added, add_n, name,
+                  (rc == PLAYLIST_UNSYNCED) ? UNSYNCED_NOTE : "");
+  }
+  player_playlist_reload(p, name);
+} /* player_playlist_add_to */
+
+/*
+ * player_prompt_cycle: Tab in a `w` or `t` prompt (P28, P31). Takes the
+ * Player, returns nothing. Replaces the text with the next existing
+ * playlist name after the one shown, or the first when the text is
+ * anything else; nothing when there are none.
+ */
+static void
+player_prompt_cycle(Player * p)
+{
+  const char * text = ui_prompt_text();
+  size_t       next = 0;
+
+  if (p->pl_n == 0) {
+    return;
+  }
+  for (size_t i = 0; i < p->pl_n; i++) {
+    if (strcmp(text, p->pl_names[i]) == 0) {
+      next = (i + 1) % p->pl_n;
+      break;
+    }
+  }
+  ui_prompt_set_text(p->pl_names[next]);
+} /* player_prompt_cycle */
+
+/*
+ * player_playlist_delete_begin: `d` on a saved row (design IV "Delete",
+ * P8). Takes the Player, returns nothing. Asks (y/N) with the stem.
+ */
+static void
+player_playlist_delete_begin(Player * p)
+{
+  const char * name = player_pl_name(p);
+  char         q[PLAYLIST_NAME_BUF + 32];
+
+  if (name == NULL) {
+    return;
+  }
+  snprintf(p->prompt_name, sizeof p->prompt_name, "%s", name);
+  p->prompt_for = PROMPT_FOR_DELETE;
+  snprintf(q, sizeof q, "delete playlist? (y/N) %s", name);
+  if (ui_prompt_open(PROMPT_CONFIRM, q, NULL) != 0) {
+    player_report(p, "terminal too small for a prompt");
+  }
+} /* player_playlist_delete_begin */
+
+/*
+ * player_delete_accepted: `y` at the delete question. Takes the Player,
+ * returns nothing. The cursor ends on the Queue row (U2).
+ */
+static void
+player_delete_accepted(Player * p)
+{
+  int dfd = playlist_dir_open(p->cfg.playlist_dir, 0);
+  int rc  = dfd;
+
+  if (dfd >= 0) {
+    rc = playlist_delete(dfd, p->prompt_name);
+    close(dfd);
+  }
+  if (rc < 0) {
+    player_report(p, "could not delete playlist %s: %s", p->prompt_name, strerror(-rc));
+    return;
+  }
+  player_report(p, "deleted playlist: %s", p->prompt_name);
+  if (strcmp(p->last_added, p->prompt_name) == 0) {
+    p->last_added[0] = '\0';
+  }
+  player_sources_refresh(p);
+  player_source_select(p, 0);
+} /* player_delete_accepted */
+
+/*
+ * player_prompt_accepted: a prompt was answered yes or Enter (action_dispatch
+ * routes ACT_CONFIRM with UI_PROMPT_ACCEPTED here). Takes the Player,
+ * returns nothing. Dispatches on the intent recorded when the prompt
+ * opened; cancel never reaches here.
+ */
+static void
+player_prompt_accepted(Player * p)
+{
+  int why = p->prompt_for;
+
+  p->prompt_for = 0;
+  switch (why) {
+    case PROMPT_FOR_SAVE:
+      player_save_accepted(p);
+      break;
+    case PROMPT_FOR_OVERWRITE:
+      player_playlist_save(p, p->prompt_name);
+      break;
+    case PROMPT_FOR_DELETE:
+      player_delete_accepted(p);
+      break;
+    case PROMPT_FOR_ADD_TO:
+      player_playlist_add_to(p);
+      player_add_paths_free(p);
+      break;
+    default:
+      break;
+  }
+} /* player_prompt_accepted */
 
 /*
  * playlists_action: the Playlists arms of design II.1. With SOURCES
@@ -3327,13 +3950,15 @@ playlists_action(Player * p, Action a)
       }
       return 1;
 
+    case ACT_PLAYLIST_SAVE:
+      player_playlist_save_begin(p);
+      return 1;
+
     case ACT_PLAYLIST_DELETE:
       if (!saved) {
         player_report(p, "the queue cannot be deleted; C clears it");
       } else {
-        /* P7 adds the flow; the translated action must reach player_action
-           itself, since the raw `d` would remove a queue entry. */
-        player_action(p, ACT_PLAYLIST_DELETE, 0);
+        player_playlist_delete_begin(p);
       }
       return 1;
 
@@ -3703,20 +4328,9 @@ player_action(Player * p, Action a, int32_t arg)
       player_rescan(p);
       return;
 
-    case ACT_ENQUEUE: {
-      Browser * b = player_focus_browser(p);
-      if (b == NULL || p->q == NULL) {
-        player_report(p, "nothing to queue");
-        return;
-      }
-      const BrowserRow * sel = browser_selection(b);
-      if (sel == NULL) {
-        player_report(p, "nothing selected");
-        return;
-      }
-      player_enqueue_row(p, sel);
+    case ACT_ENQUEUE:
+      player_enqueue_selection(p);
       return;
-    }
 
     case ACT_PLAY_NOW: {
       Browser * b = player_focus_browser(p);
@@ -4752,6 +5366,7 @@ shutdown_all(Player * p)
   p->pl_n     = 0;
   free(p->src_rows);
   p->src_rows = NULL;
+  player_add_paths_free(p);
 
   for (int v = 0; v < BROWSER_SRC_COUNT; v++) {
     browser_destroy(p->brv[v]);

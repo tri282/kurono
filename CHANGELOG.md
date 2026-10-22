@@ -14,6 +14,12 @@ Notable changes to `kurono`. Format based on
   it; `enter` on one of its tracks starts there. `a` appends a playlist, or
   one of its tracks, to the queue. `d` removes a track from a saved
   playlist. Playlists are kept in Library order without duplicates.
+- `w` saves the queue as a playlist under a name typed in the status bar
+  (`.m3u8` is added; an existing name asks `(y/N)` before overwriting; an
+  empty queue is refused). `t` adds the selected track, album or directory
+  to a playlist, from Library, Directories or Playlists: the prompt offers
+  the last playlist used, `tab` cycles the existing names, and a new name
+  creates one. `d` on a playlist deletes it after `(y/N)`.
 
 ### Changed
 
@@ -250,7 +256,10 @@ through those.
   lowest headroom was 2.69 s of 2.73 s. The verdict waits on more listening
   (10 h over 3 sessions), so the size is unchanged for now.
 - Playlists are `m3u8` only; `.m3u`, `.xspf` and `.pls` files are not read.
-- A saved playlist has no custom order: `K`/`J` reorder only the queue.
+- A saved playlist has no custom order: `K`/`J` reorder only the queue. To
+  change a playlist, load it, edit the queue and `w` over the same name,
+  which still saves it sorted.
+- Playlists cannot be renamed (load it, `w` a new name, `d` the old one).
 - Changing a playlist rewrites it in kurono's form: sorted, deduplicated,
   comments and `#EXTINF` lines from other programs dropped, entries relative.
   A playlist with lines kurono cannot read, or a symlinked one, is read-only.
