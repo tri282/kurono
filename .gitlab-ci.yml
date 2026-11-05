@@ -90,7 +90,10 @@ workflow:
 
 build:fedora:
   extends: .build_and_test
-  image: fedora:latest
+  # Pinned: the gapless fixtures' expectations were measured on ffmpeg 8.1
+  # (Fedora 44). Fedora 45 ships ffmpeg 9.0, which decodes AAC-in-M4A
+  # differently; move with the roadmap's Fedora 45 item, not before.
+  image: fedora:44
   variables:
     # The one image whose TSan runtime works on the runner host. See the
     # ring_stress block above.
