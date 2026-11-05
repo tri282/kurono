@@ -12,10 +12,11 @@ Linux only, deliberately.
 
 ## Features
 
-* **Five views.** Library (artists and an album-grouped track list), Directories (the tree as it is on disk), Playlists (the queue), Now playing and Settings. Library and Directories are the same widget with a different query.
+* **Five views.** Library (artists and an album-grouped track list), Directories (the tree as it is on disk), Playlists (the queue and your saved playlists), Now playing and Settings. Library and Directories are the same widget with a different query.
 * **Gapless playback.** The next track is opened and decoding before the current one ends. No silence at album boundaries, no click.
 * **A live filter** over the Library through SQLite's FTS5, narrowing the focused column as you type.
-* **A real queue** you can reorder and edit while it plays, in the Playlists view, with the transport keys live.
+* **A real queue** you can reorder and edit while it plays, in the Playlists view, with the transport keys live. It is kept across restarts.
+* **Saved playlists** as plain `m3u8` files with paths relative to the playlist, so a playlist folder copied next to the library still plays elsewhere (another player, a portable device).
 * **Instant rescans.** The first scan reads tags from every file; after that `kurono` compares size and mtime and skips everything unchanged.
 * **Multiple music roots**, so an archive disk and a home directory can be one library.
 * **Shuffle and repeat** off, all, one.
@@ -134,7 +135,7 @@ Everything is environment variables today. A config file is coming in v2; `KURON
 |---|---|---|
 | `KURONO_MUSIC_DIR` | `$XDG_MUSIC_DIR`, then `~/Music` | Roots of the music tree, traversed recursively. `:`-separated for more than one |
 | `KURONO_IGNORE_DIRS` | unset | Comma-separated directory names never descended into |
-| `KURONO_PLAYLIST_DIR` | first music root + `/playlists` | Where playlists are read from and written to |
+| `KURONO_PLAYLIST_DIR` | first music root + `/playlists` | Where playlists are read from and written to. A relative value resolves against the working directory; the directory is created on the first save |
 | `KURONO_NO_SCAN` | unset | If set, skip the startup scan entirely |
 | `KURONO_TRACE` | unset | If set to `1`, write an audio-path trace log to `$XDG_STATE_HOME/kurono/trace.log` |
 | `KURONO_CONFIG` | `$XDG_CONFIG_HOME/kurono/config.toml` | Reserved. Unused today. |
@@ -195,7 +196,7 @@ There are five views, on `1` to `5`: Library, Directories, Playlists, Now playin
 ![The queue pane open over the browser, editable while playback continues.](./assets/queue.png)
 <!-- assets/queue.png shows the v1 queue pane; recapture it for the Playlists view or remove it. -->
 
-The Playlists view is the queue: the entries in one column, the details of the entry under the cursor beside it, editable while playback continues.
+The Playlists view lists `Queue` first, then every `.m3u8` in the playlist directory; `←`/`→` move between that column and the track list. The queue is editable while playback continues, and is saved on exit to `$XDG_STATE_HOME/kurono/queue.m3u8` and restored, stopped, at the next start. A saved playlist is a sorted set: kept in Library order without duplicates, rewritten as soon as you change it.
 
 ### Keybindings
 
@@ -204,14 +205,16 @@ Arrows navigate, letters act. Every key resolves through a table to a named acti
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move up / down within a list |
-| `←` / `→` | Library: move between the artist column and the track list. Directories: up a folder / into a folder |
+| `←` / `→` | Library: move between the artist column and the track list. Directories: up a folder / into a folder. Playlists: move between the sources column and the track list |
 | `pgup` `pgdn` `home` `end` | Page / jump in any list |
 | `space` | Play / pause |
-| `enter` | Play the selection now (in Playlists, play the entry) |
-| `a` | Add the selection to the queue (on an album heading, the tracks listed under it) |
+| `enter` | Play the selection now (in Playlists, play the entry; on a saved playlist, replace the queue and play it, or start at the track) |
+| `a` | Add the selection to the queue (on an album heading, the tracks listed under it; in Playlists, a playlist or one of its tracks) |
+| `t` | Add the selection to a playlist (Library, Directories, Playlists): the prompt offers the last one used, `tab` cycles the names, a new name creates one |
+| `w` | Save the queue as a playlist (Playlists); an existing name asks `(y/N)` first |
 | `f` | Show / hide the artist column (Library) |
-| `d` / `C` | Remove from the queue / clear the queue (Playlists) |
-| `K` / `J` | Move an entry up / down (Playlists) |
+| `d` / `C` | Remove from the queue or a saved playlist; on a playlist, delete it after `(y/N)` / clear the queue (Playlists) |
+| `K` / `J` | Move a queue entry up / down (Playlists; saved playlists are kept sorted) |
 | `v` | Go to Playlists and back |
 | `o` | Jump to the playing track |
 | `n` / `p` | Next / previous track |
@@ -234,7 +237,7 @@ Arrows navigate, letters act. Every key resolves through a table to a named acti
 | `esc` | Close the open overlay, or clear the filter while typing it |
 | `q` / `ctrl+c` | Close the open overlay, or quit when none is open. While typing a filter, `ctrl+c` clears it and `q` is text |
 
-`d` `C` `K` `J` act only in the Playlists view, where the entry they act on is visible.
+`d` `C` `K` `J` `w` act only in the Playlists view, where the entry they act on is visible.
 
 `h` `j` `k` `l` are **not** navigation keys. Navigation lives on the arrows so that `h` can open help, a keymap that answered to `j`, `k` and `l` but opened a window on `h` would fail silently on the most-practised motion of the four.
 
@@ -394,4 +397,4 @@ build.
 
 ## Status
 
-v2.0.0 reorganises the screen into the five views above. **v2 continues** with cover art, a spectrum visualiser, saved playlists, a config file, an EQ, and moving the scan to the background.
+v2.0.0 reorganised the screen into the five views above; v2.1.0 adds saved playlists (`m3u8`) and keeps the queue across restarts. **v2 continues** with cover art, a spectrum visualiser, a config file, an EQ, and moving the scan to the background.
